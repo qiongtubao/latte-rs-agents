@@ -56,13 +56,21 @@ impl Conflict {
     pub fn signature(&self) -> String {
         let mut vs: Vec<u64> = self.groups.iter().map(|(v, _)| *v).collect();
         vs.sort_unstable();
-        format!("numeric:{}|{}", self.name, vs.iter().map(u64::to_string).collect::<Vec<_>>().join(","))
+        format!(
+            "numeric:{}|{}",
+            self.name,
+            vs.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+        )
     }
 
     /// 可疑的陈述：非第一组的全部；第一、二组一样多就分不出多数派，全部都算（由辅导员对着源码裁决）。
     pub fn suspects(&self) -> Vec<&Claim> {
         let tie = self.groups.len() >= 2 && self.groups[0].1.len() == self.groups[1].1.len();
-        self.groups.iter().skip(usize::from(!tie)).flat_map(|(_, c)| c.iter()).collect()
+        self.groups
+            .iter()
+            .skip(usize::from(!tie))
+            .flat_map(|(_, c)| c.iter())
+            .collect()
     }
 
     /// 给辅导员看的一段话。
@@ -91,13 +99,49 @@ impl Conflict {
 
 /// 整行带这些措辞：在讲条件 / 假设 / 反例 / 别的配置，里面的数不代表「这个宏的值」。
 const EXEMPT_WORDS: &[&str] = &[
-    "若", "如果", "假设", "假如", "换成", "改成", "改为", "改到", "改后", "改动", "代入", "推测", "反例", "误以为", "误写",
-    "非法", "不支持", "arm", "ARM", "16K 页", "16KB 页", "16 KB 页", "64K 页", "又如", "比如", "例如",
+    "若",
+    "如果",
+    "假设",
+    "假如",
+    "换成",
+    "改成",
+    "改为",
+    "改到",
+    "改后",
+    "改动",
+    "代入",
+    "推测",
+    "反例",
+    "误以为",
+    "误写",
+    "非法",
+    "不支持",
+    "arm",
+    "ARM",
+    "16K 页",
+    "16KB 页",
+    "16 KB 页",
+    "64K 页",
+    "又如",
+    "比如",
+    "例如",
 ];
 
 /// 连接词：宏名之后、数字之前。
 // 注意没有 `==`：那是 `#if X == 0` 这类条件表达式（比较），不是在陈述它的值。
-const LINKS: &[&str] = &["＝", "=", "≈", "≃", "约等于", "等于", "约为", "恰为", "固定为", "为", "是"];
+const LINKS: &[&str] = &[
+    "＝",
+    "=",
+    "≈",
+    "≃",
+    "约等于",
+    "等于",
+    "约为",
+    "恰为",
+    "固定为",
+    "为",
+    "是",
+];
 
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
@@ -107,7 +151,9 @@ fn is_macro_name(tok: &str) -> bool {
     tok.chars().count() >= 4
         && tok.contains('_')
         && tok.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && tok.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// 从 `s` 开头解析一个整数（可带 `,` `_` 分隔、`0x` 十六进制、`K`/`KB`/`MB` 单位）。
@@ -124,7 +170,11 @@ fn parse_value(s: &str) -> Option<(u64, usize)> {
             i += 1;
         }
     } else {
-        while i < b.len() && (b[i].is_ascii_digit() || ((b[i] == ',' || b[i] == '_') && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()))) {
+        while i < b.len()
+            && (b[i].is_ascii_digit()
+                || ((b[i] == ',' || b[i] == '_')
+                    && b.get(i + 1).is_some_and(|c| c.is_ascii_digit())))
+        {
             if b[i].is_ascii_digit() {
                 digits.push(b[i]);
             }
@@ -138,15 +188,25 @@ fn parse_value(s: &str) -> Option<(u64, usize)> {
     if b.get(i) == Some(&'.') && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
         return None;
     }
-    let mut value = if hex { u64::from_str_radix(&digits, 16).ok()? } else { digits.parse::<u64>().ok()? };
+    let mut value = if hex {
+        u64::from_str_radix(&digits, 16).ok()?
+    } else {
+        digits.parse::<u64>().ok()?
+    };
     let mut j = i;
     while b.get(j) == Some(&' ') {
         j += 1;
     }
     let rest: String = b[j..].iter().take(4).collect();
-    let unit = [("KiB", 1024u64), ("KB", 1024), ("MiB", 1 << 20), ("MB", 1 << 20), ("K", 1024)]
-        .into_iter()
-        .find(|(u, _)| rest.starts_with(u));
+    let unit = [
+        ("KiB", 1024u64),
+        ("KB", 1024),
+        ("MiB", 1 << 20),
+        ("MB", 1 << 20),
+        ("K", 1024),
+    ]
+    .into_iter()
+    .find(|(u, _)| rest.starts_with(u));
     if let Some((u, mul)) = unit {
         let after = b.get(j + u.len()).copied();
         if after.is_none_or(|c| !c.is_ascii_alphanumeric()) {
@@ -160,7 +220,13 @@ fn parse_value(s: &str) -> Option<(u64, usize)> {
         k += 1;
     }
     match b.get(k) {
-        Some(c) if "*×x+-−–—/÷^<>%·".contains(*c) || (c.is_ascii_alphabetic() && k == i) || *c == '_' => None,
+        Some(c)
+            if "*×x+-−–—/÷^<>%·".contains(*c)
+                || (c.is_ascii_alphabetic() && k == i)
+                || *c == '_' =>
+        {
+            None
+        }
         _ => Some((value, i)),
     }
 }
@@ -215,7 +281,9 @@ pub fn extract_claims(file: &str, text: &str) -> Vec<Claim> {
                 let in_expr = match pre {
                     _ if pre_trimmed.is_some_and(|p| "+&|^<>~/".contains(p)) => true,
                     // `-`、`*` 紧贴着前一个标识符 / 右括号才是运算符（列表符号、加粗记号前面是空白或行首）。
-                    Some(p) if p == '-' || p == '*' => pre2.is_some_and(|q| is_ident_char(q) || q == ')'),
+                    Some(p) if p == '-' || p == '*' => {
+                        pre2.is_some_and(|q| is_ident_char(q) || q == ')')
+                    }
                     _ => false,
                 };
                 if in_expr {
@@ -224,14 +292,23 @@ pub fn extract_claims(file: &str, text: &str) -> Vec<Claim> {
             }
             // 宏名后的装饰（反引号、星号、空格）→ 连接词 → 装饰 → 数字
             let rest = &line[end_b..];
-            let skip_deco = |s: &str| s.trim_start_matches(|c: char| c == '`' || c == '*' || c == ' ' || c == '\u{3000}').to_string();
+            let skip_deco = |s: &str| {
+                s.trim_start_matches(|c: char| c == '`' || c == '*' || c == ' ' || c == '\u{3000}')
+                    .to_string()
+            };
             let after_name = skip_deco(rest);
-            let Some(link) = LINKS.iter().find(|l| after_name.starts_with(**l)) else { continue };
+            let Some(link) = LINKS.iter().find(|l| after_name.starts_with(**l)) else {
+                continue;
+            };
             let after_link = skip_deco(&after_name[link.len()..]);
             // 「约」「大约」之类的修饰
-            let after_link = after_link.trim_start_matches("约").trim_start_matches("大约");
+            let after_link = after_link
+                .trim_start_matches("约")
+                .trim_start_matches("大约");
             let after_link = skip_deco(after_link);
-            let Some((value, used)) = parse_value(&after_link) else { continue };
+            let Some((value, used)) = parse_value(&after_link) else {
+                continue;
+            };
             // 原文片段：从宏名到数字末尾。
             let consumed_tail = after_link.chars().take(used).collect::<String>();
             let span_start = bi;
@@ -274,7 +351,10 @@ pub fn conflicts(files: &[(String, String)]) -> Vec<Conflict> {
             .collect();
         // 次数多的在前；次数一样，先出现的在前（先出现的多半是对着代码推导出来的那一处）。
         gs.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then(a.1.cmp(&b.1)));
-        out.push(Conflict { name, groups: gs.into_iter().map(|(v, _, cs)| (v, cs)).collect() });
+        out.push(Conflict {
+            name,
+            groups: gs.into_iter().map(|(v, _, cs)| (v, cs)).collect(),
+        });
     }
     out
 }
@@ -314,19 +394,34 @@ mod tests {
         assert_eq!(c.len(), 1, "{c:?}");
         assert_eq!((c[0].name.as_str(), c[0].value), ("SC_OK", 7));
         // 算式的结果不记在最后一个宏头上
-        assert!(extract_claims("a.md", "NGROUP+LG_QUANTUM=6，SC_LG_NGROUP + LG_QUANTUM = 6").is_empty());
+        assert!(
+            extract_claims("a.md", "NGROUP+LG_QUANTUM=6，SC_LG_NGROUP + LG_QUANTUM = 6").is_empty()
+        );
         // 比较、减法算式、反事实
         let cf = "#if SC_LG_TINY_MIN == 0 守卫\nSC_NTINY = LG_QUANTUM − SC_LG_TINY_MIN = 4 − 3 = 1\n改后（`SC_LG_NGROUP = 1`）\n代入 SC_LG_NGROUP = 1 时";
-        assert!(extract_claims("a.md", cf).is_empty(), "{:?}", extract_claims("a.md", cf));
+        assert!(
+            extract_claims("a.md", cf).is_empty(),
+            "{:?}",
+            extract_claims("a.md", cf)
+        );
     }
 
     /// jemalloc 实测：36 写了多处、39 写了一处 → 39 是可疑的。
     #[test]
     fn contradictory_values_are_reported_with_majority_first() {
         let files = vec![
-            f("sections/00_overview.md", "总览：SC_NSIZES = 232，SC_NBINS 为 39"),
-            f("sections/k1/0_logic.md", "推导 SC_NBINS = 36\n再算 `SC_NBINS` = 36"),
-            f("sections/k1/9_summary.md", "本章小结 `SC_NBINS = 39`\nSC_NSIZES = 232"),
+            f(
+                "sections/00_overview.md",
+                "总览：SC_NSIZES = 232，SC_NBINS 为 39",
+            ),
+            f(
+                "sections/k1/0_logic.md",
+                "推导 SC_NBINS = 36\n再算 `SC_NBINS` = 36",
+            ),
+            f(
+                "sections/k1/9_summary.md",
+                "本章小结 `SC_NBINS = 39`\nSC_NSIZES = 232",
+            ),
             f("sections/k2/3_solutions.md", "SC_NBINS=36"),
         ];
         let cs = conflicts(&files);
@@ -339,7 +434,12 @@ mod tests {
         assert_eq!(sus.len(), 2, "{sus:?}");
         assert!(sus.iter().all(|s| s.value == 39));
         let d = c.describe();
-        assert!(d.contains("36（3 处") && d.contains("39（2 处") && d.contains("sections/k1/9_summary.md 第 1 行"), "{d}");
+        assert!(
+            d.contains("36（3 处")
+                && d.contains("39（2 处")
+                && d.contains("sections/k1/9_summary.md 第 1 行"),
+            "{d}"
+        );
         assert!(d.contains("前 N 个档位"), "要提醒换了说法的同一个数: {d}");
         assert_eq!(c.signature(), "numeric:SC_NBINS|36,39");
     }
@@ -348,7 +448,10 @@ mod tests {
     fn consistent_values_and_unit_equivalents_do_not_conflict() {
         let files = vec![
             f("a.md", "SC_LARGE_MINCLASS = 16384\nSC_NSIZES = 232"),
-            f("b.md", "`SC_LARGE_MINCLASS` = **16 KB**\nSC_NSIZES 等于 232"),
+            f(
+                "b.md",
+                "`SC_LARGE_MINCLASS` = **16 KB**\nSC_NSIZES 等于 232",
+            ),
         ];
         assert!(conflicts(&files).is_empty());
     }
@@ -370,14 +473,17 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_real_docs() {
-        let Ok(dir) = std::env::var("LEARN_FACTS_DIR") else { return };
+        let Ok(dir) = std::env::var("LEARN_FACTS_DIR") else {
+            return;
+        };
         let base = std::path::Path::new(&dir);
         let mut files: Vec<(String, String)> = crate::learn_novice::walk(&base.join("sections"))
             .into_iter()
             .filter(|p| p.extension().is_some_and(|e| e == "md"))
             .filter_map(|p| {
                 let rel = p.strip_prefix(base).ok()?.to_string_lossy().into_owned();
-                let top_level_chapter = rel.matches('/').count() == 1 && rel != "sections/00_overview.md";
+                let top_level_chapter =
+                    rel.matches('/').count() == 1 && rel != "sections/00_overview.md";
                 (!top_level_chapter).then(|| (rel, std::fs::read_to_string(&p).unwrap_or_default()))
             })
             .collect();

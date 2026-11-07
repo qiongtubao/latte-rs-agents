@@ -284,7 +284,21 @@ export type ChatEvent =
   // plan mode（只读规划模式）开关：active=true 时模型侧工具收敛为只读
   // （read/search/ask/plan/todo 等），产出是 plan 提案走 PlanProposed
   // 审批流。回放历史里也有此事件，取最后一条恢复状态。
-  | { type: "PlanModeChanged"; active: boolean };
+  | { type: "PlanModeChanged"; active: boolean }
+  /** bash 后台 job 起止（async 启动或前台超时转后台的命令）。
+   *  status: running / completed / stopped。 */
+  | {
+      type: "BackgroundJob";
+      job_id: string;
+      status: string;
+      command: string;
+      cwd?: string;
+      exit_code?: number;
+      elapsed_secs: number;
+      detail?: string;
+      role_id?: string;
+      sub_id?: string;
+    };
 export interface SelfLoopEvent {
   kind: "started" | "iteration" | "log" | "screenshot" | "done" | "error";
   iteration: number;

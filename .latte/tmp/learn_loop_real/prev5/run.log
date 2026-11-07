@@ -1,0 +1,14 @@
+[    8s] session ui-52566-1792338686601-w0
+[    9s] 已发 /learn_loop
+[    9s]   status: Workflow '/learn_loop' 完成。
+workflow 'learn_loop' 已转入后台运行；请观察 WorkflowStarted/WorkflowStep/WorkflowFinished 事件。
+[    9s] step 1/12 plan
+[  353s]   status: ⏳ tutor 的模型调用（glm-5.3）已超过 120s 未返回——多为厂商慢速生成或大上下文，不是卡死，仍在等待
+[  526s]   status: ⏳ tutor 的模型调用（MiniMax-M3）已超过 120s 未返回——多为厂商慢速生成或大上下文，不是卡死，仍在等待
+[  577s] workflow 结束 status=failed step 'plan' speaker 'tutor': plan.json 未通过校验：
+- 决策 d1 没有带 name + pros/cons 的替代方案（没有对比就讲不出为什么选它）
+- 决策 d2 没有带 name + pros/cons 的替代方案（没有对比就讲不出为什么选它）
+- 决策 d2 没有任何替代方案写 wins_when：什么条件下替代方案反而更好（讲不出翻转条件，说明对比只是一边倒的背书）
+- 决策 d3 没有带 name + pros/cons 的替代方案（没有对比就讲不出为什么选它）
+- 决策 d3 没有任何替代方案写 wins_when：什么条件下替代方案反而更
+[  577s] 会话 ui-52566-1792338686601-w0；token 报告：latte-agent debug usage ui-52566-1792338686601-w0 --dir <项目或 worktree>/.latte

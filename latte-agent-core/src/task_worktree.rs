@@ -886,7 +886,10 @@ impl TaskWorktree {
     /// 新建的树从项目里已跟踪文件的未提交改动快照拉出：用户在编辑器里改了
     /// 还没 commit 的代码，会话里也能读到（learn_loop 取证、行号才对得上）。
     /// 快照记在 [`SESSION_BASE_REF`] 下，删会话时据此只算会话自己的产出。
-    pub fn create_session_workspace(project_root: &Path, session_id: &str) -> std::io::Result<PathBuf> {
+    pub fn create_session_workspace(
+        project_root: &Path,
+        session_id: &str,
+    ) -> std::io::Result<PathBuf> {
         if !safe_task_id(session_id) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -907,7 +910,11 @@ impl TaskWorktree {
                 if let Some(sha) = &snapshot {
                     let _ = git(
                         &repo,
-                        &["update-ref", &format!("{SESSION_BASE_REF}{session_id}"), sha],
+                        &[
+                            "update-ref",
+                            &format!("{SESSION_BASE_REF}{session_id}"),
+                            sha,
+                        ],
                     );
                 }
                 return Ok(wt.info.root);
@@ -1111,9 +1118,17 @@ mod session_workspace_tests {
     }
 
     fn branch_exists(repo: &Path, branch: &str) -> bool {
-        git_in(repo, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
-            .status
-            .success()
+        git_in(
+            repo,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .status
+        .success()
     }
 
     /// LATTE_HOME 是进程级环境变量，非 git 与 git 两种情形放在同一个用例里
@@ -1129,7 +1144,10 @@ mod session_workspace_tests {
         std::fs::write(proj.path().join("main.c"), "int main(){}\n").unwrap();
         let root = TaskWorktree::create_session_workspace(proj.path(), "ui-1-2-w0").unwrap();
         assert_eq!(root, proj.path(), "非 git 项目要让 agent 看得到源码");
-        assert_eq!(TaskWorktree::remove_session_workspace(proj.path(), "ui-1-2-w0", &root), None);
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(proj.path(), "ui-1-2-w0", &root),
+            None
+        );
         assert!(proj.path().join("main.c").exists());
 
         // git：会话里产出的文档不能随删会话丢失。
@@ -1168,7 +1186,10 @@ mod session_workspace_tests {
 
         // 没产出的会话：树和分支一起删。
         let ws = TaskWorktree::create_session_workspace(r, "ui-1-2-w2").unwrap();
-        assert_eq!(TaskWorktree::remove_session_workspace(r, "ui-1-2-w2", &ws), None);
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(r, "ui-1-2-w2", &ws),
+            None
+        );
         assert!(!ws.exists());
         assert!(!branch_exists(r, &format!("{TASK_BRANCH_PREFIX}ui-1-2-w2")));
 
@@ -1187,11 +1208,19 @@ mod session_workspace_tests {
         assert_eq!(git_in(r, &["status", "--porcelain"]).stdout, status_before);
         assert!(git_in(r, &["diff", "--cached", "--quiet"]).status.success());
         // 会话自己没产出：快照不算改动，树、分支、快照 ref 一起删。
-        assert_eq!(TaskWorktree::remove_session_workspace(r, "ui-1-2-w3", &ws), None);
+        assert_eq!(
+            TaskWorktree::remove_session_workspace(r, "ui-1-2-w3", &ws),
+            None
+        );
         assert!(!branch_exists(r, &format!("{TASK_BRANCH_PREFIX}ui-1-2-w3")));
         assert!(!git_in(
             r,
-            &["rev-parse", "--verify", "--quiet", &format!("{SESSION_BASE_REF}ui-1-2-w3")]
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{SESSION_BASE_REF}ui-1-2-w3")
+            ]
         )
         .status
         .success());

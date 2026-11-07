@@ -556,6 +556,47 @@ const BOOK_MAX_DESC_CHARS: usize = 260;
 /// 一本书的章数上限：清单是一次输出，章数再多就会在输出上限处被截断。
 const BOOK_MAX_CHAPTERS: usize = 40;
 
+/// 汇总跨章重复的精读锚点。输入既可来自最终 task 清单，也可来自
+/// `chapters.json` 骨架；两层共用同一判据，避免坏骨架先扇出几十章后才失败。
+fn shared_anchor_problems(
+    rows: impl IntoIterator<Item = (String, bool, Vec<String>)>,
+) -> Vec<String> {
+    let mut owners: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (title, is_reading, paths) in rows {
+        if !is_reading {
+            continue;
+        }
+        // 同一章重复写同一路径只算一个 owner；顺手归一化常见的 `./` 和
+        // 尾部 `/`，避免同一路径换一种拼法绕过跨章计数。
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in paths {
+            let mut path = raw.trim().trim_end_matches('/');
+            while let Some(rest) = path.strip_prefix("./") {
+                path = rest;
+            }
+            if path.is_empty() || !seen.insert(path.to_string()) {
+                continue;
+            }
+            owners
+                .entry(path.to_string())
+                .or_default()
+                .push(title.clone());
+        }
+    }
+    owners
+        .into_iter()
+        .filter(|(_, chapters)| chapters.len() >= BOOK_MAX_SHARED_ANCHOR)
+        .map(|(path, chapters)| {
+            format!(
+                "{path} 被 {} 章当锚点（{}）：一个文件最多给 2 章精读。把它只留给讲它主体的那一章，其他章换成自己的实现文件或在描述里点名函数",
+                chapters.len(),
+                chapters.join("、")
+            )
+        })
+        .collect()
+}
+
 /// 标题里的「第 N 章」的 N（`第2编第5章` 取 5）。
 fn chapter_number(title: &str) -> Option<usize> {
     let chars: Vec<char> = title.chars().collect();
@@ -758,9 +799,10 @@ fn check_learn_book_output(output: &str, cwd: &std::path::Path) -> Result<(), St
         // 体量：只量 learn_loop 的精读章（有锚点路径、要按 file:line 取证的）。
         let paths = strs("paths");
         let is_reading = t["task_type"].as_str().map(str::trim) == Some("learn_loop");
-        // 精读章必须锚定真实文件：不锚定，体量和“只有头文件”这些检查就全被绕过，
-        // learn_loop 也只能凭标题去猜读哪里（实测整本书 paths 全留空时就是这样）。
-        if is_reading && paths.is_empty() {
+        // `learn_loop` 表示交互式课程形态，不等同于每章都必须做源码精读。
+        // 地基/树干允许是概念课而没有锚点；进入枝干/树叶后才要求源码落点。
+        let requires_anchor = is_reading && *rank >= LAYER_BRANCH;
+        if requires_anchor && paths.is_empty() {
             problems.push(format!(
                 "精读章「{title}」没有 paths：至少锚定 1 个先用 search / ls 核实过存在的 .cc / .c 文件；超大文件（> {BOOK_MAX_FILE_LINES} 行）别当锚点，换同一功能的小文件"
             ));
@@ -896,36 +938,28 @@ fn check_learn_book_output(output: &str, cwd: &std::path::Path) -> Result<(), St
     }
     // 同一个锚点文件被 3 章以上精读：每章都会把它从头读一遍，讲的东西必然重复（实测终审连续挑出 5 处跨章复读）。
     // 两章共用不拦（如内部键编码在 MemTable 和可见性两章都要用），3 章以上要求重划归属。
-    {
-        let mut owners: std::collections::BTreeMap<String, Vec<String>> =
-            std::collections::BTreeMap::new();
-        for t in arr {
-            if t["task_type"].as_str().map(str::trim) != Some("learn_loop") {
-                continue;
-            }
-            let title = t["title"].as_str().unwrap_or("?").trim().to_string();
-            for p in t["paths"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|v| v.as_str())
-            {
-                owners
-                    .entry(p.trim().trim_end_matches('/').to_string())
-                    .or_default()
-                    .push(title.clone());
-            }
-        }
-        for (path, chs) in owners
-            .iter()
-            .filter(|(_, c)| c.len() >= BOOK_MAX_SHARED_ANCHOR)
-        {
-            problems.push(format!(
-                "{path} 被 {} 章当锚点（{}）：一个文件最多给 2 章精读。把它只留给讲它主体的那一章，其他章换成自己的实现文件或在描述里点名函数",
-                chs.len(),
-                chs.join("、")
-            ));
-        }
+    // 共享锚点问题优先进入反馈，且不受普通问题 8 条上限截断；否则模型可能
+    // 修完前八项后才看到重复锚点，再消耗一轮完整生成。
+    let shared = shared_anchor_problems(arr.iter().map(|t| {
+        let title = t["title"].as_str().unwrap_or("?").trim().to_string();
+        let is_reading = t["task_type"].as_str().map(str::trim) == Some("learn_loop");
+        let paths = t["paths"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (title, is_reading, paths)
+    }));
+    let shared_count = shared.len();
+    let ordinary_limit = 8usize.saturating_sub(shared_count);
+    problems.truncate(ordinary_limit);
+    if !shared.is_empty() {
+        let mut prioritized = shared;
+        prioritized.extend(problems);
+        problems = prioritized;
     }
     if foundation > BOOK_MAX_FOUNDATION {
         problems.push(format!("地基章有 {foundation} 章，最多 {BOOK_MAX_FOUNDATION} 章：地基只管“先跑起来、会用公开 API”，别的原理属于树干"));
@@ -949,7 +983,7 @@ fn check_learn_book_output(output: &str, cwd: &std::path::Path) -> Result<(), St
     if problems.is_empty() {
         Ok(())
     } else {
-        problems.truncate(8);
+        problems.truncate(8usize.max(shared_count));
         Err(format!(
             "学习书目录未通过结构校验：\n- {}",
             problems.join("\n- ")
@@ -2415,12 +2449,18 @@ fn collect_fail_targets(err: &str) -> Vec<String> {
     for line in err.lines() {
         let body = line.trim_start();
         let body = body.strip_prefix("- ").unwrap_or(body);
-        let Some(first) = chapter_refs_in(body).into_iter().next() else {
-            continue;
-        };
-        let id = fmt_chapter(&[first]);
-        if !out.contains(&id) {
-            out.push(id);
+        // 共享锚点是一条跨章错误，括号里列出的每个 owner 都是病灶章；
+        // 普通依赖错误仍只取行首第一个 chNN，避免把“ch32 引用了 ch31”里的
+        // 被引用章 ch31 一并删掉。
+        let refs = body
+            .split_once("章当锚点（")
+            .map(|(_, owners)| chapter_refs_in(owners))
+            .unwrap_or_else(|| chapter_refs_in(body).into_iter().take(1).collect());
+        for chapter in refs {
+            let id = fmt_chapter(&[chapter]);
+            if !out.contains(&id) {
+                out.push(id);
+            }
         }
     }
     out
@@ -2507,6 +2547,14 @@ pub struct WorkflowStepDef {
     /// 精确的请求次数预算，优先于 `budget` 档位。`0` = 本 step 不设预算。
     #[serde(default)]
     pub max_requests: Option<usize>,
+    /// 单个 speaker 分派的真实墙钟硬上限（秒）。到期会 abort 正在运行的
+    /// 模型/工具 future；未配置时保持全局 specialist timeout 行为。
+    #[serde(default)]
+    pub hard_timeout_secs: Option<u64>,
+    /// 单个 speaker turn 最多允许启动的模型工具调用数。`0` 表示禁止
+    /// 工具执行；检查发生在整批调用 spawn/execute 之前。
+    #[serde(default)]
+    pub max_tool_calls: Option<usize>,
     /// Provider 报 context overflow 时，是否丢弃当前 runner 并重启本 step。
     /// 这是给“审查员重新读取文件”这类步骤的定向恢复开关；默认关闭，
     /// 普通 workflow 仍沿用 compact/retry 后失败的旧语义。
@@ -3079,6 +3127,20 @@ impl WorkflowDef {
                             .join(" / ")
                     ));
                 }
+            }
+            if step.hard_timeout_secs == Some(0) {
+                return Err(format!(
+                    "step '{}': hard_timeout_secs 必须大于 0",
+                    step.id
+                ));
+            }
+            if (step.hard_timeout_secs.is_some() || step.max_tool_calls.is_some())
+                && step.declared_roles().is_empty()
+            {
+                return Err(format!(
+                    "step '{}': hard_timeout_secs/max_tool_calls 只对有 speaker 的模型步骤生效",
+                    step.id
+                ));
             }
             if let Some(nested) = &step.workflow {
                 if nested.trim().is_empty() {
@@ -11267,6 +11329,10 @@ struct SpeakerDispatch {
     plan_stage: Option<crate::controller::SharedPlanStage>,
     /// 本次分派的软请求预算（0 = 不设），见 [`step_request_budget`]。
     request_budget: usize,
+    /// 本次分派显式 wall-clock 硬上限；None 使用全局 specialist timeout。
+    hard_timeout_secs: Option<u64>,
+    /// 本次分派允许启动的工具调用硬上限。
+    max_tool_calls: Option<usize>,
     /// 委派返回审查不阻塞（结论本就只作参考的 step），见 [`review_is_advisory`]。
     review_async: bool,
     /// 机械验收依据（产出契约 + 工具使用约束）。`Some` 时先过机械验收，
@@ -11327,6 +11393,8 @@ impl SpeakerDispatch {
             // 构造后写入自己的句柄。
             plan_stage: None,
             request_budget: scaled_budget(step_budget_tier("default").unwrap_or(0)),
+            hard_timeout_secs: None,
+            max_tool_calls: None,
             review_async: false,
             gate_step: None,
         }
@@ -11661,6 +11729,17 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         ),
         None => (None, None),
     };
+    // 后台 bash job 归属本 step：runner 的 job owner 就是这个 sub_id
+    // （见 AgentRunner::anchor_scope_id）。本函数以任何方式退出（完成、
+    // 失败、取消、future 被 drop）都会 kill 名下仍在跑的 job，不留孤儿。
+    let _job_guard = sub_id.as_deref().and_then(|id| {
+        crate::bg_jobs::JobOwnerGuard::new(
+            id,
+            inp.event_tx.clone(),
+            Some(id.to_string()),
+            "所属 workflow step 已结束，后台 job 被终止",
+        )
+    });
 
     // 2-4. 执行 + advisor 返回审查的返工环：返回被判 intervene/terminate
     //    时带【上轮审查反馈】返工——advisor 的「打回」不再只是批注
@@ -11834,11 +11913,22 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         // 循环内 deadline（对齐 oh-my-pi）：在 runner 被 move 进 spawn 之前设好。
         // 墙钟只做兜底（默认数小时，见 specialist_timeout_secs）；常规的「这一步
         // 该收手了」由请求次数预算判定。
-        let step_timeout_s = crate::controller::specialist_timeout_secs();
+        let step_timeout_s = inp
+            .hard_timeout_secs
+            .unwrap_or_else(crate::controller::specialist_timeout_secs);
+        let graceful_timeout_s = if inp.hard_timeout_secs.is_some() {
+            step_timeout_s
+                .saturating_sub(step_timeout_s.min(5))
+                .max(1)
+        } else {
+            step_timeout_s
+        };
         runner.set_deadline(
-            std::time::Instant::now() + std::time::Duration::from_secs(step_timeout_s),
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(graceful_timeout_s),
         );
         runner.set_request_budget(inp.request_budget);
+        runner.set_max_tool_calls(inp.max_tool_calls);
         let mut run_handle = tokio::spawn(async move {
             let result = runner.run_turn_gated(&[Message::user(prompt)], None).await;
             let tool_count = runner.last_turn_tool_count;
@@ -11859,10 +11949,24 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
         // 轮询分支重建的 sleep 永远不响，必须在循环外 pin 住）。
         // 超时走 StepFail::Failed → 引擎按 max_retries 重试/失败冒泡，
         // 而不是无限挂起（实测事故：estimate 步挂 24min）。
-        // TimeoutWarning 的复发周期（只提醒用户、不杀），与兜底墙钟分开。
-        let timeout_s = crate::controller::specialist_warn_secs();
+        // TimeoutWarning 的复发周期（只提醒用户、不杀），与硬墙钟分开。
+        // 显式 hard timeout 时提前到一半提醒，避免 warning 与 hard abort
+        // 同时到达；未配置时保持全局 15 分钟节奏。
+        let timeout_s = inp
+            .hard_timeout_secs
+            .map(|hard| crate::controller::specialist_warn_secs().min((hard / 2).max(1)))
+            .unwrap_or_else(crate::controller::specialist_warn_secs);
         let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
         tokio::pin!(timeout);
+        // 只有 step 显式配置 hard_timeout_secs 才启用 outer abort；旧 workflow
+        // 仍沿用全局 runner deadline，不改变历史运行时长语义。
+        let hard_timeout = async {
+            match inp.hard_timeout_secs {
+                Some(secs) => tokio::time::sleep(std::time::Duration::from_secs(secs)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(hard_timeout);
         // step 实际起跑时刻：TimeoutWarning 复发时据此报真实已跑秒数
         // （而不是每次都报一个 soft_timeout_secs 的固定值）。
         let step_started = tokio::time::Instant::now();
@@ -11980,6 +12084,34 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                                 )));
                                 break;
                             }
+                            if let crate::error::AgentError::ToolCallBudgetExceeded {
+                                calls,
+                                limit,
+                                last_tool,
+                                partial,
+                            } = &e
+                            {
+                                if let Some((notice, adopted)) = degrade_partial_on_break(
+                                    &speaker,
+                                    &inp.step_id,
+                                    &format!("达到工具调用硬上限（已启动 {calls}/{limit} 次）"),
+                                    partial,
+                                ) {
+                                    let _ = inp
+                                        .event_tx
+                                        .send(ChatEvent::Status { message: notice });
+                                    attempt = Ok((adopted, tool_count, tool_summary));
+                                    break;
+                                }
+                                let last_info = last_tool
+                                    .as_ref()
+                                    .map(|t| format!("，最后调用的工具是 '{t}'"))
+                                    .unwrap_or_default();
+                                attempt = Err(StepFail::Failed(format!(
+                                    "subagent '{speaker}' 达到工具调用硬上限（已启动 {calls}/{limit} 次{last_info}），未输出可交付正文。可提高 max_tool_calls 或缩小任务范围"
+                                )));
+                                break;
+                            }
                             if let crate::error::AgentError::DeadlineExceeded {
                                 elapsed_secs,
                                 tool_rounds,
@@ -12034,6 +12166,29 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                             break;
                         }
                     }
+                }
+                _ = &mut hard_timeout => {
+                    run_handle.abort();
+                    let summary = format!(
+                        "workflow step '{}' speaker '{}' 超过 {}s 硬上限，已中止；请缩小任务范围或提高 hard_timeout_secs",
+                        inp.step_id, speaker, step_timeout_s
+                    );
+                    let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                        role_id: speaker.clone(),
+                        detail: format!("timed out after {step_timeout_s}s"),
+                        sub_id: sub_id.clone(),
+                    });
+                    if let Some(id) = &sub_id {
+                        let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                            from_role: "manager".into(),
+                            to_role: speaker.clone(),
+                            status: "timeout".into(),
+                            summary: summary.clone(),
+                            sub_id: id.clone(),
+                            wf_id: Some(inp.wf_id.clone()),
+                        });
+                    }
+                    return Err(StepFail::Failed(summary));
                 }
                 _ = &mut timeout => {
                     // 子代理正挂起等用户回答（ask 阻塞中，choice 表里有
@@ -12733,6 +12888,7 @@ async fn run_workflow_serial(
                     &vars,
                     &ctx.cwd,
                     step.require_learn_chapters,
+                    step.require_learn_book,
                 ) {
                     Ok(fence) => {
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
@@ -13114,6 +13270,8 @@ async fn run_workflow_serial(
                     dispatch.step_has_output_contract = step_has_output_contract(step);
                     dispatch.review_constraints = step_review_constraints(step);
                     dispatch.request_budget = step_request_budget(step);
+                    dispatch.hard_timeout_secs = step.hard_timeout_secs;
+                    dispatch.max_tool_calls = step.max_tool_calls;
                     dispatch.review_async = review_is_advisory(&wf.name, step);
                     dispatch.gate_step = Some(Arc::new(step.clone()));
                     let (mut response, tools_called) = match run_step_speaker(dispatch).await {
@@ -13844,6 +14002,7 @@ fn collect_plan_tasks_mechanical(
     vars: &HashMap<String, String>,
     cwd: &Path,
     learn_chapters: bool,
+    learn_book: bool,
 ) -> Result<String, String> {
     let subst = |tpl: &str| -> String {
         let mut s = tpl.to_string();
@@ -13911,9 +14070,21 @@ fn collect_plan_tasks_mechanical(
     let body = serde_json::to_string(&serde_json::json!({ "tasks": tasks }))
         .map_err(|e| format!("序列化 tasks 失败：{e}"))?;
     let fence = format!("```json\n{body}\n```");
-    // 4) 跑与模型步同一套机械校验：失败即指名病灶，不静默。
+    // 4) 跑与模型步同一套机械校验：基础任务/章节约束之后，按配置继续跑
+    // 学习书全局约束。机械装配不能静默跳过 `require_learn_book`，否则共享
+    // 锚点、层级、体量等问题只会在旧的模型装配路径里被发现。
     check_plan_tasks_output(&fence, cwd, learn_chapters)
         .map_err(|e| format!("装配后校验未通过：{e}"))?;
+    if learn_book {
+        check_learn_book_output(&fence, cwd)
+            .and_then(|()| {
+                check_learn_book_against_breakdown(
+                    &fence,
+                    vars.get("plan").map_or("", String::as_str),
+                )
+            })
+            .map_err(|e| format!("装配后校验未通过：{e}"))?;
+    }
     Ok(fence)
 }
 
@@ -14023,7 +14194,8 @@ fn check_learn_skeleton_file(
 
 /// `fan_out.require_learn_chapters` 的扇出前校验：把骨架元素
 /// （`id`/`title`/`depends_on`/`brief`/`accept`）折成 [`PlanTask`] 跑
-/// [`check_learn_chapters`]，复用同一套章号连续 / 先修链 / 跨章引用判据。
+/// [`check_learn_chapters`]，并在扇出前统计精读锚点归属。这样同一文件被
+/// 三章以上使用时会直接要求重写骨架，不必先生成全部单章文件。
 fn validate_learn_chapters_skeleton(elems: &[serde_json::Value]) -> Result<(), String> {
     let mut tasks: Vec<crate::controller::PlanTask> = Vec::with_capacity(elems.len());
     for e in elems {
@@ -14042,7 +14214,39 @@ fn validate_learn_chapters_skeleton(elems: &[serde_json::Value]) -> Result<(), S
         .map_err(|err| format!("骨架元素无法解析为任务（title=「{title}」）：{err}"))?;
         tasks.push(pt);
     }
-    check_learn_chapters(&tasks)
+    let chapter_check = check_learn_chapters(&tasks);
+    let shared = shared_anchor_problems(elems.iter().map(|e| {
+        let title = e
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .trim()
+            .to_string();
+        let is_reading =
+            e.get("task_type").and_then(|v| v.as_str()).map(str::trim) == Some("learn_loop");
+        let paths = e
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (title, is_reading, paths)
+    }));
+    match (chapter_check, shared.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Err(e), true) => Err(e),
+        (Ok(()), false) => Err(format!(
+            "学习书骨架存在重复精读锚点：\n- {}",
+            shared.join("\n- ")
+        )),
+        (Err(e), false) => Err(format!(
+            "{e}\n学习书骨架存在重复精读锚点：\n- {}",
+            shared.join("\n- ")
+        )),
+    }
 }
 
 /// Everything a single DAG step task owns (spawned onto a `JoinSet`,
@@ -14153,8 +14357,8 @@ async fn run_dag_step(
             advisor_gate: inp.advisor_gate.clone(),
             advisor_pause: inp.advisor_pause.clone(),
             staging: inp.staging.clone(),
-            // 顶层 run 自己建（见 run_workflow_inner），宿主传 None。
-            dispatch_budget: None,
+            // 两种根级预算都由外层 run 创建并向嵌套层透传。
+            dispatch_budget: inp.dispatch_budget.clone(),
             token_budget: inp.token_budget.clone(),
             root_wf_id: inp.root_wf_id.clone(),
         };
@@ -14308,6 +14512,8 @@ async fn run_dag_step(
                     .and_then(|_| inp.vars.get("item_id").cloned()),
                 plan_stage: plan_stage.clone(),
                 request_budget: step_request_budget(step),
+                hard_timeout_secs: step.hard_timeout_secs,
+                max_tool_calls: step.max_tool_calls,
                 review_async: review_is_advisory(
                     crate::step_journal::workflow_name_of(&inp.wf_id),
                     step,
@@ -16435,6 +16641,7 @@ role = "reviewer"
         let verify = step("verify").expect("verify step exists");
         let fix = step("fix").expect("fix step exists");
         let recheck = step("recheck").expect("recheck step exists");
+        let release = step("release").expect("release gate exists");
         assert_eq!(
             verify.speakers,
             vec!["reviewer".to_string()],
@@ -16450,28 +16657,33 @@ role = "reviewer"
             vec!["reviewer".to_string()],
             "recheck 由 reviewer 独立复核"
         );
+        assert!(recheck.require_verdict_json, "复核必须提交结构化问题清单");
+        assert!(release.roles().is_empty(), "release 必须是零模型机械门");
 
-        // 放行门在 recheck（reviewer），不在 fix（programmer）——核心修复点。
+        // reviewer 只提交问题；release 按 severity 机械推导 PASS/REJECT。
+        assert_eq!(release.gate_from.as_deref(), Some("report"));
         assert_eq!(
-            recheck.loop_until.as_deref(),
+            release.loop_until.as_deref(),
             Some("VERDICT: PASS"),
-            "放行门必须挂在 reviewer 的复核步上"
+            "放行标记必须由机械门生成"
         );
         assert_eq!(
-            recheck.loop_back_to.as_deref(),
+            release.loop_back_to.as_deref(),
             Some("fix"),
-            "复核不过应跳回 fix 再修一轮"
+            "机械门不过应跳回 fix 再修一轮"
         );
         assert!(fix.loop_until.is_none(), "fix（改的人）不得持有放行门");
+        assert!(recheck.loop_until.is_none(), "reviewer 不得用自由文本自宣放行");
         assert!(
             verify.loop_until.is_none(),
             "verify（初审）不放行，只列问题"
         );
 
-        // 步序：verify 在 fix 前、fix 在 recheck 前（审→改→复核）。
+        // 步序：verify → fix → recheck → release（审→改→复核→机械放行）。
         let idx = |id: &str| wf.steps.iter().position(|s| s.id == id).unwrap();
         assert!(idx("verify") < idx("fix"), "先审后改");
         assert!(idx("fix") < idx("recheck"), "先改后复核");
+        assert!(idx("recheck") < idx("release"), "复核后才机械放行");
     }
 
     #[test]
@@ -30709,7 +30921,7 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
             task_file: ".latte/learn-plan/tasks/{{id}}.json".into(),
             on_fail: None,
         };
-        let fence = collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true)
+        let fence = collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true, false)
             .expect("骨架覆盖后应通过机械校验");
         // 产出是唯一 tasks fence，且标题取骨架权威值（漂移被纠正）。
         let (_, tasks) = find_tasks_fence(&fence).unwrap();
@@ -30720,7 +30932,8 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
 
         // 缺章：删掉 ch02 的文件，报错并指名。
         std::fs::remove_file(base.join("tasks/ch02.json")).unwrap();
-        let err = collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true).unwrap_err();
+        let err =
+            collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true, false).unwrap_err();
         assert!(err.contains("缺章 ch02"), "{err}");
     }
 

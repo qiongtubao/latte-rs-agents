@@ -757,7 +757,6 @@ impl TaskStore {
         self.notion_dirty.contains_after_take(id)
     }
 
-
     fn save_meta(&self) -> Result<(), String> {
         write_atomic_json(&self.dir.join("board.json"), &self.meta)
     }
@@ -1708,9 +1707,7 @@ pub async fn import_tasks(
         if already_imported {
             return Err(ApiError {
                 status: 409,
-                message: format!(
-                    "plan {plan_id:?} 已经被本次 server 导入过一次（重复导入防护）"
-                ),
+                message: format!("plan {plan_id:?} 已经被本次 server 导入过一次（重复导入防护）"),
             });
         }
     }
@@ -2338,7 +2335,11 @@ pub(crate) async fn reclaim_session_worktree(b: &UiBackend, agent_cwd: &Path) {
     if agent_cwd == b.cwd {
         return;
     }
-    if b.sessions.read().values().any(|h| h.agent_cwd() == agent_cwd) {
+    if b.sessions
+        .read()
+        .values()
+        .any(|h| h.agent_cwd() == agent_cwd)
+    {
         return;
     }
     let owner = {
@@ -2381,9 +2382,16 @@ fn build_dispatch_message(
     title: &str,
     priority: i64,
     description: &str,
+    paths: &[String],
     children: &[Task],
 ) -> String {
     let mut msg = format!("[任务 {id}] {title}\n优先级：P{priority}\n描述：{description}\n");
+    if !paths.is_empty() {
+        msg.push_str("【任务声明范围 task.paths】\n");
+        for path in paths {
+            msg.push_str(&format!("  - {path}\n"));
+        }
+    }
     if !children.is_empty() {
         msg.push_str("子任务：\n");
         for (i, c) in children.iter().enumerate() {
@@ -2588,6 +2596,7 @@ pub async fn dispatch_task(
         children,
         task_type,
         workflow,
+        task_paths,
         prev_state,
         recent_notes,
         family_ctx,
@@ -2620,6 +2629,7 @@ pub async fn dispatch_task(
             store.children_of(id),
             t.task_type.clone(),
             t.workflow.clone(),
+            t.paths.clone(),
             t.state.clone(),
             notes,
             build_family_context(&store, id),
@@ -2641,7 +2651,14 @@ pub async fn dispatch_task(
     // 点开报错、又要重新点立即执行。materialize 是 best-effort（失败
     // 只 eprintln），不阻断派发。
     api::materialize_session(b, &info.session_id).await.ok();
-    let base_msg = build_dispatch_message(id, &title, priority, &description, &children);
+    let base_msg = build_dispatch_message(
+        id,
+        &title,
+        priority,
+        &description,
+        &task_paths,
+        &children,
+    );
     // 任务族上下文（祖先链 + 兄弟 paths 边界）随本体一起下发：子任务
     // 执行时要知道自己在任务树里的位置，paths 声明的避让边界也在此。
     let base_msg = format!("{base_msg}{family_ctx}");
@@ -2716,10 +2733,7 @@ pub async fn dispatch_task(
                 // （重启后 reconcile 也不会动它——只 dispatch 状态回退）。
                 return Err(ApiError {
                     status: 409,
-                    message: format!(
-                        "state {:?} 不可派发（已并发被另一请求派发）",
-                        t.state
-                    ),
+                    message: format!("state {:?} 不可派发（已并发被另一请求派发）", t.state),
                 });
             }
             t.set_state("in_progress", actor, None, now);
@@ -2775,7 +2789,10 @@ pub async fn dispatch_task(
     let (bad_state, gone) = {
         let store = b.tasks.read();
         match store.get(id) {
-            Some(t) => ((t.state != "todo" && t.state != "rework").then(|| t.state.clone()), false),
+            Some(t) => (
+                (t.state != "todo" && t.state != "rework").then(|| t.state.clone()),
+                false,
+            ),
             None => (None, true),
         }
     };
@@ -3801,15 +3818,17 @@ pub async fn resume_task(b: &UiBackend, id: &str) -> Result<TaskView, ApiError> 
 
     // 2. 让绑定的 session 从断点续跑。session 已被删 → 404，提示用户改走
     //    中止（语义：执行体没了，只能放弃这次 run）。
-    api::chat_resume_session(b, Some(&session_id)).await.map_err(|e| {
-        if e.status == 404 {
-            ApiError::bad_request(format!(
+    api::chat_resume_session(b, Some(&session_id))
+        .await
+        .map_err(|e| {
+            if e.status == 404 {
+                ApiError::bad_request(format!(
                 "绑定的执行 session {session_id} 已不存在，无法续跑——请「中止」回 todo 后重新派发"
             ))
-        } else {
-            e
-        }
-    })?;
+            } else {
+                e
+            }
+        })?;
 
     // 3. 记 history（状态不变）。actor=user：重试是人触发的恢复动作。
     let now = now_ms();
@@ -4452,10 +4471,8 @@ mod tests {
         assert_eq!(t1.id, "LAT-100");
         // 模拟 board.json 损坏/回绕：写一份 next_seq 倒退的版本。
         let meta_path = dir.path().join(".latte/tasks/board.json");
-        let mut bad: BoardMeta = serde_json::from_str(
-            &std::fs::read_to_string(&meta_path).unwrap(),
-        )
-        .unwrap();
+        let mut bad: BoardMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         bad.next_seq = 100; // 回绕到起点
         std::fs::write(&meta_path, serde_json::to_string(&bad).unwrap()).unwrap();
         drop(store);
@@ -4472,10 +4489,8 @@ mod tests {
         assert_ne!(t2.id, "LAT-100", "新任务不得复用已用 id");
         assert!(store2.get("LAT-100").is_some(), "旧任务不能被覆盖丢");
         // 盘上的 board.json 也应被回写修正（下次启动不再回绕）。
-        let fixed: BoardMeta = serde_json::from_str(
-            &std::fs::read_to_string(&meta_path).unwrap(),
-        )
-        .unwrap();
+        let fixed: BoardMeta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(fixed.next_seq >= 101, "board.json 应回写修正后的 next_seq");
     }
 
@@ -6555,10 +6570,7 @@ mod tests {
         // meta 行里带着 [task-id] label（恢复后列表不显示成空白）。
         let raw = std::fs::read_to_string(&persisted).unwrap();
         let meta = raw.lines().next().expect("meta line");
-        assert!(
-            meta.contains(&ids[0]),
-            "meta label 应含任务 id：{meta}"
-        );
+        assert!(meta.contains(&ids[0]), "meta label 应含任务 id：{meta}");
 
         // 模拟重启：丢弃旧 backend，UiBackend::new 重新扫盘恢复。
         drop(b);
@@ -6582,18 +6594,17 @@ mod tests {
         let t = b2.tasks.read().get(&ids[0]).unwrap().clone();
         assert_eq!(t.state, "in_progress", "中断的任务保持 in_progress");
         assert_eq!(t.runs.last().unwrap().session_id, sid, "runs 关联仍在");
-        assert!(t.runs.last().unwrap().ended_at.is_none(), "run 未收尾，留给续跑");
+        assert!(
+            t.runs.last().unwrap().ended_at.is_none(),
+            "run 未收尾，留给续跑"
+        );
     }
     /// 同一任务并发派发两次（双击/两 tab 同时点）：写锁内复查 state
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_dispatch_on_same_task_only_one_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = std::sync::Arc::new(git_backend(&dir));
-        let ids = import_as_todo(
-            &b,
-            serde_json::json!({"tasks": [{ "title": "竞态派发" }]}),
-        )
-        .await;
+        let ids = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "竞态派发" }]})).await;
         let id = ids[0].clone();
 
         // 两个 dispatch 并发触发。join 收集结果。
@@ -6919,7 +6930,9 @@ mod tests {
 
         // todo → 400（造第二个 todo 任务校验状态守卫）。
         let todo_id = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "别的" }]})).await;
-        let err = resume_task(&b, &todo_id[0]).await.expect_err("todo 不可重试");
+        let err = resume_task(&b, &todo_id[0])
+            .await
+            .expect_err("todo 不可重试");
         assert_eq!(err.status, 400);
 
         // in_progress → 走 chat_resume_session 续跑（session 在盘上，无
@@ -6939,7 +6952,11 @@ mod tests {
     async fn resume_task_surfaces_deleted_session_as_abort_hint() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = test_backend(&dir);
-        let ids = import_as_todo(&b, serde_json::json!({"tasks": [{ "title": "死 session" }]})).await;
+        let ids = import_as_todo(
+            &b,
+            serde_json::json!({"tasks": [{ "title": "死 session" }]}),
+        )
+        .await;
         dispatch_task(&b, &ids[0], "user", "redo")
             .await
             .expect("派发");
@@ -6953,7 +6970,9 @@ mod tests {
             .unwrap()
             .session_id
             .clone();
-        crate::api::delete_session(&b, &sid).await.expect("删 session");
+        crate::api::delete_session(&b, &sid)
+            .await
+            .expect("删 session");
 
         let err = resume_task(&b, &ids[0])
             .await
@@ -7178,11 +7197,13 @@ mod tests {
     async fn import_same_plan_id_concurrently_only_one_succeeds() {
         let dir = tempfile::tempdir().expect("tempdir");
         let b = std::sync::Arc::new(test_backend(&dir));
-        let make_req = || serde_json::from_value::<ImportTasksRequest>(serde_json::json!({
-            "plan_id": "plan-manager-dup",
-            "tasks": [{ "title": "重复导入候选" }, { "title": "再来一份" }]
-        }))
-        .expect("parse req");
+        let make_req = || {
+            serde_json::from_value::<ImportTasksRequest>(serde_json::json!({
+                "plan_id": "plan-manager-dup",
+                "tasks": [{ "title": "重复导入候选" }, { "title": "再来一份" }]
+            }))
+            .expect("parse req")
+        };
         let h1 = {
             let b = b.clone();
             tokio::spawn(async move { import_tasks(&b, make_req()).await })
@@ -7230,7 +7251,6 @@ mod tests {
         let r3 = import_tasks(&b, req3).await.expect("no-plan ok");
         assert_eq!(r3.created.len(), 1);
     }
-
 
     /// 拆分导入：带 parent_id 的导入全部挂为该父任务的子任务。
     #[tokio::test]

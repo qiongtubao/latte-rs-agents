@@ -67,9 +67,8 @@ pub struct RoleHit {
     pub all_blocked: bool,
 }
 
-type RoleLookup = std::sync::Arc<
-    dyn Fn(&BTreeSet<String>) -> Vec<(String, Vec<String>, bool)> + Send + Sync,
->;
+type RoleLookup =
+    std::sync::Arc<dyn Fn(&BTreeSet<String>) -> Vec<(String, Vec<String>, bool)> + Send + Sync>;
 
 fn role_lookup() -> &'static Mutex<Option<RoleLookup>> {
     static L: OnceLock<Mutex<Option<RoleLookup>>> = OnceLock::new();
@@ -89,7 +88,11 @@ pub fn register_host(
     resolver: std::sync::Arc<crate::model_resolver::ModelResolver>,
     model_ids: impl IntoIterator<Item = String>,
 ) {
-    register_catalog(model_ids.into_iter().filter_map(|id| resolver.build_model(&id).ok()));
+    register_catalog(
+        model_ids
+            .into_iter()
+            .filter_map(|id| resolver.build_model(&id).ok()),
+    );
     register_resolver(resolver);
 }
 
@@ -134,11 +137,23 @@ impl BillingNotice {
             let dead = if self.dead_roles.is_empty() {
                 "其余模型可用，会自动回落".to_string()
             } else {
-                format!("其中整条链不可用、派给它们的任务会暂停：{}", self.dead_roles.join("、"))
+                format!(
+                    "其中整条链不可用、派给它们的任务会暂停：{}",
+                    self.dead_roles.join("、")
+                )
             };
-            let shown = self.roles.iter().take(SHOW).cloned().collect::<Vec<_>>().join("、");
+            let shown = self
+                .roles
+                .iter()
+                .take(SHOW)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("、");
             let more = if self.roles.len() > SHOW {
-                format!(" 等 {} 个（完整列表见 UI 横幅 / GET /api/billing）", self.roles.len())
+                format!(
+                    " 等 {} 个（完整列表见 UI 横幅 / GET /api/billing）",
+                    self.roles.len()
+                )
             } else {
                 String::new()
             };
@@ -182,7 +197,9 @@ pub fn forward_to(event_tx: broadcast::Sender<crate::controller::ChatEvent>) {
             match rx.recv().await {
                 Ok(n) => {
                     if event_tx
-                        .send(crate::controller::ChatEvent::Status { message: n.render() })
+                        .send(crate::controller::ChatEvent::Status {
+                            message: n.render(),
+                        })
                         .is_err()
                         && event_tx.receiver_count() == 0
                     {
@@ -214,7 +231,11 @@ fn account_key(m: &Model) -> String {
         h ^= u64::from(b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    format!("{}|{}|{h:016x}", m.provider, m.base_url.trim_end_matches('/'))
+    format!(
+        "{}|{}|{h:016x}",
+        m.provider,
+        m.base_url.trim_end_matches('/')
+    )
 }
 
 const BILLING_MARKERS: &[&str] = &[
@@ -243,7 +264,9 @@ const BILLING_MARKERS: &[&str] = &[
 pub fn is_billing_error(e: &AiError) -> bool {
     let has_marker = |msg: &str| {
         let m = msg.to_ascii_lowercase();
-        BILLING_MARKERS.iter().any(|k| m.contains(k) || msg.contains(k))
+        BILLING_MARKERS
+            .iter()
+            .any(|k| m.contains(k) || msg.contains(k))
     };
     match e {
         AiError::Api { status: 402, .. } => true,
@@ -342,7 +365,11 @@ pub fn blocked_accounts() -> Vec<BlockedAccount> {
             }
             let roles = lookup_roles(&models)
                 .into_iter()
-                .map(|(role, models, all_blocked)| RoleHit { role, models, all_blocked })
+                .map(|(role, models, all_blocked)| RoleHit {
+                    role,
+                    models,
+                    all_blocked,
+                })
                 .collect();
             BlockedAccount {
                 provider: e.provider,
@@ -415,18 +442,30 @@ mod tests {
 
     #[test]
     fn billing_errors_are_recognized_by_status_and_message() {
-        assert!(is_billing_error(&AiError::Api { status: 402, message: "x".into() }));
+        assert!(is_billing_error(&AiError::Api {
+            status: 402,
+            message: "x".into()
+        }));
         assert!(is_billing_error(&AiError::RateLimited {
             retry_after: 20.0,
             message: "You exceeded your current quota (insufficient_quota)".into()
         }));
-        assert!(is_billing_error(&AiError::Api { status: 403, message: "账户余额不足".into() }));
+        assert!(is_billing_error(&AiError::Api {
+            status: 403,
+            message: "账户余额不足".into()
+        }));
         assert!(!is_billing_error(&AiError::RateLimited {
             retry_after: 1.0,
             message: "请求过于频繁，请稍后重试".into()
         }));
-        assert!(!is_billing_error(&AiError::Api { status: 400, message: "invalid params".into() }));
-        assert!(!is_billing_error(&AiError::Api { status: 500, message: "billing service down".into() }));
+        assert!(!is_billing_error(&AiError::Api {
+            status: 400,
+            message: "invalid params".into()
+        }));
+        assert!(!is_billing_error(&AiError::Api {
+            status: 500,
+            message: "billing service down".into()
+        }));
     }
 
     #[test]
@@ -457,8 +496,10 @@ mod tests {
             dead_roles: vec!["r3".into()],
         };
         let t = n.render();
-        assert!(t.contains("受影响角色：r0、r1、r2、r3、r4、r5、r6、r7 等 10 个"), "{t}");
+        assert!(
+            t.contains("受影响角色：r0、r1、r2、r3、r4、r5、r6、r7 等 10 个"),
+            "{t}"
+        );
         assert!(t.contains("整条链不可用、派给它们的任务会暂停：r3"), "{t}");
     }
-
 }

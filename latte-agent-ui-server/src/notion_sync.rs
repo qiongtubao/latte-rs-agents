@@ -331,9 +331,9 @@ impl DirtySet {
         self.ids.contains(id)
     }
     /// 重启重建时批量注入盘上扫出的 id（**不再落盘**——标记文件已存在）。
-     pub(crate) fn restore_id(&mut self, id: String) {
-         self.ids.insert(id);
-     }
+    pub(crate) fn restore_id(&mut self, id: String) {
+        self.ids.insert(id);
+    }
     /// 下一轮 `sync` 还会再读到。
     pub fn take_dirty(&mut self) -> Vec<String> {
         let out: Vec<String> = self.ids.iter().cloned().collect();
@@ -683,7 +683,6 @@ mod tests {
         assert!(cwd.join(".latte/.tasks-dirty/LAT-101").is_file());
     }
 
-
     /// sync_once 期间的 race：take 清空内存后，用户再次 mark 同 id。
     /// 修前 sync 走 Ok 分支会无脑 clear_dirty_on_disk → 这次新 mark
     /// 永久丢失。contains_after_take 给出保护信号。
@@ -943,11 +942,7 @@ mod tests {
         };
         let summary2 = sync_dirty_tasks(&http, &cfg2, &mut store2).await;
         assert_eq!(summary2.failed_client, 1, "400 是致命数据错");
-        assert_eq!(
-            store2.notion_dirty_count(),
-            0,
-            "400 删除标记（不再重推）"
-        );
+        assert_eq!(store2.notion_dirty_count(), 0, "400 删除标记（不再重推）");
     }
 
     /// sync_dirty_tasks：5xx 失败 → dirty 保留待下一轮。

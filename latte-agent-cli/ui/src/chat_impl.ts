@@ -3322,6 +3322,22 @@ export function mountChat(opts: {
         resetWaitTimer();
         break;
       }
+      case "BackgroundJob": {
+        // 后台 job 起止：一行状态；子会话的归到子会话（data-sub-id 可右键看日志）。
+        const state =
+          e.status === "running" ? "后台运行中"
+          : e.status === "completed" ? `已结束 exit=${e.exit_code ?? "?"}`
+          : e.status === "stopped" ? `已终止${e.detail ? `（${e.detail}）` : ""}`
+          : e.status;
+        const who = e.role_id ? `${roleIcon(e.role_id)} ` : "";
+        addMessage({
+          kind: "status",
+          content: `⚙ ${who}${e.job_id} ${state} · ${e.elapsed_secs}s · ${truncate(e.command, 80)}`,
+          subId: e.sub_id,
+        });
+        resetWaitTimer();
+        break;
+      }
       case "Prompt":
         updateRoleDisplay(e.role_id, e.icon);
         container.modelPill.textContent = e.model_id;

@@ -240,7 +240,12 @@ impl ChatCmd {
         // 余额不足提示要点名受影响角色：注册模型目录与角色查询。
         latte_agent_core::billing::register_host(
             Arc::new(resolver.clone()),
-            merged.models.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            merged
+                .models
+                .models
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>(),
         );
         let default_params = GenerateParams::default();
         let initial_role = self.role.clone().unwrap_or_else(|| "manager".into());
@@ -2174,7 +2179,11 @@ fn spawn_cli_workflow_event_consumer_with(
                                 multi: q.multi,
                                 allow_upload: q.allow_upload,
                                 layout: q.layout,
-                                document_path: if qi == 0 { document_path.clone() } else { String::new() },
+                                document_path: if qi == 0 {
+                                    document_path.clone()
+                                } else {
+                                    String::new()
+                                },
                                 document_markdown: if qi == 0 {
                                     document_markdown.clone()
                                 } else {
@@ -2187,7 +2196,9 @@ fn spawn_cli_workflow_event_consumer_with(
                                 latte_agent_core::choice::cancel(&choice_id);
                                 break;
                             };
-                            if latte_agent_core::choice::resolve_one(&choice_id, &q.id, answer).is_err() {
+                            if latte_agent_core::choice::resolve_one(&choice_id, &q.id, answer)
+                                .is_err()
+                            {
                                 ui_emit(&format!(
                                     "[ask] 答案未送达（choice_id={choice_id} 已被取消或已回答）"
                                 ));
@@ -4110,7 +4121,10 @@ mod tests {
         let task = spawn_cli_workflow_event_consumer_with(rx, answerer);
         let id = "choice-cli-multi-q";
         let mut ev = choice_event(id, true, false);
-        if let latte_agent_core::controller::ChatEvent::ChoiceRequested { questions, options, .. } = &mut ev {
+        if let latte_agent_core::controller::ChatEvent::ChoiceRequested {
+            questions, options, ..
+        } = &mut ev
+        {
             options.clear();
             for (qid, label) in [("k1", "甲"), ("k2", "乙")] {
                 questions.push(latte_agent_core::controller::ChoiceQuestion {

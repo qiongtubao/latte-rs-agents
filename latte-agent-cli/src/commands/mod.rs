@@ -18,8 +18,8 @@ pub mod split_screen;
 pub mod style;
 pub mod test;
 pub mod trace_store;
-pub mod usage_report;
 pub mod ui;
+pub mod usage_report;
 pub mod workflow;
 
 use std::path::PathBuf;

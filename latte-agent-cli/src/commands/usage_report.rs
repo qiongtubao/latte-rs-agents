@@ -243,9 +243,17 @@ pub fn analyze(main: &[Value], subs: Vec<(String, Vec<Value>)>) -> UsageReport {
                 role = r.to_string();
             }
             if let Some(mc) = e.get("ModelCall") {
-                let class = CallClass::of(mc.get("finish_reason").and_then(Value::as_str).unwrap_or(""));
+                let class = CallClass::of(
+                    mc.get("finish_reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
                 let ms = mc.get("latency_ms").and_then(Value::as_u64).unwrap_or(0);
-                let model = mc.get("model_id").and_then(Value::as_str).unwrap_or("?").to_string();
+                let model = mc
+                    .get("model_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("?")
+                    .to_string();
                 let usage = mc.get("usage").map(Usage::from_call).unwrap_or_default();
                 calls.push((class, ms, usage, model));
             }
@@ -262,17 +270,27 @@ pub fn analyze(main: &[Value], subs: Vec<(String, Vec<Value>)>) -> UsageReport {
             continue;
         }
         let per_call_usage = calls.iter().any(|(_, _, u, _)| !u.is_zero());
-        let step = steps
-            .get(&sub_id)
-            .cloned()
-            .unwrap_or_else(|| if role == "advisor" { "(advisor 审查)".into() } else { "(未归属)".into() });
-        let mut agg = Agg { subs: 1, ..Default::default() };
+        let step = steps.get(&sub_id).cloned().unwrap_or_else(|| {
+            if role == "advisor" {
+                "(advisor 审查)".into()
+            } else {
+                "(未归属)".into()
+            }
+        });
+        let mut agg = Agg {
+            subs: 1,
+            ..Default::default()
+        };
         let (mut first_input, mut last_input) = (0, 0);
         for (class, ms, usage, model) in &calls {
             agg.add_call(*class, *ms, usage);
             let mut one = Agg::default();
             one.add_call(*class, *ms, usage);
-            report.by_model.entry(model.clone()).or_default().merge(&one);
+            report
+                .by_model
+                .entry(model.clone())
+                .or_default()
+                .merge(&one);
             if usage.input > 0 {
                 if first_input == 0 {
                     first_input = usage.input;
@@ -288,8 +306,23 @@ pub fn analyze(main: &[Value], subs: Vec<(String, Vec<Value>)>) -> UsageReport {
         }
         report.total.merge(&agg);
         report.by_step.entry(step.clone()).or_default().merge(&agg);
-        report.by_role.entry(if role.is_empty() { "?".into() } else { role.clone() }).or_default().merge(&agg);
-        report.subs.push(SubSummary { sub_id, role, step, agg, first_input, last_input });
+        report
+            .by_role
+            .entry(if role.is_empty() {
+                "?".into()
+            } else {
+                role.clone()
+            })
+            .or_default()
+            .merge(&agg);
+        report.subs.push(SubSummary {
+            sub_id,
+            role,
+            step,
+            agg,
+            first_input,
+            last_input,
+        });
     }
     report
 }
@@ -308,7 +341,8 @@ fn n(v: u64) -> String {
 }
 
 fn pct(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.0}%", x * 100.0)).unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{:.0}%", x * 100.0))
+        .unwrap_or_else(|| "-".into())
 }
 
 fn ratio(v: Option<f64>) -> String {
@@ -416,7 +450,10 @@ pub fn render(r: &UsageReport) -> String {
         ));
     }
     if t.truncated > 0 {
-        flags.push(format!("{} 次调用输出被长度上限截断，产出是半截的（要续写或重做）", t.truncated));
+        flags.push(format!(
+            "{} 次调用输出被长度上限截断，产出是半截的（要续写或重做）",
+            t.truncated
+        ));
     }
     for (name, a) in &r.by_step {
         if let (Some(h), true) = (a.cache_hit(), a.input >= 200_000) {
@@ -438,7 +475,10 @@ pub fn render(r: &UsageReport) -> String {
         }
     }
     if t.turn_totals_only {
-        flags.push("带 * 的行只有 turn 合计（旧日志没有逐次用量）：看不出每轮重传，也没有失败调用的 token".into());
+        flags.push(
+            "带 * 的行只有 turn 合计（旧日志没有逐次用量）：看不出每轮重传，也没有失败调用的 token"
+                .into(),
+        );
     }
     let _ = writeln!(out, "\n── 浪费信号 ──");
     if flags.is_empty() {
@@ -466,8 +506,14 @@ mod tests {
         assert_eq!(CallClass::of("stop"), CallClass::Ok);
         assert_eq!(CallClass::of("length"), CallClass::Truncated);
         assert_eq!(CallClass::of("timeout"), CallClass::Timeout);
-        assert_eq!(CallClass::of("error: all models unavailable … API error: 429 - rate_limit_error"), CallClass::RateLimited);
-        assert_eq!(CallClass::of("error: … 余额不足/配额耗尽 … 402"), CallClass::Billing);
+        assert_eq!(
+            CallClass::of("error: all models unavailable … API error: 429 - rate_limit_error"),
+            CallClass::RateLimited
+        );
+        assert_eq!(
+            CallClass::of("error: … 余额不足/配额耗尽 … 402"),
+            CallClass::Billing
+        );
         assert_eq!(CallClass::of("error: boom"), CallClass::Error);
     }
 
@@ -486,7 +532,9 @@ mod tests {
 
     #[test]
     fn aggregates_per_call_usage_by_step_role_and_model() {
-        let main = vec![json!({"type": "RoleStarted", "sub_id": "tutor-1", "detail": "workflow step 'ch_logic'"})];
+        let main = vec![
+            json!({"type": "RoleStarted", "sub_id": "tutor-1", "detail": "workflow step 'ch_logic'"}),
+        ];
         let sub1 = vec![
             json!({"role_name": "tutor", "sub_id": "tutor-1"}),
             call("glm", 5_000, "tool_calls", 10_000, 100, 0),
@@ -498,7 +546,10 @@ mod tests {
             json!({"role_name": "advisor"}),
             call("mini", 15_000, "stop", 2_000, 50, 0),
         ];
-        let r = analyze(&main, vec![("tutor-1".into(), sub1), ("advisor-9".into(), sub2)]);
+        let r = analyze(
+            &main,
+            vec![("tutor-1".into(), sub1), ("advisor-9".into(), sub2)],
+        );
         let t = &r.total;
         assert_eq!((t.calls, t.ok, t.timeout), (5, 4, 1));
         assert_eq!((t.input, t.output, t.cache_read), (62_000, 1_050, 30_000));
@@ -506,7 +557,11 @@ mod tests {
         assert_eq!(t.max_input, 30_000);
         let step = &r.by_step["ch_logic"];
         assert_eq!((step.calls, step.input), (4, 60_000));
-        assert!(r.by_step.contains_key("(advisor 审查)"), "没有 RoleStarted 的 advisor 单独归类: {:?}", r.by_step.keys());
+        assert!(
+            r.by_step.contains_key("(advisor 审查)"),
+            "没有 RoleStarted 的 advisor 单独归类: {:?}",
+            r.by_step.keys()
+        );
         assert_eq!(r.by_model["glm"].calls, 4);
         assert_eq!(r.by_model["mini"].input, 2_000);
         // 单次输入 10k → 30k：历史在重传中涨大
@@ -527,15 +582,27 @@ mod tests {
         assert!(r.total.turn_totals_only);
         assert_eq!((r.total.input, r.total.output), (500_000, 5_000));
         let text = render(&r);
-        assert!(text.contains("tutor*") && text.contains("只有 turn 合计"), "{text}");
+        assert!(
+            text.contains("tutor*") && text.contains("只有 turn 合计"),
+            "{text}"
+        );
     }
 
     #[test]
     fn render_flags_the_real_waste_signals() {
-        let main = vec![json!({"type": "RoleStarted", "sub_id": "t-1", "detail": "workflow step 'ch_frame'"})];
+        let main = vec![
+            json!({"type": "RoleStarted", "sub_id": "t-1", "detail": "workflow step 'ch_frame'"}),
+        ];
         let mut ev = vec![json!({"role_name": "tutor"})];
         for i in 0..40u64 {
-            ev.push(call("glm", 8_000, "tool_calls", 20_000 + i * 5_000, 50, 1_000));
+            ev.push(call(
+                "glm",
+                8_000,
+                "tool_calls",
+                20_000 + i * 5_000,
+                50,
+                1_000,
+            ));
         }
         ev.push(call("glm", 90_000, "timeout", 0, 0, 0));
         ev.push(call("glm", 20_000, "length", 5_000, 4_000, 0));
@@ -543,10 +610,22 @@ mod tests {
         let text = render(&r);
         assert!(text.contains("白等"), "{text}");
         assert!(text.contains("输出被长度上限截断"), "{text}");
-        assert!(text.contains("步骤 ch_frame") && text.contains("缓存命中只有"), "{text}");
+        assert!(
+            text.contains("步骤 ch_frame") && text.contains("缓存命中只有"),
+            "{text}"
+        );
         assert!(text.contains("工具循环每轮都在重传"), "{text}");
         // 干净的数据不报警
-        let clean = analyze(&[], vec![("c".into(), vec![json!({"role_name":"tutor"}), call("m", 1000, "stop", 1000, 500, 900)])]);
+        let clean = analyze(
+            &[],
+            vec![(
+                "c".into(),
+                vec![
+                    json!({"role_name":"tutor"}),
+                    call("m", 1000, "stop", 1000, 500, 900),
+                ],
+            )],
+        );
         assert!(render(&clean).contains("没有明显异常"));
     }
 

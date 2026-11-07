@@ -200,7 +200,11 @@ fn quiz_lines(point: &serde_json::Value, salt: u64) -> String {
         x ^= x << 17;
         labels.swap(i, (x % (i as u64 + 1)) as usize);
     }
-    let mut out = format!("- 题 `{}`：{}\n", str_of(point, "id"), str_of(point, "question"));
+    let mut out = format!(
+        "- 题 `{}`：{}\n",
+        str_of(point, "id"),
+        str_of(point, "question")
+    );
     for l in labels {
         out.push_str(&format!("  - {l}\n"));
     }
@@ -208,16 +212,26 @@ fn quiz_lines(point: &serde_json::Value, salt: u64) -> String {
 }
 
 fn rel(base: &Path, p: &Path) -> String {
-    p.strip_prefix(base).unwrap_or(p).to_string_lossy().replace('\\', "/")
+    p.strip_prefix(base)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// 写试学说明 `novice/brief.md`，重置本轮问题与轮次。
-pub fn write_study_brief(base: &Path, base_rel: &str, scope: &[String], engine_issues: Vec<Issue>) -> Result<(), String> {
+pub fn write_study_brief(
+    base: &Path,
+    base_rel: &str,
+    scope: &[String],
+    engine_issues: Vec<Issue>,
+) -> Result<(), String> {
     let plan = plan(base);
     let mut out = String::from("# 试学说明（引擎生成）\n\n## 要学的章节（按顺序）\n");
     let overview = base.join("sections/00_overview.md");
     if overview.is_file() {
-        out.push_str(&format!("- 总览 `overview`：`{base_rel}/sections/00_overview.md`\n"));
+        out.push_str(&format!(
+            "- 总览 `overview`：`{base_rel}/sections/00_overview.md`\n"
+        ));
     }
     for p in points(&plan) {
         let id = str_of(&p, "id");
@@ -263,7 +277,11 @@ pub fn write_study_brief(base: &Path, base_rel: &str, scope: &[String], engine_i
     let _ = std::fs::remove_file(dir(base).join("recheck.json"));
     // 引擎提出的问题也要有 id：辅导员按 id 回 `FIXED <id>`，空 id 永远对不上。
     let mut engine_issues = engine_issues;
-    for (n, i) in engine_issues.iter_mut().enumerate().filter(|(_, i)| i.id.is_empty()) {
+    for (n, i) in engine_issues
+        .iter_mut()
+        .enumerate()
+        .filter(|(_, i)| i.id.is_empty())
+    {
         i.id = format!("e{}", n + 1);
     }
     save_issues(base, &engine_issues)?;
@@ -362,7 +380,11 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
     let plan = plan(base);
     let mut issues = load_issues(base); // 引擎预置的（出处核对修不了的）
     let mut out = Ingested::default();
-    let answers = report.get("answers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let answers = report
+        .get("answers")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut missing = Vec::new();
     for p in points(&plan) {
         let id = str_of(&p, "id");
@@ -381,12 +403,24 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
         out.wrong_answers += 1;
         let basis = str_of(a, "basis");
         let file = locate_quote(base, basis).unwrap_or_default();
-        let chapter = if file.is_empty() { id.to_string() } else { chapter_of(&file) };
+        let chapter = if file.is_empty() {
+            id.to_string()
+        } else {
+            chapter_of(&file)
+        };
         issues.push(Issue {
             kind: "quiz".into(),
-            chapter: if chapter.is_empty() { id.to_string() } else { chapter },
+            chapter: if chapter.is_empty() {
+                id.to_string()
+            } else {
+                chapter
+            },
             file: file.clone(),
-            quote: if file.is_empty() { String::new() } else { basis.to_string() },
+            quote: if file.is_empty() {
+                String::new()
+            } else {
+                basis.to_string()
+            },
             // 措辞不预设「小白错了」：标准答案也是模型写的，可能本身就错，或者题干在问文档和
             // 源码里根本没有的东西（实测 n26：题问「换成 std::string 会多付出什么」，小白答「堆上
             // 复制一份」是对的，标准答案却写成了 Slice 的行为，于是文档被往错的方向改）。
@@ -394,7 +428,11 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
                 "小白作答「{}」选了「{choice}」，标准答案是「{answer}」，两者不一致。{}\
                  先对照源码判断：是标准答案 / 题干本身有问题，还是文档没讲清让小白答错。",
                 str_of(&p, "question"),
-                if file.is_empty() { "小白依据的那句没在文档里找到。".to_string() } else { format!("小白依据的原文：「{basis}」。") }
+                if file.is_empty() {
+                    "小白依据的那句没在文档里找到。".to_string()
+                } else {
+                    format!("小白依据的原文：「{basis}」。")
+                }
             ),
             source: "quiz".into(),
             status: "open".into(),
@@ -412,7 +450,12 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
             missing.join("、")
         ));
     }
-    for it in report.get("issues").and_then(|v| v.as_array()).into_iter().flatten() {
+    for it in report
+        .get("issues")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
         let kind = match str_of(it, "kind") {
             "code" => "code",
             "split" => "split",
@@ -426,7 +469,10 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
         let quote = str_of(it, "quote").trim().to_string();
         let evidence = str_of(it, "evidence").trim().to_string();
         if !evidence.is_empty() && !evidence_ok(&evidence) {
-            out.dropped.push(format!("「{}」依据 `{evidence}` 的行号不存在", clip(&problem, 40)));
+            out.dropped.push(format!(
+                "「{}」依据 `{evidence}` 的行号不存在",
+                clip(&problem, 40)
+            ));
             continue;
         }
         let (file, chapter) = if kind == "split" && quote.is_empty() {
@@ -435,11 +481,18 @@ pub fn ingest_report(base: &Path, evidence_ok: &dyn Fn(&str) -> bool) -> Result<
             match locate_quote(base, &quote) {
                 Some(f) => {
                     let ch = chapter_of(&f);
-                    let ch = if ch.is_empty() { str_of(it, "chapter").to_string() } else { ch };
+                    let ch = if ch.is_empty() {
+                        str_of(it, "chapter").to_string()
+                    } else {
+                        ch
+                    };
                     (f, ch)
                 }
                 None => {
-                    out.dropped.push(format!("「{}」摘的原文在文档/代码副本里找不到", clip(&problem, 40)));
+                    out.dropped.push(format!(
+                        "「{}」摘的原文在文档/代码副本里找不到",
+                        clip(&problem, 40)
+                    ));
                     continue;
                 }
             }
@@ -474,7 +527,12 @@ fn clip(s: &str, n: usize) -> String {
 
 /// `numeric:SC_NBINS|36,39` → `SC_NBINS`。
 pub fn numeric_name(check: &str) -> &str {
-    check.strip_prefix("numeric:").unwrap_or(check).split('|').next().unwrap_or("")
+    check
+        .strip_prefix("numeric:")
+        .unwrap_or(check)
+        .split('|')
+        .next()
+        .unwrap_or("")
 }
 
 /// 引擎数值问题（`check` 以 `numeric:` 开头）辅导员回应之后的裁定。`still` 是引擎重扫全文
@@ -485,20 +543,32 @@ pub fn numeric_name(check: &str) -> &str {
 ///   `dismissed`，之后的试学不再提。
 /// - 回了 FIXED：引擎重扫，矛盾还在就不认，改回 open；没了就是解决了。
 /// - 没回应的（还是 open）：矛盾没了就算解决，还在继续 open。
-pub fn apply_numeric_verdicts(issues: &mut [Issue], still: &[Issue], dismissed: &mut BTreeSet<String>) -> Vec<String> {
+pub fn apply_numeric_verdicts(
+    issues: &mut [Issue],
+    still: &[Issue],
+    dismissed: &mut BTreeSet<String>,
+) -> Vec<String> {
     let mut reopened = Vec::new();
     // 取证核对的判错：辅导员对着源码说「文档没错」（WONTFIX），同一条断言（原文 + 证据没变）以后不再核。
     // 状态保持 wontfix，由小白复查去判断理由是否站得住。
-    for i in issues.iter().filter(|i| i.check.starts_with("fact:") && i.status == "wontfix") {
+    for i in issues
+        .iter()
+        .filter(|i| i.check.starts_with("fact:") && i.status == "wontfix")
+    {
         dismissed.insert(i.check.clone());
     }
-    for i in issues.iter_mut().filter(|i| (i.check.starts_with("numeric:") || i.check.starts_with("arith:")) && i.status != "resolved") {
+    for i in issues.iter_mut().filter(|i| {
+        (i.check.starts_with("numeric:") || i.check.starts_with("arith:")) && i.status != "resolved"
+    }) {
         if i.status == "wontfix" {
             dismissed.insert(i.check.clone());
             i.status = "resolved".into();
             continue;
         }
-        match still.iter().find(|s| numeric_name(&s.check) == numeric_name(&i.check)) {
+        match still
+            .iter()
+            .find(|s| numeric_name(&s.check) == numeric_name(&i.check))
+        {
             Some(now) => {
                 if i.status == "fixed" {
                     i.fix_note = format!("{}（引擎复核：该宏的数值在全文仍然不一致）", i.fix_note);
@@ -515,7 +585,10 @@ pub fn apply_numeric_verdicts(issues: &mut [Issue], still: &[Issue], dismissed: 
 
 /// 交给辅导员改的问题（拆分类不在这里改——改知识点划分要重排整份 plan，交给学员定）。
 pub fn fixable(issues: &[Issue]) -> Vec<&Issue> {
-    issues.iter().filter(|i| i.status == "open" && i.kind != "split").collect()
+    issues
+        .iter()
+        .filter(|i| i.status == "open" && i.kind != "split")
+        .collect()
 }
 
 /// 写 `novice/fix_brief.md`。没有要改的返回 false。
@@ -539,7 +612,10 @@ pub fn write_fix_brief(base: &Path, base_rel: &str) -> Result<bool, String> {
             out.push_str(&format!("- 依据：`{}`\n", i.evidence));
         }
         if !i.recheck_note.is_empty() {
-            out.push_str(&format!("- 上轮你的处理：{}\n- 小白复查后仍不满意：{}\n", i.fix_note, i.recheck_note));
+            out.push_str(&format!(
+                "- 上轮你的处理：{}\n- 小白复查后仍不满意：{}\n",
+                i.fix_note, i.recheck_note
+            ));
         }
         out.push('\n');
     }
@@ -564,7 +640,10 @@ pub struct FixReplies {
 /// `npsizes=1` 两条互相矛盾的说明，最后标成"待确认"放行。引擎能机械核对的就别靠自述。
 /// 只对带依据（`evidence`）的问题生效：「看不懂」类问题的正确修法恰恰是保留原文、补解释。
 fn quote_still_present(base: &Path, i: &Issue) -> bool {
-    if !matches!(i.kind.as_str(), "doc" | "code") || i.evidence.trim().is_empty() || i.file.is_empty() {
+    if !matches!(i.kind.as_str(), "doc" | "code")
+        || i.evidence.trim().is_empty()
+        || i.file.is_empty()
+    {
         return false;
     }
     let q = norm(&i.quote);
@@ -575,7 +654,11 @@ fn quote_still_present(base: &Path, i: &Issue) -> bool {
 }
 
 /// 解析辅导员逐条回应：`FIXED n1: …` / `WONTFIX n2: …`。
-pub fn apply_fix_response(base: &Path, response: &str, broken_files: &[String]) -> Result<FixReplies, String> {
+pub fn apply_fix_response(
+    base: &Path,
+    response: &str,
+    broken_files: &[String],
+) -> Result<FixReplies, String> {
     let mut issues = load_issues(base);
     let mut replies: BTreeMap<String, (bool, String)> = BTreeMap::new();
     for line in response.lines() {
@@ -583,8 +666,14 @@ pub fn apply_fix_response(base: &Path, response: &str, broken_files: &[String]) 
         for (tag, fixed) in [("FIXED", true), ("WONTFIX", false)] {
             if let Some(rest) = l.strip_prefix(tag) {
                 let rest = rest.trim_start();
-                let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
-                let note = rest[id.len()..].trim_start_matches([':', '：', ' ']).trim().to_string();
+                let id: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                let note = rest[id.len()..]
+                    .trim_start_matches([':', '：', ' '])
+                    .trim()
+                    .to_string();
                 if !id.is_empty() {
                     replies.insert(id, (fixed, note));
                 }
@@ -593,16 +682,20 @@ pub fn apply_fix_response(base: &Path, response: &str, broken_files: &[String]) 
     }
     let mut silent = Vec::new();
     let mut unchanged = Vec::new();
-    for i in issues.iter_mut().filter(|i| i.status == "open" && i.kind != "split") {
+    for i in issues
+        .iter_mut()
+        .filter(|i| i.status == "open" && i.kind != "split")
+    {
         if broken_files.contains(&i.file) {
             i.fix_note = "改动没通过引擎检查（删了原有出处或整段推倒），已还原".into();
             continue;
         }
         match replies.get(&i.id) {
             Some((true, _)) if quote_still_present(base, i) => {
-                i.fix_note = "你回复了 FIXED，但小白指出的原文仍逐字留在文件里：直接改掉或删除那一段，\
+                i.fix_note =
+                    "你回复了 FIXED，但小白指出的原文仍逐字留在文件里：直接改掉或删除那一段，\
                               不要只在旁边追加说明"
-                    .into();
+                        .into();
                 unchanged.push(i.id.clone());
             }
             Some((true, note)) => {
@@ -625,19 +718,29 @@ pub fn write_recheck_brief(base: &Path, base_rel: &str) -> Result<bool, String> 
     let issues = load_issues(base);
     let st = load_state(base);
     let plan = plan(base);
-    let todo: Vec<&Issue> = issues.iter().filter(|i| i.status == "fixed" || i.status == "wontfix").collect();
+    let todo: Vec<&Issue> = issues
+        .iter()
+        .filter(|i| i.status == "fixed" || i.status == "wontfix")
+        .collect();
     if todo.is_empty() {
         return Ok(false);
     }
     let mut out = String::from("# 复查（只看下面这些条目和改过的地方）\n\n");
     for i in &todo {
-        out.push_str(&format!("## {}（{}）\n- 你上次的问题：{}\n", i.id, i.kind, i.problem));
+        out.push_str(&format!(
+            "## {}（{}）\n- 你上次的问题：{}\n",
+            i.id, i.kind, i.problem
+        ));
         if !i.file.is_empty() {
             out.push_str(&format!("- 改在：`{base_rel}/{}`\n", i.file));
         }
         out.push_str(&format!(
             "- 辅导员：{}{}\n",
-            if i.status == "fixed" { "已改。" } else { "不改，理由：" },
+            if i.status == "fixed" {
+                "已改。"
+            } else {
+                "不改，理由："
+            },
             i.fix_note
         ));
         if i.kind == "quiz" {
@@ -662,15 +765,29 @@ pub fn ingest_recheck(base: &Path) -> Result<(usize, bool), String> {
         serde_json::from_str(&raw).map_err(|e| format!("{DIR}/recheck.json 不是合法 JSON：{e}"))?;
     let plan = plan(base);
     let mut issues = load_issues(base);
-    let verdicts = v.get("issues").and_then(|x| x.as_array()).cloned().unwrap_or_default();
-    let answers = v.get("answers").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let verdicts = v
+        .get("issues")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let answers = v
+        .get("answers")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut missing = Vec::new();
-    for i in issues.iter_mut().filter(|i| i.status == "fixed" || i.status == "wontfix") {
+    for i in issues
+        .iter_mut()
+        .filter(|i| i.status == "fixed" || i.status == "wontfix")
+    {
         let verdict = verdicts.iter().find(|x| str_of(x, "id") == i.id);
         let resolved = if i.kind == "quiz" {
             // 答对才算解决：不采信「我觉得改好了」。
             let point = quiz_point(&points(&plan), i);
-            let qid = point.as_ref().map(|p| str_of(p, "id").to_string()).unwrap_or_default();
+            let qid = point
+                .as_ref()
+                .map(|p| str_of(p, "id").to_string())
+                .unwrap_or_default();
             // 对照 plan.json 里**现在**的标准答案：辅导员发现原答案有误改过题，旧答案不再算数。
             let expected = point
                 .as_ref()
@@ -685,7 +802,10 @@ pub fn ingest_recheck(base: &Path) -> Result<(usize, bool), String> {
                 }
             }
         } else {
-            match verdict.and_then(|x| x.get("resolved")).and_then(|x| x.as_bool()) {
+            match verdict
+                .and_then(|x| x.get("resolved"))
+                .and_then(|x| x.as_bool())
+            {
                 Some(b) => b,
                 None => {
                     missing.push(i.id.clone());
@@ -693,13 +813,19 @@ pub fn ingest_recheck(base: &Path) -> Result<(usize, bool), String> {
                 }
             }
         };
-        let note = verdict.map(|x| str_of(x, "note").to_string()).unwrap_or_default();
+        let note = verdict
+            .map(|x| str_of(x, "note").to_string())
+            .unwrap_or_default();
         if resolved {
             i.status = "resolved".into();
             i.recheck_note = note;
         } else {
             i.status = "open".into();
-            i.recheck_note = if note.is_empty() { "复查仍没看懂".into() } else { note };
+            i.recheck_note = if note.is_empty() {
+                "复查仍没看懂".into()
+            } else {
+                note
+            };
         }
     }
     if !missing.is_empty() {
@@ -712,7 +838,10 @@ pub fn ingest_recheck(base: &Path) -> Result<(usize, bool), String> {
     let mut st = load_state(base);
     st.round += 1;
     save_state(base, &st)?;
-    let open = issues.iter().filter(|i| i.status == "open" && i.kind != "split").count();
+    let open = issues
+        .iter()
+        .filter(|i| i.status == "open" && i.kind != "split")
+        .count();
     Ok((open, open == 0 || st.round >= MAX_ROUNDS))
 }
 
@@ -739,7 +868,10 @@ pub fn finalize(base: &Path) -> Result<Vec<Issue>, String> {
             if faq.is_file() {
                 let mut t = std::fs::read_to_string(&faq).unwrap_or_default();
                 if !t.contains(&i.problem) {
-                    t.push_str(&format!("\n\n#### 试学提问：{}\n\n{}\n", i.problem, i.fix_note));
+                    t.push_str(&format!(
+                        "\n\n#### 试学提问：{}\n\n{}\n",
+                        i.problem, i.fix_note
+                    ));
                     let _ = std::fs::write(&faq, t);
                 }
             }
@@ -748,7 +880,10 @@ pub fn finalize(base: &Path) -> Result<Vec<Issue>, String> {
     save_issues(base, &issues)?;
     let mut md = String::from("# 试学后仍待确认的问题\n\n");
     for i in &pending {
-        md.push_str(&format!("- {}（{}，章节 {}）{}\n", i.id, i.kind, i.chapter, i.problem));
+        md.push_str(&format!(
+            "- {}（{}，章节 {}）{}\n",
+            i.id, i.kind, i.chapter, i.problem
+        ));
     }
     std::fs::write(dir(base).join("pending.md"), md).map_err(|e| e.to_string())?;
     let mut st = load_state(base);
@@ -768,7 +903,9 @@ fn comment_prefix(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
         "md" | "markdown" | "txt" => None,
-        "py" | "sh" | "bash" | "zsh" | "rb" | "toml" | "yaml" | "yml" | "pl" | "mk" | "cmake" => Some("#"),
+        "py" | "sh" | "bash" | "zsh" | "rb" | "toml" | "yaml" | "yml" | "pl" | "mk" | "cmake" => {
+            Some("#")
+        }
         "sql" | "lua" | "hs" => Some("--"),
         // C 系 / Rust / Go / Java / JS / TS 等一律 `//`；认不出的扩展名也用 `//`，
         // 总比一行引用块强（副本的头部本来就是按语言写的注释）。
@@ -785,7 +922,11 @@ fn mark_pending(base: &Path, i: &Issue) {
         base.join(&i.file)
     };
     let prefix = comment_prefix(&target);
-    let body = format!("⚠️ 待确认（试学提问 {}）：{}", i.id, i.problem.replace('\n', " "));
+    let body = format!(
+        "⚠️ 待确认（试学提问 {}）：{}",
+        i.id,
+        i.problem.replace('\n', " ")
+    );
     let note = match prefix {
         Some(p) => format!("{p} {body}"),
         None => format!("> {body}"),
@@ -808,13 +949,18 @@ fn mark_pending(base: &Path, i: &Issue) {
         Some(at) if prefix.is_some() => {
             // 代码：紧跟在原文那一行后面，保持缩进；不能像 markdown 那样找"下一个空行"，
             // 那会把标记丢到别的函数里去。
-            let indent: String = lines[at].chars().take_while(|c| c.is_whitespace()).collect();
+            let indent: String = lines[at]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect();
             let mut v: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
             v.insert(at + 1, format!("{indent}{note}"));
             v.join("\n")
         }
         Some(at) => {
-            let end = (at..lines.len()).find(|&j| lines[j].trim().is_empty()).unwrap_or(lines.len());
+            let end = (at..lines.len())
+                .find(|&j| lines[j].trim().is_empty())
+                .unwrap_or(lines.len());
             let mut v: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
             v.insert(end, String::new());
             v.insert(end + 1, note);
@@ -873,8 +1019,14 @@ mod tests {
         let d = ws();
         write_study_brief(d.path(), "L", &["k2".into()], vec![]).unwrap();
         // 没答题 → 报告不合格
-        std::fs::write(d.path().join("novice/report.json"), r#"{"answers":[],"issues":[]}"#).unwrap();
-        assert!(ingest_report(d.path(), &|_| true).unwrap_err().contains("k2"));
+        std::fs::write(
+            d.path().join("novice/report.json"),
+            r#"{"answers":[],"issues":[]}"#,
+        )
+        .unwrap();
+        assert!(ingest_report(d.path(), &|_| true)
+            .unwrap_err()
+            .contains("k2"));
         std::fs::write(
             d.path().join("novice/report.json"),
             serde_json::json!({
@@ -916,10 +1068,18 @@ mod tests {
         .unwrap();
         let got = ingest_report(d.path(), &|_| true).unwrap();
         assert_eq!(got.issues[0].check, "quiz:k2");
-        assert!(got.issues[0].problem.contains("题干本身有问题") || got.issues[0].problem.contains("标准答案 / 题干本身有问题"), "{}", got.issues[0].problem);
+        assert!(
+            got.issues[0].problem.contains("题干本身有问题")
+                || got.issues[0].problem.contains("标准答案 / 题干本身有问题"),
+            "{}",
+            got.issues[0].problem
+        );
         // 辅导员核对源码后发现原标准答案是错的，改了 plan.json。
-        let mut plan: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(d.path().join("plan.json")).unwrap()).unwrap();
-        plan["knowledge_points"][0]["question"] = serde_json::json!("改写后的题干：申请恰好 16384 字节？");
+        let mut plan: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(d.path().join("plan.json")).unwrap())
+                .unwrap();
+        plan["knowledge_points"][0]["question"] =
+            serde_json::json!("改写后的题干：申请恰好 16384 字节？");
         plan["knowledge_points"][0]["answer"] = serde_json::json!("作为 Small 走 slab 分配");
         std::fs::write(d.path().join("plan.json"), plan.to_string()).unwrap();
         apply_fix_response(d.path(), "FIXED n1: 题有问题，已改题", &[]).unwrap();
@@ -931,7 +1091,11 @@ mod tests {
             serde_json::json!({"issues": [{"id": "n1", "resolved": true}], "answers": [{"id": "k2", "choice": "作为 Small 走 slab 分配"}]}).to_string(),
         )
         .unwrap();
-        assert_eq!(ingest_recheck(d.path()).unwrap().0, 0, "按现在的答案答对 → 解决");
+        assert_eq!(
+            ingest_recheck(d.path()).unwrap().0,
+            0,
+            "按现在的答案答对 → 解决"
+        );
     }
 
     #[test]
@@ -950,7 +1114,12 @@ mod tests {
         .unwrap();
         ingest_report(d.path(), &|_| true).unwrap();
         assert!(write_fix_brief(d.path(), "L").unwrap());
-        let replies = apply_fix_response(d.path(), "FIXED n1: 改成 ≥ 16 KiB\nFIXED n2: 边界改了\n- FIXED n3: 补了解释\n", &[]).unwrap();
+        let replies = apply_fix_response(
+            d.path(),
+            "FIXED n1: 改成 ≥ 16 KiB\nFIXED n2: 边界改了\n- FIXED n3: 补了解释\n",
+            &[],
+        )
+        .unwrap();
         assert_eq!(replies, FixReplies::default());
         assert!(write_recheck_brief(d.path(), "L").unwrap());
         let rb = std::fs::read_to_string(d.path().join("novice/recheck_brief.md")).unwrap();
@@ -978,9 +1147,15 @@ mod tests {
         let bg = std::fs::read_to_string(d.path().join("sections/k2/1_background.md")).unwrap();
         assert!(bg.contains("⚠️ 待确认（试学提问 n1）"), "{bg}");
         let pos_note = bg.find("⚠️").unwrap();
-        assert!(pos_note < bg.find("下一段").unwrap(), "标在原文段落后面: {bg}");
+        assert!(
+            pos_note < bg.find("下一段").unwrap(),
+            "标在原文段落后面: {bg}"
+        );
         let faq = std::fs::read_to_string(d.path().join("sections/k2/8_faq.md")).unwrap();
-        assert!(faq.contains("试学提问：这段看不懂") && faq.contains("补了解释"), "{faq}");
+        assert!(
+            faq.contains("试学提问：这段看不懂") && faq.contains("补了解释"),
+            "{faq}"
+        );
     }
 
     fn numeric_issue(id: &str, check: &str, status: &str) -> Issue {
@@ -1006,17 +1181,30 @@ mod tests {
             numeric_issue("n4", "numeric:LG_PAGE|12,14", "open"),
         ];
         // 重扫后 SC_NBINS 仍有矛盾（数值组合变了：39 改成了 38）、LG_PAGE 仍有；SC_NSIZES 没了
-        let still = vec![numeric_issue("e1", "numeric:SC_NBINS|36,38", "open"), numeric_issue("e2", "numeric:LG_PAGE|12,14", "open")];
+        let still = vec![
+            numeric_issue("e1", "numeric:SC_NBINS|36,38", "open"),
+            numeric_issue("e2", "numeric:LG_PAGE|12,14", "open"),
+        ];
         let mut dismissed = BTreeSet::new();
         let reopened = apply_numeric_verdicts(&mut issues, &still, &mut dismissed);
         assert_eq!(issues[0].status, "resolved", "WONTFIX 采信");
         assert!(dismissed.contains("numeric:SC_LG_NGROUP|1,2"));
         assert_eq!(issues[1].status, "open", "说改了但矛盾还在 → 不认");
-        assert_eq!(issues[1].check, "numeric:SC_NBINS|36,38", "跟踪最新的数值组合");
+        assert_eq!(
+            issues[1].check, "numeric:SC_NBINS|36,38",
+            "跟踪最新的数值组合"
+        );
         assert!(issues[1].fix_note.contains("引擎复核"));
-        assert_eq!(reopened.len(), 1, "只有「回了 FIXED 又没改好」的要打回: {reopened:?}");
+        assert_eq!(
+            reopened.len(),
+            1,
+            "只有「回了 FIXED 又没改好」的要打回: {reopened:?}"
+        );
         assert_eq!(issues[2].status, "resolved", "真改好了");
-        assert_eq!(issues[3].status, "open", "没回应且矛盾还在：继续 open，不算打回");
+        assert_eq!(
+            issues[3].status, "open",
+            "没回应且矛盾还在：继续 open，不算打回"
+        );
         assert_eq!(numeric_name("numeric:SC_NBINS|36,39"), "SC_NBINS");
     }
 
@@ -1063,13 +1251,23 @@ mod tests {
         };
         mark_pending(d.path(), &issue);
         let got = std::fs::read_to_string(d.path().join("code/k2-a.c")).unwrap();
-        assert!(!got.contains("> ⚠️"), "代码文件里不能有 markdown 引用块: {got}");
+        assert!(
+            !got.contains("> ⚠️"),
+            "代码文件里不能有 markdown 引用块: {got}"
+        );
         let lines: Vec<&str> = got.lines().collect();
         let at = lines.iter().position(|l| l.contains("npsizes++")).unwrap();
-        assert!(lines[at + 1].starts_with("\t// ⚠️ 待确认（试学提问 n1）：64 不是 4096 的整数倍 注释矛盾"), "紧跟原文且保持缩进: {got}");
+        assert!(
+            lines[at + 1]
+                .starts_with("\t// ⚠️ 待确认（试学提问 n1）：64 不是 4096 的整数倍 注释矛盾"),
+            "紧跟原文且保持缩进: {got}"
+        );
         // 重复标记不叠加
         mark_pending(d.path(), &issue);
-        assert_eq!(std::fs::read_to_string(d.path().join("code/k2-a.c")).unwrap(), got);
+        assert_eq!(
+            std::fs::read_to_string(d.path().join("code/k2-a.c")).unwrap(),
+            got
+        );
         // 其它语言的行注释前缀
         assert_eq!(comment_prefix(Path::new("a.py")), Some("#"));
         assert_eq!(comment_prefix(Path::new("a.rs")), Some("//"));
@@ -1082,7 +1280,11 @@ mod tests {
     fn fixed_claim_is_rejected_while_quoted_text_remains() {
         let d = ws();
         let wrong = "退出时 npsizes=1，因为 64 是 4096 整数倍";
-        std::fs::write(d.path().join("sections/k2/1_background.md"), format!("前文\n{wrong}\n后面这一段讲具体的分档数字")).unwrap();
+        std::fs::write(
+            d.path().join("sections/k2/1_background.md"),
+            format!("前文\n{wrong}\n后面这一段讲具体的分档数字"),
+        )
+        .unwrap();
         write_study_brief(d.path(), "L", &["k2".into()], vec![]).unwrap();
         std::fs::write(
             d.path().join("novice/report.json"),
@@ -1103,14 +1305,30 @@ mod tests {
             format!("前文\n{wrong}\n（补充：其实不是）\n后面这一段讲具体的分档数字"),
         )
         .unwrap();
-        let r = apply_fix_response(d.path(), "FIXED n1: 补了说明\nFIXED n2: 补了解释", &[]).unwrap();
-        assert_eq!(r.unchanged, vec!["n1".to_string()], "带依据的事实错误，原文还在 → 不采信");
+        let r =
+            apply_fix_response(d.path(), "FIXED n1: 补了说明\nFIXED n2: 补了解释", &[]).unwrap();
+        assert_eq!(
+            r.unchanged,
+            vec!["n1".to_string()],
+            "带依据的事实错误，原文还在 → 不采信"
+        );
         let issues = load_issues(d.path());
         assert_eq!(issues[0].status, "open");
-        assert!(issues[0].fix_note.contains("仍逐字留在文件里"), "{:?}", issues[0]);
-        assert_eq!(issues[1].status, "fixed", "没有依据的看不懂类，保留原文补解释是正确修法");
+        assert!(
+            issues[0].fix_note.contains("仍逐字留在文件里"),
+            "{:?}",
+            issues[0]
+        );
+        assert_eq!(
+            issues[1].status, "fixed",
+            "没有依据的看不懂类，保留原文补解释是正确修法"
+        );
         // 真的改掉原文 → 采信
-        std::fs::write(d.path().join("sections/k2/1_background.md"), "前文\n退出时 npsizes=0\n后面这一段讲具体的分档数字").unwrap();
+        std::fs::write(
+            d.path().join("sections/k2/1_background.md"),
+            "前文\n退出时 npsizes=0\n后面这一段讲具体的分档数字",
+        )
+        .unwrap();
         let r = apply_fix_response(d.path(), "FIXED n1: 改成 0", &[]).unwrap();
         assert!(r.unchanged.is_empty() && r.silent.is_empty(), "{r:?}");
         assert_eq!(load_issues(d.path())[0].status, "fixed");
@@ -1129,7 +1347,12 @@ mod tests {
         .unwrap();
         let got = ingest_report(d.path(), &|_| true).unwrap();
         assert_eq!(got.wrong_answers, 0);
-        apply_fix_response(d.path(), "FIXED n1: 改了", &["sections/k2/1_background.md".into()]).unwrap();
+        apply_fix_response(
+            d.path(),
+            "FIXED n1: 改了",
+            &["sections/k2/1_background.md".into()],
+        )
+        .unwrap();
         assert_eq!(load_issues(d.path())[0].status, "open");
         assert!(!write_recheck_brief(d.path(), "L").unwrap());
     }

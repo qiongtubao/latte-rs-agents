@@ -58,6 +58,10 @@ pub struct StepForm {
     #[serde(default)]
     pub output_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_timeout_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_token_budget: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_token_ratio: Option<f64>,
@@ -243,6 +247,8 @@ fn step_to_form(s: &WorkflowStepDef) -> StepForm {
         speakers: s.roles(),
         prompt: s.task_text().to_string(),
         output_key: s.output_key.clone(),
+        hard_timeout_secs: s.hard_timeout_secs,
+        max_tool_calls: s.max_tool_calls,
         prompt_token_budget: s.prompt_token_budget,
         prompt_token_ratio: s.prompt_token_ratio,
         context_overflow_restart: s.context_overflow_restart,
@@ -287,6 +293,8 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // 请求预算档位只在 TOML 权威版可配；试运行走默认档。
                 budget: None,
                 max_requests: None,
+                hard_timeout_secs: s.hard_timeout_secs,
+                max_tool_calls: s.max_tool_calls,
                 context_overflow_restart: s.context_overflow_restart,
                 context_overflow_max_restarts: 2,
                 context_overflow_files: vec![],
@@ -681,7 +689,6 @@ pub(crate) struct WorkflowRunState {
 }
 
 impl WorkflowRunState {
-
     /// 原子 start：检查-登记一把锁内完成，关闭旧 is_active()→start()
     /// TOCTOU——两个并发请求都过 is_active，都跑 start，后者的 tx/
     /// cancel/run_id 会覆盖前者的，第一次跑的事件永远到不了 SSE 客户端
@@ -705,7 +712,6 @@ impl WorkflowRunState {
         });
         Ok(())
     }
-
 
     /// 转发一条事件：同一把写锁内先记录回放再广播。与
     /// `subscribe_with_history`（读锁内建 receiver + 快照 history）
@@ -762,19 +768,30 @@ mod tests {
         let s = WorkflowRunState::default();
         let (tx1, _rx1) = tokio::sync::broadcast::channel::<ChatEvent>(1);
         let (tx2, _rx2) = tokio::sync::broadcast::channel::<ChatEvent>(1);
-        let r1 = s.try_start(tx1, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-1".into());
-        let r2 = s.try_start(tx2, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-2".into());
+        let r1 = s.try_start(
+            tx1,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            "run-1".into(),
+        );
+        let r2 = s.try_start(
+            tx2,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            "run-2".into(),
+        );
         assert!(r1.is_ok());
         assert!(r2.is_err(), "并发第二个必须 409，修复前会覆盖前者");
         // 跑完第一个后 clear，第二个应该能正常起。
         s.clear();
         let (tx3, _rx3) = tokio::sync::broadcast::channel::<ChatEvent>(1);
-        let r3 = s.try_start(tx3, Arc::new(std::sync::atomic::AtomicBool::new(false)), "run-3".into());
+        let r3 = s.try_start(
+            tx3,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            "run-3".into(),
+        );
         assert!(r3.is_ok(), "clear 后必须能再次起 run");
     }
 
     fn merged_with_roles(ids: &[&str]) -> AgentConfig {
-
         let mut cfg = AgentConfig::default();
         for id in ids {
             cfg.roles.insert(
@@ -809,6 +826,8 @@ mod tests {
                 speakers,
                 prompt: prompt.into(),
                 output_key: None,
+                hard_timeout_secs: None,
+                max_tool_calls: None,
                 prompt_token_budget: None,
                 prompt_token_ratio: None,
                 context_overflow_restart: false,
@@ -875,6 +894,8 @@ mod tests {
                     speakers: vec!["pm".into()],
                     prompt: "draft {{topic}}".into(),
                     output_key: Some("draft".into()),
+                    hard_timeout_secs: None,
+                    max_tool_calls: None,
                     gates: Vec::new(),
                     prompt_token_budget: None,
                     prompt_token_ratio: None,
@@ -886,6 +907,8 @@ mod tests {
                     speakers: vec!["pm".into()],
                     prompt: "refine {{draft}} with {{missing}}".into(),
                     output_key: Some("draft".into()),
+                    hard_timeout_secs: None,
+                    max_tool_calls: None,
                     gates: Vec::new(),
                     prompt_token_budget: None,
                     prompt_token_ratio: None,

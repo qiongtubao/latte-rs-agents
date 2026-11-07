@@ -14,7 +14,7 @@
 pub fn lint(text: &str, dir: Option<&std::path::Path>) -> Vec<String> {
     let mut problems = Vec::new();
     let mut fence: Option<(usize, char, usize)> = None; // (行号, 字符, 长度)
-    // 表格状态：(表头行号, 列数)
+                                                        // 表格状态：(表头行号, 列数)
     let mut table: Option<(usize, usize)> = None;
     let mut prev_table_row_open: Option<usize> = None;
     let mut think_reported = false;
@@ -47,7 +47,9 @@ pub fn lint(text: &str, dir: Option<&std::path::Path>) -> Vec<String> {
             continue;
         }
         if !think_reported && (t.contains("<think>") || t.contains("</think>")) {
-            problems.push(format!("第 {ln} 行有模型思考内容 `<think>` 漏进了正文，删掉这段"));
+            problems.push(format!(
+                "第 {ln} 行有模型思考内容 `<think>` 漏进了正文，删掉这段"
+            ));
             think_reported = true;
         }
         if let Some(open) = prev_table_row_open.take() {
@@ -117,7 +119,12 @@ pub fn lint(text: &str, dir: Option<&std::path::Path>) -> Vec<String> {
 /// `|` 全被当成代码里的字符，列数算成 1 列，白白把合法表格打回去（实测：写 markdown 围栏
 /// 相关主题时，逐轮推演表整张被判坏，重试用完只能带着"坏表格"放行）。
 fn table_cols(row: &str) -> usize {
-    let chars: Vec<char> = row.trim().trim_start_matches('|').trim_end_matches('|').chars().collect();
+    let chars: Vec<char> = row
+        .trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .chars()
+        .collect();
     let run_len = |from: usize| chars[from..].iter().take_while(|c| **c == '`').count();
     let mut n = 0;
     let mut prev = ' ';
@@ -168,9 +175,17 @@ fn local_images(line: &str) -> Vec<String> {
         let Some(close) = rest.find("](") else { break };
         let after = &rest[close + 2..];
         let Some(end) = after.find(')') else { break };
-        let target = after[..end].split_whitespace().next().unwrap_or("").to_string();
+        let target = after[..end]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
         rest = &after[end..];
-        if target.is_empty() || target.contains("://") || target.starts_with("data:") || target.starts_with('/') {
+        if target.is_empty()
+            || target.contains("://")
+            || target.starts_with("data:")
+            || target.starts_with('/')
+        {
             continue;
         }
         out.push(target);
@@ -188,7 +203,9 @@ pub fn dead_links(root: &std::path::Path) -> Vec<String> {
         if !seen.insert(md.clone()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&md) else { continue };
+        let Ok(text) = std::fs::read_to_string(&md) else {
+            continue;
+        };
         let dir = md.parent().map(|d| d.to_path_buf()).unwrap_or_default();
         let mut in_fence = false;
         for line in text.lines() {
@@ -206,7 +223,9 @@ pub fn dead_links(root: &std::path::Path) -> Vec<String> {
                 }
                 let p = dir.join(path);
                 if !p.exists() {
-                    let name = md.strip_prefix(root.parent().unwrap_or(&dir)).unwrap_or(&md);
+                    let name = md
+                        .strip_prefix(root.parent().unwrap_or(&dir))
+                        .unwrap_or(&md);
                     dead.push(format!("{}: {target}", name.display()));
                 } else if path.ends_with(".md") {
                     queue.push(p);
@@ -224,7 +243,11 @@ fn link_targets(line: &str) -> Vec<String> {
     while let Some(p) = rest.find("](") {
         let after = &rest[p + 2..];
         let Some(end) = after.find(')') else { break };
-        let target = after[..end].split_whitespace().next().unwrap_or("").to_string();
+        let target = after[..end]
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_string();
         rest = &after[end..];
         if target.is_empty()
             || target.contains("://")
@@ -247,7 +270,10 @@ mod tests {
     #[test]
     fn unclosed_fence() {
         let p = lint("正文\n```c\nint x;\n", None);
-        assert!(p[0].contains("第 2 行") && p[0].contains("没有闭合"), "{p:?}");
+        assert!(
+            p[0].contains("第 2 行") && p[0].contains("没有闭合"),
+            "{p:?}"
+        );
         assert!(lint("```c\nint x;\n```\n````md\n```\n````\n", None).is_empty());
     }
 
@@ -301,7 +327,10 @@ mod tests {
         let p = lint("a\n</think>\n\n<think>继续写</think>\n", None);
         assert_eq!(p.len(), 1);
         assert!(p[0].contains("<think>"));
-        assert!(lint("```\n<think>\n```\n", None).is_empty(), "代码块里的不算");
+        assert!(
+            lint("```\n<think>\n```\n", None).is_empty(),
+            "代码块里的不算"
+        );
     }
 
     #[test]
@@ -322,7 +351,11 @@ mod tests {
         std::fs::create_dir_all(d.join("doc/sections")).unwrap();
         std::fs::create_dir_all(d.join("doc/img")).unwrap();
         std::fs::write(d.join("doc/img/ok.svg"), "<svg/>").unwrap();
-        std::fs::write(d.join("doc.md"), "[一](doc/sections/k1.md) [外](https://a.b) [锚](#x)\n").unwrap();
+        std::fs::write(
+            d.join("doc.md"),
+            "[一](doc/sections/k1.md) [外](https://a.b) [锚](#x)\n",
+        )
+        .unwrap();
         std::fs::write(
             d.join("doc/sections/k1.md"),
             "![好](../img/ok.svg) ![坏](../img/gone.svg) [下一章](k6.md)\n```\n[代码里](nope.md)\n```\n",
@@ -330,7 +363,10 @@ mod tests {
         .unwrap();
         let dead = dead_links(&d.join("doc.md"));
         assert_eq!(dead.len(), 2, "{dead:?}");
-        assert!(dead.iter().any(|x| x.ends_with("../img/gone.svg")), "{dead:?}");
+        assert!(
+            dead.iter().any(|x| x.ends_with("../img/gone.svg")),
+            "{dead:?}"
+        );
         assert!(dead.iter().any(|x| x.ends_with("k6.md")), "{dead:?}");
     }
 }

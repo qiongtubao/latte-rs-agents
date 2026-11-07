@@ -234,7 +234,13 @@ impl UiBackend {
         // 余额不足提示要点名「哪些角色在用没钱的账户」：注册模型目录与角色查询。
         latte_agent_core::billing::register_host(
             Arc::clone(&resolver),
-            merged.read().models.models.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            merged
+                .read()
+                .models
+                .models
+                .iter()
+                .map(|m| m.name.clone())
+                .collect::<Vec<_>>(),
         );
         let backend = Self {
             sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
@@ -505,11 +511,11 @@ pub async fn spawn(config: UiServerConfig) -> anyhow::Result<UiServerHandle> {
 /// 也几乎零成本。设 `LATTE_CODE_GRAPH_REFRESH_SECS=0` 可关闭周期刷新
 /// （仅保留启动时那一次）。
 async fn code_graph_index_loop(cwd: PathBuf) {
-    use latte_agent_core::code_graph_index::{build_or_update, BuildOutcome};
+    use latte_agent_core::code_graph_index::{build_or_join, BuildOutcome};
 
     async fn run_once(cwd: &std::path::Path, tag: &str) -> bool {
         let t0 = std::time::Instant::now();
-        match build_or_update(cwd).await {
+        match build_or_join(cwd).await {
             BuildOutcome::Built { files, symbols } => {
                 eprintln!(
                     "[{tag}] code-graph index: built {files} files / {symbols} symbols in {:?}",

@@ -258,7 +258,11 @@ impl ModelResolver {
         roles
             .into_iter()
             .filter_map(|role| {
-                let chain = snap.role_model_chains.get(role).cloned().unwrap_or_default();
+                let chain = snap
+                    .role_model_chains
+                    .get(role)
+                    .cloned()
+                    .unwrap_or_default();
                 let tier = snap
                     .role_model_tiers
                     .get(role)
@@ -752,7 +756,11 @@ mod tests {
         };
         let resolver = ModelResolver::from_config(&config).unwrap();
         let err = resolver
-            .resolve_chain("advisor", ModelTier::Premium, &["glm-5.3".into(), "MiniMax-M3".into()])
+            .resolve_chain(
+                "advisor",
+                ModelTier::Premium,
+                &["glm-5.3".into(), "MiniMax-M3".into()],
+            )
             .expect_err("chain 全不可用必须中止，不得兜底到 catalog 里的 unwanted-deepseek");
         match err {
             AgentError::ModelResolutionFailed { role, .. } => assert_eq!(role, "advisor"),

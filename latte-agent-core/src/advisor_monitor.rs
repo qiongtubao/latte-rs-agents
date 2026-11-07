@@ -1345,9 +1345,8 @@ impl AdvisorReviewEngine {
         let n = models.len();
         let mut last_err: Option<AgentError> = None;
         for (i, model) in models.into_iter().enumerate() {
-            let limit = budget.and_then(|b| {
-                review_attempt_limit(i, n, b.saturating_sub(started_all.elapsed()))
-            });
+            let limit = budget
+                .and_then(|b| review_attempt_limit(i, n, b.saturating_sub(started_all.elapsed())));
             let agent = Agent::new_with_chain(
                 "advisor".to_string(),
                 role.clone(),
@@ -2468,11 +2467,18 @@ mod tests {
     #[test]
     fn review_attempt_limit_splits_budget_across_chain() {
         let b = Duration::from_secs(90);
-        assert_eq!(review_attempt_limit(0, 1, b), None, "唯一的模型不限时（预算外转后台）");
+        assert_eq!(
+            review_attempt_limit(0, 1, b),
+            None,
+            "唯一的模型不限时（预算外转后台）"
+        );
         assert_eq!(review_attempt_limit(0, 2, b), Some(Duration::from_secs(45)));
         assert_eq!(review_attempt_limit(1, 2, b), None);
         assert_eq!(review_attempt_limit(0, 3, b), Some(Duration::from_secs(45)));
-        assert_eq!(review_attempt_limit(1, 3, Duration::from_secs(40)), Some(Duration::from_secs(20)));
+        assert_eq!(
+            review_attempt_limit(1, 3, Duration::from_secs(40)),
+            Some(Duration::from_secs(20))
+        );
         assert_eq!(review_attempt_limit(2, 3, b), None);
     }
 

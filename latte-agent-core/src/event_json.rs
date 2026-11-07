@@ -279,6 +279,20 @@ mod tests {
                     sub_id: None,
                 },
             ),
+            (
+                "BackgroundJob",
+                ChatEvent::BackgroundJob {
+                    job_id: "bg-3".into(),
+                    status: "running".into(),
+                    command: "make all -j16".into(),
+                    cwd: Some("/repo".into()),
+                    exit_code: None,
+                    elapsed_secs: 300,
+                    detail: None,
+                    role_id: Some("devops".into()),
+                    sub_id: Some("devops-1".into()),
+                },
+            ),
         ];
         for (expected_type, ev) in cases {
             let json = chat_event_to_frontend_json(&ev).expect("convert");

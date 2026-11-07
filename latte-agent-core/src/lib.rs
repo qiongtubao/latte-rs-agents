@@ -38,6 +38,7 @@
 
 pub mod advisor_monitor;
 pub mod agent;
+pub mod bg_jobs;
 pub mod billing;
 pub mod bridge;
 pub mod checkpoint;
@@ -59,17 +60,17 @@ pub mod goal;
 pub mod ground_truth;
 pub mod hooks;
 pub mod image_gen;
+pub mod inject_queue;
 pub mod learn_arith;
 pub mod learn_cite;
 pub mod learn_claims;
-pub mod learn_complexity;
-pub mod learn_facts;
 pub mod learn_code;
-pub mod learn_novice;
+pub mod learn_complexity;
 pub mod learn_doc;
+pub mod learn_facts;
+pub mod learn_novice;
 pub mod md_lint;
 pub mod mermaid_lint;
-pub mod inject_queue;
 pub mod model_resolver;
 pub mod pause_gate;
 /// 阻塞 ask 挂起项的跨进程落盘（服务器重启后用户回答仍能驱动续跑）。

@@ -111,10 +111,13 @@ pub struct DefaultRetryPolicy;
 impl RetryPolicy for DefaultRetryPolicy {
     fn retryable(&self, kind: &ToolCallErrorKind) -> bool {
         match kind {
-            // 瞬时错误：HTTP 5xx、timeout、shell escape 漏掉的常见修正一次就够
-            ToolCallErrorKind::MalformedArgs { .. }
-            | ToolCallErrorKind::Execution { .. }
-            | ToolCallErrorKind::Timeout => true,
+            // 瞬时错误：HTTP 5xx、shell escape 漏掉的常见修正一次就够
+            ToolCallErrorKind::MalformedArgs { .. } | ToolCallErrorKind::Execution { .. } => true,
+            // 工具级超时不自动重试：同参数重放会把命令里的副作用再执行
+            // 一遍（rocksdb LAT-100 会话：bash 300s 超时后自动重试，命令
+            // 开头的 `make clean` 又跑一次，5 分钟编译进度清零，还和上一次
+            // 没被杀掉的 make 抢同一个目录）。超时错误交给模型决定下一步。
+            ToolCallErrorKind::Timeout => false,
             // 名字错 / hook 故意拒绝 / 永久性执行错误 → 再试也不会好
             ToolCallErrorKind::ToolNotFound { .. }
             | ToolCallErrorKind::HookAborted { .. }
@@ -382,19 +385,15 @@ impl Agent {
                 continue;
             }
             match mc.client.chat(messages, p).await {
-                Ok(c) if is_empty_completion(&c) => {
-                    // 空 completion（无文本、无 tool_calls）是厂商侧抖动
-                    // （glm/deepseek 系偶发）：原样上交会让下游把空串当
-                    // 结论（日志事故：architect 空返回 → workflow 直接判死）。
-                    // 按模型局部失败处理：短冷却后跟链走。
-                    tried.push(mc.model.id.clone());
-                    failures.push((
-                        mc.model.id.clone(),
-                        "empty completion (no content, no tool_calls)".into(),
-                    ));
-                    mc.set_cooldown(Duration::from_secs(5));
-                }
                 Ok(c) => {
+                    if let Some(reason) = completion_rejection_reason(&c) {
+                        // 空产出、纯思维链、缺失终止原因都不是可提交结果。
+                        // 按模型局部失败处理：短冷却后沿链尝试下一个模型。
+                        tried.push(mc.model.id.clone());
+                        failures.push((mc.model.id.clone(), reason.into()));
+                        mc.set_cooldown(Duration::from_secs(5));
+                        continue;
+                    }
                     self.note_served(mc);
                     return Ok(c);
                 }
@@ -406,7 +405,11 @@ impl Agent {
                         crate::billing::mark(&mc.model, &e.to_string());
                         failures.push((
                             mc.model.id.clone(),
-                            format!("{}：{}", crate::billing::BILLING_FAILURE_PREFIX, brief_model_error(&e)),
+                            format!(
+                                "{}：{}",
+                                crate::billing::BILLING_FAILURE_PREFIX,
+                                brief_model_error(&e)
+                            ),
                         ));
                         continue;
                     }
@@ -442,15 +445,15 @@ impl Agent {
                     .find(|mc| crate::billing::blocked(&mc.model).is_none())
                 {
                     match mc.client.chat(messages, p).await {
-                        Ok(c) if !is_empty_completion(&c) => return Ok(c),
-                        Ok(_) => {
-                            // 空 completion 同样按失败处理（见链式遍历分支）。
-                            mc.set_cooldown(Duration::from_secs(5));
-                            tried.push(mc.model.id.clone());
-                            failures.push((
-                                mc.model.id.clone(),
-                                "empty completion (no content, no tool_calls)".into(),
-                            ));
+                        Ok(c) => {
+                            if let Some(reason) = completion_rejection_reason(&c) {
+                                mc.set_cooldown(Duration::from_secs(5));
+                                tried.push(mc.model.id.clone());
+                                failures.push((mc.model.id.clone(), reason.into()));
+                            } else {
+                                self.note_served(mc);
+                                return Ok(c);
+                            }
                         }
                         Err(e) => {
                             if crate::billing::is_billing_error(&e) {
@@ -524,7 +527,11 @@ impl Agent {
                         crate::billing::mark(&mc.model, &e.to_string());
                         failures.push((
                             mc.model.id.clone(),
-                            format!("{}：{}", crate::billing::BILLING_FAILURE_PREFIX, brief_model_error(&e)),
+                            format!(
+                                "{}：{}",
+                                crate::billing::BILLING_FAILURE_PREFIX,
+                                brief_model_error(&e)
+                            ),
                         ));
                         continue;
                     }
@@ -1355,6 +1362,9 @@ pub struct AgentRunner {
     deadline: Option<std::time::Instant>,
     /// 单个 turn 的模型请求次数预算（软上限）。见 [`AgentRunner::set_request_budget`]。
     request_budget: Option<usize>,
+    /// 单个 turn 最多允许启动多少个模型发出的工具调用。检查发生在整批
+    /// spawn/execute 之前；`None` 不限，`Some(0)` 禁止执行任何工具。
+    max_tool_calls: Option<usize>,
     /// Shared workflow/session token meter. Every attached runner contributes
     /// actual input + output + thinking usage after each model response.
     shared_token_budget: Option<std::sync::Arc<SharedTokenBudget>>,
@@ -1367,6 +1377,9 @@ pub struct AgentRunner {
     /// 每 turn 的 todo 纠偏计数器，`run_turn` 入口重置（与
     /// `last_turn_tool_count` 同位置）。
     todo_tracker: crate::todo::TodoTracker,
+    /// 本 turn 已发出的「还有后台 job 在跑」收尾提醒次数（见
+    /// [`crate::bg_jobs::job_stop_reminder`]），`run_turn` 入口重置。
+    job_stop_reminders: u8,
     /// 单次模型调用实际待发消息的硬预算。None = 不限制（默认）；
     /// workflow step 可用它把工具循环的 prompt 放大转成可恢复的
     /// `PromptBudgetExceeded`，而不是等供应商拒绝。
@@ -1459,6 +1472,8 @@ fn classify_tool_execution_error(e: &latte_rs_agent_tools::error::ToolError) -> 
         // until the local ast-grep installation changes. Retrying the same call
         // immediately only burns a tool round-trip.
         "code_graph backend unavailable",
+        "code_graph index not ready",
+        "code_graph index unavailable",
         "ast-grep query failed",
         "backend protocol failure",
         // ask_human 的"错误返回"是设计好的控制流（暂停会话），不是
@@ -2115,12 +2130,35 @@ fn max_pause_park() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// 空 completion 判定：无有效文本且无任何 tool_calls。只有文本为空
-/// 但带 tool_calls 是正常的 tool round，不算空。空 completion 是厂商
-/// 侧抖动（空响应入历史会导致后续请求 400，见 run_turn 尾部注释），
-/// 调用方应把它当模型局部失败走 fallback，而不是当成功结果上交。
+/// 空 completion 判定：无可交付正文且无任何 tool_calls。
+///
+/// 除空串外，「只有 `<think>` / `<mm:think>` 思维链」也没有可交付内容。
+/// 只有文本为空但带 tool_calls 是正常的 tool round，不算空。
 fn is_empty_completion(c: &Completion) -> bool {
-    c.tool_calls.is_empty() && crate::controller::is_empty_output(&c.content)
+    c.tool_calls.is_empty()
+        && (crate::controller::is_empty_output(&c.content)
+            || crate::controller::is_only_think_blocks(&c.content))
+}
+
+/// 一个 provider completion 能否作为成功结果提交。
+///
+/// `stop_reason` 为空表示客户端从未观察到可靠的终止帧。典型形态是网关
+/// 在 `<think>` 中途断流后直接 EOF：已有 partial content，但没有
+/// `finish_reason` / usage。把它当 `stop` 会让上层发送 `RoleFinished: ok`，
+/// 再到 workflow contract 才发现没有最终答案。这里在模型链边界拒绝，
+/// 让现有 fallback / cooldown 处理，而不是让半包进入会话历史。
+fn completion_rejection_reason(c: &Completion) -> Option<&'static str> {
+    if c.stop_reason.trim().is_empty() {
+        return Some("completion ended without a terminal stop reason");
+    }
+    if is_empty_completion(c) {
+        return Some(if crate::controller::is_only_think_blocks(&c.content) {
+            "completion contained reasoning only and no deliverable output"
+        } else {
+            "empty completion (no content, no tool_calls)"
+        });
+    }
+    None
 }
 
 /// 最终答复尾部带悬挂工具标记的判定。native function-calling 下，
@@ -2554,8 +2592,10 @@ struct OneCallResult {
 fn tool_execution_metadata(
     cwd: Option<&std::path::Path>,
     current_session_file: Option<&std::path::Path>,
+    job_owner: &str,
+    role: &str,
 ) -> Option<serde_json::Value> {
-    if cwd.is_none() && current_session_file.is_none() {
+    if cwd.is_none() && current_session_file.is_none() && job_owner.is_empty() {
         return None;
     }
     let mut metadata = serde_json::Map::new();
@@ -2567,6 +2607,12 @@ fn tool_execution_metadata(
             "current_session_file".into(),
             path.display().to_string().into(),
         );
+    }
+    // bash 后台 job 的归属（见 crate::bg_jobs）：分派 runner 是 sub_id，
+    // 主会话 runner 是 session_id。分派 / 会话结束时据此 kill 名下 job。
+    if !job_owner.is_empty() {
+        metadata.insert("job_owner".into(), job_owner.into());
+        metadata.insert("role".into(), role.into());
     }
     Some(serde_json::Value::Object(metadata))
 }
@@ -2737,7 +2783,12 @@ async fn run_one_tool_call(
 
         // 3. Execute
         let mut ctx = latte_rs_agent_tools::types::ToolExecutionContext::fresh(&resolved_name, 1);
-        ctx.metadata = tool_execution_metadata(cwd.as_deref(), current_session_file.as_deref());
+        ctx.metadata = tool_execution_metadata(
+            cwd.as_deref(),
+            current_session_file.as_deref(),
+            anchor_scope_id,
+            &meta.role,
+        );
         // P1b：per-path 写锁——写类工具（write/edit/delete/ast_edit）
         // 按目标文件互斥，挡住「并行 delegate 子代理 / 主 agent + 子代理」
         // 同时写同一文件的竞态。许可持到本次 execute 返回（作用域尾 drop）。
@@ -2896,9 +2947,11 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            max_tool_calls: None,
             shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            job_stop_reminders: 0,
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
             required_tools: Vec::new(),
@@ -2943,9 +2996,11 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            max_tool_calls: None,
             shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            job_stop_reminders: 0,
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
             required_tools: Vec::new(),
@@ -2988,9 +3043,11 @@ impl AgentRunner {
             resume_step: None,
             deadline: None,
             request_budget: None,
+            max_tool_calls: None,
             shared_token_budget: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
+            job_stop_reminders: 0,
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
             required_tools: Vec::new(),
@@ -3203,7 +3260,10 @@ impl AgentRunner {
         // 自动退避恢复不放行——那只是限流窗口过去了，余额不会自己回来。
         if resumed && manual && !billing.is_empty() {
             let n = crate::billing::clear_all();
-            tracing::info!(accounts = n, "manual resume: billing blocks cleared for re-probe");
+            tracing::info!(
+                accounts = n,
+                "manual resume: billing blocks cleared for re-probe"
+            );
         }
         self.sink.emit(crate::trace::TraceEvent::SessionResumed {
             meta: crate::trace::TraceMeta::now(0, &self.role_id, ""),
@@ -3922,6 +3982,29 @@ impl AgentRunner {
             .take_stop_reminder(&phases, waiting_on_user)
     }
 
+    /// 本 runner 名下已结束的后台 bash job → 一条通知（每个 job 只通知
+    /// 一次）。在 turn 入口与每次模型调用前注入，模型不必一直轮询。
+    fn job_notice(&self) -> Option<String> {
+        crate::bg_jobs::job_notice_message(self.anchor_scope_id())
+    }
+
+    /// 收尾提醒：只对分派 runner（workflow step / delegate，有 `sub_id`）
+    /// 生效——分派一结束，名下后台 job 就会被 kill（见
+    /// [`crate::bg_jobs::JobOwnerGuard`]），模型最好先 wait 拿结果或明确
+    /// kill。主会话的后台 job 可以跨 turn 继续跑，不拦。
+    fn job_stop_reminder(&mut self) -> Option<String> {
+        let owner = self.sub_id.as_deref()?;
+        if self.job_stop_reminders >= crate::bg_jobs::JOB_STOP_REMINDERS_PER_TURN {
+            return None;
+        }
+        let running = crate::bg_jobs::running_jobs(owner);
+        if running.is_empty() {
+            return None;
+        }
+        self.job_stop_reminders += 1;
+        Some(crate::bg_jobs::job_stop_reminder(&running))
+    }
+
     /// Set the absolute wall-clock deadline for the tool loop (对齐 oh-my-pi
     /// `config.deadline`). 超时时循环优雅退出、返回 partial 产出。
     /// 设置单个 turn 的模型请求次数预算（软上限 `soft`，0 = 不限）。
@@ -3934,6 +4017,13 @@ impl AgentRunner {
     ///   （带 partial，调用方降级采纳）。
     pub fn set_request_budget(&mut self, soft: usize) {
         self.request_budget = (soft > 0).then_some(soft);
+    }
+
+    /// 设置本 turn 的工具调用硬上限。`None` 不限；`Some(0)` 表示
+    /// 第一个工具调用执行前就终止。一次工具内部的瞬时重试仍只算一个
+    /// 模型工具调用。
+    pub fn set_max_tool_calls(&mut self, max: Option<usize>) {
+        self.max_tool_calls = max;
     }
 
     pub fn with_shared_token_budget(mut self, budget: std::sync::Arc<SharedTokenBudget>) -> Self {
@@ -4173,6 +4263,11 @@ impl AgentRunner {
         // *before* the working message list is built below, so the
         // first model call of this turn already sees them.
         self.drain_advisor_hints();
+        // 后台 bash job 完成通知：主会话里 job 可能在两个 turn 之间跑完，
+        // 先放进 context，本轮第一次模型调用就能看到。
+        if let Some(notice) = self.job_notice() {
+            self.context.push(Message::user(notice));
+        }
 
         // 一旦 turn 已开始，就立即把调用方输入提交到持久 context，而不
         // 等模型成功返回。`run_turn_cancellable` 通过 drop in-flight future
@@ -4204,6 +4299,7 @@ impl AgentRunner {
         // TodoTracker 每 turn 重置：nudge / stop reminder 的额度都按
         // turn 计（见 crate::todo）。
         self.todo_tracker = crate::todo::TodoTracker::default();
+        self.job_stop_reminders = 0;
         use crate::trace::{ParseDiag, ParsedCall, TraceEvent, TraceMeta};
         let turn_start = Instant::now();
         // wall-clock 起点：与 `turn_start`（单调）配对，用来暴露进程被
@@ -4363,6 +4459,8 @@ impl AgentRunner {
         let mut read_only_streak: usize = 0;
         let mut read_only_nudge_sent = false;
         let mut deadline_hit = false;
+        let mut tool_calls_started = 0usize;
+        let mut tool_budget_hit: Option<(usize, usize)> = None;
         let mut last_executed_tool: Option<String> = None;
         // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
@@ -4476,6 +4574,12 @@ impl AgentRunner {
                 if let Some(nudge) = self.todo_mid_run_nudge() {
                     self.context.push(Message::user(nudge.clone()));
                     messages.push(Message::user(nudge));
+                }
+                // 后台 bash job 跑完了：在下一次模型调用里告诉模型，
+                // 不必靠它一直 wait 轮询。
+                if let Some(notice) = self.job_notice() {
+                    self.context.push(Message::user(notice.clone()));
+                    messages.push(Message::user(notice));
                 }
             }
             // 2a. Emit ModelCall + ModelRawOut after agent.chat()
@@ -4690,11 +4794,9 @@ impl AgentRunner {
                                     content: text,
                                     content_parts: content,
                                     tool_calls,
-                                    stop_reason: if stop_reason.is_empty() {
-                                        "stop".into()
-                                    } else {
-                                        stop_reason
-                                    },
+                                    // 空值必须原样保留给完整性校验。把它伪装成
+                                    // `stop` 会把提前 EOF 的半包标成成功。
+                                    stop_reason,
                                     usage,
                                 };
                             }
@@ -4733,9 +4835,32 @@ impl AgentRunner {
                             }
                         }
                     };
-                    if is_empty_completion(&c) && empty_retries < 2 {
-                        empty_retries += 1;
-                        continue 'stream_attempt;
+                    if let Some(reason) = completion_rejection_reason(&c) {
+                        // 供应商明确正常收尾但没有可交付内容时，允许同一模型
+                        // 短重试两次；缺失 stop reason 是协议/传输不完整，直接
+                        // 沿模型链 fallback。已经流给用户的内容不可整流重放，
+                        // `try_stream_fallback` 会据 `streamed_any` 拒绝。
+                        if !c.stop_reason.trim().is_empty()
+                            && is_empty_completion(&c)
+                            && empty_retries < 2
+                        {
+                            empty_retries += 1;
+                            continue 'stream_attempt;
+                        }
+                        let err = AiError::Stream(reason.to_string());
+                        if self
+                            .try_stream_fallback(
+                                &err,
+                                streamed_any,
+                                &mut stream_fallbacks,
+                                MAX_STREAM_FALLBACKS,
+                                &meta,
+                            )
+                            .is_some()
+                        {
+                            continue 'stream_attempt;
+                        }
+                        return Err(AgentError::from(err));
                     }
                     break 'stream_attempt c;
                 }
@@ -4854,8 +4979,10 @@ impl AgentRunner {
             // 「接着写的下一段」——真正的产出是前缀 + 本段拼起来。下游
             // 看到的 final_response 始终是**拼接后的完整内容**，TraceEvent、
             // hooks、tool 解析、workflow 契约都据此工作，感知不到分段。
-            let healed_content =
-                strip_leaked_think(&completion.content, is_length_truncation(&completion.stop_reason));
+            let healed_content = strip_leaked_think(
+                &completion.content,
+                is_length_truncation(&completion.stop_reason),
+            );
             final_response = if continuation_prefix.is_empty() {
                 healed_content
             } else {
@@ -4988,7 +5115,9 @@ impl AgentRunner {
                         // 截断的这一轮**不进上下文**（模型看不到那半截，也就不会照着续或复述），
                         // 只补一条说明：撞了上限，要缩短，别重新规划整件事。
                         // 先补一条占位 assistant，避免连续两条 user 被个别兼容端点拒绝。
-                        messages.push(Message::assistant("（上一条回复撞上输出长度上限，已被丢弃）".to_string()));
+                        messages.push(Message::assistant(
+                            "（上一条回复撞上输出长度上限，已被丢弃）".to_string(),
+                        ));
                         messages.push(Message::user(format!(
                             "你上一条回复撞上了输出长度上限（finish_reason={}，约 {} 个输出 token），已被丢弃，没有被使用。\
                              重新来一遍，这次必须写得更短：\n\
@@ -5124,6 +5253,16 @@ impl AgentRunner {
                     messages.push(Message::user(reminder));
                     continue;
                 }
+                // 分派准备收尾，但名下还有后台 bash job 在跑：分派一结束
+                // 它们就会被 kill（见 crate::bg_jobs），先提醒模型 wait 拿
+                // 结果或明确 kill。每 turn 最多 JOB_STOP_REMINDERS_PER_TURN 次。
+                if let Some(reminder) = self.job_stop_reminder() {
+                    if !final_response.trim().is_empty() {
+                        messages.push(Message::assistant(final_response.clone()));
+                    }
+                    messages.push(Message::user(reminder));
+                    continue;
+                }
                 break;
             }
 
@@ -5168,6 +5307,17 @@ impl AgentRunner {
             }
 
             if let Some(tm) = self.tool_manager.clone() {
+                // 运行时工具硬预算：整批在任何 spawn/execute 之前预检。
+                // 若本批会跨过上限，整批都不启动，避免并行池一次越界多个
+                // 副作用调用。当前 turn 随后以带 partial 的错误结束。
+                if let Some(limit) = self.max_tool_calls {
+                    if tool_calls_started.saturating_add(post_parse_calls.len()) > limit {
+                        tool_budget_hit = Some((tool_calls_started, limit));
+                        break;
+                    }
+                }
+                tool_calls_started = tool_calls_started.saturating_add(post_parse_calls.len());
+
                 // 追加 assistant 消息（带上它请求的 tool_calls）。native
                 // 协议要求：assistant 消息列出 tool_calls（含 id），随后每条
                 // tool_result 用 tool_call_id 引用回来，形成闭环。
@@ -5337,6 +5487,14 @@ impl AgentRunner {
             return Err(AgentError::TokenBudgetExceeded {
                 used,
                 budget,
+                partial: last_substantive_response,
+            });
+        }
+        if let Some((calls, limit)) = tool_budget_hit {
+            return Err(AgentError::ToolCallBudgetExceeded {
+                calls,
+                limit,
+                last_tool: last_executed_tool,
                 partial: last_substantive_response,
             });
         }
@@ -5942,8 +6100,8 @@ mod tests {
         let cwd = std::path::Path::new("/workspace");
         let a = std::path::Path::new("/workspace/.latte/ui-sessions/a.jsonl");
         let b = std::path::Path::new("/workspace/.latte/ui-sessions/b.jsonl");
-        let meta_a = tool_execution_metadata(Some(cwd), Some(a)).unwrap();
-        let meta_b = tool_execution_metadata(Some(cwd), Some(b)).unwrap();
+        let meta_a = tool_execution_metadata(Some(cwd), Some(a), "", "r").unwrap();
+        let meta_b = tool_execution_metadata(Some(cwd), Some(b), "", "r").unwrap();
         assert_eq!(meta_a["cwd"], "/workspace");
         assert_eq!(meta_a["current_session_file"], a.to_string_lossy().as_ref());
         assert_eq!(meta_b["current_session_file"], b.to_string_lossy().as_ref());
@@ -5951,7 +6109,15 @@ mod tests {
             meta_a["current_session_file"],
             meta_b["current_session_file"]
         );
-        assert!(tool_execution_metadata(None, None).is_none());
+        assert!(
+            meta_a.get("job_owner").is_none(),
+            "无 owner 时不写 job_owner"
+        );
+        assert!(tool_execution_metadata(None, None, "", "r").is_none());
+        // 有 owner（分派 sub_id / 会话 id）时，bash 后台 job 据此归属。
+        let owned = tool_execution_metadata(None, None, "devops-1", "devops").unwrap();
+        assert_eq!(owned["job_owner"], "devops-1");
+        assert_eq!(owned["role"], "devops");
     }
 
     /// P0 回归：并发同角色 workflow subagent 不再共享观察台账作用域。
@@ -6178,7 +6344,10 @@ mod tests {
         ));
         assert_eq!(kind, ToolCallErrorKind::Timeout, "必须归到 Timeout");
         assert_eq!(kind.label(), "Timeout", "trace 上要能看出是超时");
-        assert!(policy.retryable(&kind), "工具级超时仍可重试一次");
+        assert!(
+            !policy.retryable(&kind),
+            "工具级超时不自动重试（会重放副作用）"
+        );
     }
 
     fn test_model() -> Model {
@@ -6551,7 +6720,10 @@ mod tests {
             Message::tool_result("t3", &huge),
         ];
         compact_stale_tool_results(&mut msgs, 6);
-        assert!(msgs[3].as_text().contains("中段省略"), "上一轮看过的超大结果照常压");
+        assert!(
+            msgs[3].as_text().contains("中段省略"),
+            "上一轮看过的超大结果照常压"
+        );
         assert_eq!(msgs[5].as_text(), huge, "本轮结果逐字");
         assert_eq!(msgs[6].as_text(), huge, "本轮结果逐字");
     }
@@ -7135,9 +7307,10 @@ mod tests {
         let broke = wiremock::MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(402).set_body_string(
-                r#"{"error":{"message":"Insufficient Balance"}}"#,
-            ))
+            .respond_with(
+                ResponseTemplate::new(402)
+                    .set_body_string(r#"{"error":{"message":"Insufficient Balance"}}"#),
+            )
             .mount(&broke)
             .await;
         let ok = wiremock::MockServer::start().await;
@@ -7150,7 +7323,8 @@ mod tests {
             .await;
         let chain = || vec![model_at(&broke, "broke-a"), model_at(&ok, "ok-b")];
         let mk = |models| {
-            Agent::new_with_chain("t".into(), test_role(), models, GenerateParams::default()).unwrap()
+            Agent::new_with_chain("t".into(), test_role(), models, GenerateParams::default())
+                .unwrap()
         };
         let msgs = [Message::user("hi")];
         mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("回落到 ok-b");
@@ -7172,9 +7346,15 @@ mod tests {
             .await
             .unwrap_err();
         match &err {
-            AgentError::ModelsUnavailable { failures, next_retry_in, .. } => {
+            AgentError::ModelsUnavailable {
+                failures,
+                next_retry_in,
+                ..
+            } => {
                 assert!(next_retry_in.is_none(), "余额不足不给重试时间");
-                assert!(failures[0].1.starts_with(crate::billing::BILLING_FAILURE_PREFIX));
+                assert!(failures[0]
+                    .1
+                    .starts_with(crate::billing::BILLING_FAILURE_PREFIX));
             }
             other => panic!("{other:?}"),
         }
@@ -7511,7 +7691,10 @@ mod tests {
             tried: vec!["ds".into()],
             failures: vec![(
                 "ds".into(),
-                format!("{}：402 Insufficient Balance", crate::billing::BILLING_FAILURE_PREFIX),
+                format!(
+                    "{}：402 Insufficient Balance",
+                    crate::billing::BILLING_FAILURE_PREFIX
+                ),
             )],
             next_retry_in: Some(Duration::from_millis(50)),
         };
@@ -7527,7 +7710,10 @@ mod tests {
         assert!(runner.pause_wait_model_unavailable(&err, 0).await);
         let (still_paused, reason) = watcher.await.unwrap();
         assert!(still_paused, "余额不足不该自动退避恢复");
-        assert!(reason.contains("余额不足") && reason.contains("充值"), "{reason}");
+        assert!(
+            reason.contains("余额不足") && reason.contains("充值"),
+            "{reason}"
+        );
     }
 
     /// 无暂停门 → 不等人，直接 false（调用方原样抛错，保持旧行为）。
@@ -9120,7 +9306,10 @@ mod tests {
         let nudge = "逐字节相同的参数调用";
         assert!(bodies.len() >= 4, "至少 4 轮请求，实际 {}", bodies.len());
         assert!(!bodies[2].contains(nudge), "第 3 次请求发出时还没有提醒");
-        assert!(bodies[3].contains(nudge), "第 4 次请求要带上上一轮结果里的提醒");
+        assert!(
+            bodies[3].contains(nudge),
+            "第 4 次请求要带上上一轮结果里的提醒"
+        );
         assert_eq!(bodies[3].matches(nudge).count(), 1, "只提醒一次，不叠加");
     }
 
@@ -9129,17 +9318,32 @@ mod tests {
     fn loop_detector_nudges_before_it_breaks() {
         let mut d = LoopDetector::default();
         for i in 1..LOOP_NUDGE_AT {
-            assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue), "第 {i} 次");
+            assert!(
+                matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue),
+                "第 {i} 次"
+            );
             assert!(d.take_nudge().is_none(), "第 {i} 次还不该提醒");
         }
-        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue));
+        assert!(matches!(
+            d.record("edit", "{\"a\":1}"),
+            LoopDecision::Continue
+        ));
         let n = d.take_nudge().expect("第 3 次相同调用应留下提醒");
-        assert!(n.contains("连续 3 次") && n.contains("`edit`") && n.contains("再重复 2 次"), "{n}");
+        assert!(
+            n.contains("连续 3 次") && n.contains("`edit`") && n.contains("再重复 2 次"),
+            "{n}"
+        );
         assert!(d.take_nudge().is_none(), "提醒是一次性的");
         // 第 4 次不再提醒；第 5 次熔断
-        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Continue));
+        assert!(matches!(
+            d.record("edit", "{\"a\":1}"),
+            LoopDecision::Continue
+        ));
         assert!(d.take_nudge().is_none());
-        assert!(matches!(d.record("edit", "{\"a\":1}"), LoopDecision::Break(_)));
+        assert!(matches!(
+            d.record("edit", "{\"a\":1}"),
+            LoopDecision::Break(_)
+        ));
         // 参数一变，连击清零，之后重新累计
         let mut d = LoopDetector::default();
         d.record("edit", "{\"a\":1}");
@@ -9366,9 +9570,17 @@ mod tests {
         let mut runner = AgentRunner::new_with_tools(agent, tm);
         runner.set_request_budget(2);
 
-        let err = runner.run_turn(&[Message::user("do work")], None).await.unwrap_err();
+        let err = runner
+            .run_turn(&[Message::user("do work")], None)
+            .await
+            .unwrap_err();
         match err {
-            AgentError::RequestBudgetExceeded { requests, budget, partial, last_tool } => {
+            AgentError::RequestBudgetExceeded {
+                requests,
+                budget,
+                partial,
+                last_tool,
+            } => {
                 assert_eq!((requests, budget), (3, 2));
                 assert_eq!(last_tool.as_deref(), Some("read"));
                 assert!(partial.contains("继续读"), "{partial}");
@@ -9445,7 +9657,9 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            AgentError::DeadlineExceeded { partial, last_tool, .. } => {
+            AgentError::DeadlineExceeded {
+                partial, last_tool, ..
+            } => {
                 assert_eq!(partial, "再补读三个 plan 片段");
                 assert_eq!(last_tool.as_deref(), Some("read"));
             }
@@ -10234,7 +10448,10 @@ mod tests {
         assert_eq!(result, "resumed");
         let reqs = server.received_requests().await.unwrap();
         let last = String::from_utf8_lossy(&reqs.last().unwrap().body).to_string();
-        assert!(last.contains("\"model\":\"m-new\""), "恢复后应发往新模型: {last}");
+        assert!(
+            last.contains("\"model\":\"m-new\""),
+            "恢复后应发往新模型: {last}"
+        );
     }
 
     #[tokio::test]
@@ -12008,13 +12225,25 @@ tools = ["read", "write"]
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
-        assert_eq!(out, "SHORT_FINAL", "第二次正常收尾的产出直接采用，不与截断的半截拼接: {out}");
+        let out = runner
+            .run_turn(&[Message::user("出任务清单")], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            out, "SHORT_FINAL",
+            "第二次正常收尾的产出直接采用，不与截断的半截拼接: {out}"
+        );
         let reqs = server.received_requests().await.expect("mock 应记录请求");
         assert_eq!(reqs.len(), 2);
         let second = String::from_utf8_lossy(&reqs[1].body).to_string();
-        assert!(second.contains("已被丢弃") && second.contains("必须写得更短"), "{second}");
-        assert!(!second.contains("HALF_WRITTEN_DRAFT"), "截断的半截不能回喂给模型: {second}");
+        assert!(
+            second.contains("已被丢弃") && second.contains("必须写得更短"),
+            "{second}"
+        );
+        assert!(
+            !second.contains("HALF_WRITTEN_DRAFT"),
+            "截断的半截不能回喂给模型: {second}"
+        );
     }
 
     /// 重试用完仍撞上限：不再续写，带显式标记交给下游；请求数 = 1 首次 + LENGTH_DISCARD_MAX_RETRIES。
@@ -12028,9 +12257,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("SEG", "length"),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body_with_finish("SEG", "length")),
+                    ),
             )
             .await;
         let agent = Agent::new_with_chain(
@@ -12041,9 +12271,19 @@ tools = ["read", "write"]
         )
         .unwrap();
         let mut runner = AgentRunner::new(agent);
-        let out = runner.run_turn(&[Message::user("出任务清单")], None).await.unwrap();
-        assert!(out.contains("⚠️ [产出被截断]") && out.contains("缩短重试"), "{out}");
-        assert_eq!(out.matches("SEG").count(), 1, "只保留最后一次的内容，不累加: {out}");
+        let out = runner
+            .run_turn(&[Message::user("出任务清单")], None)
+            .await
+            .unwrap();
+        assert!(
+            out.contains("⚠️ [产出被截断]") && out.contains("缩短重试"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("SEG").count(),
+            1,
+            "只保留最后一次的内容，不累加: {out}"
+        );
         let reqs = server.received_requests().await.expect("mock 应记录请求");
         assert_eq!(reqs.len(), 1 + usize::from(LENGTH_DISCARD_MAX_RETRIES));
     }
@@ -12442,12 +12682,21 @@ tools = ["read", "write"]
 
     #[test]
     fn leaked_think_blocks_are_stripped_but_plain_text_is_kept() {
-        assert_eq!(strip_leaked_think("<think>草稿 {\"tasks\":[]}</think>\n正式", false), "正式");
-        assert_eq!(strip_leaked_think("前<think>a</think>中<think>b</think>后", false), "前中后");
+        assert_eq!(
+            strip_leaked_think("<think>草稿 {\"tasks\":[]}</think>\n正式", false),
+            "正式"
+        );
+        assert_eq!(
+            strip_leaked_think("前<think>a</think>中<think>b</think>后", false),
+            "前中后"
+        );
         assert_eq!(strip_leaked_think("没有思考", false), "没有思考");
         // 未闭合：截断 = 预算花在思考上，整段丢；没截断则保守保留
         assert_eq!(strip_leaked_think("开头<think>想了很久", true), "开头");
-        assert_eq!(strip_leaked_think("开头<think>想了很久", false), "开头<think>想了很久");
+        assert_eq!(
+            strip_leaked_think("开头<think>想了很久", false),
+            "开头<think>想了很久"
+        );
     }
 
     /// 续满上限仍被截断：照收拼好的部分（不死循环），但必须打上显式

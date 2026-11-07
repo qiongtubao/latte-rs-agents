@@ -40,7 +40,10 @@ pub enum FindingKind {
     /// 引擎已改成 `new_cite`。
     Fixed { new_cite: String },
     /// 修不了：定义有多处，或出处是多段区间。`defs` 是定义所在行（1 起）与原文。
-    Wrong { file: String, defs: Vec<(usize, String)> },
+    Wrong {
+        file: String,
+        defs: Vec<(usize, String)>,
+    },
     /// 代码块里带 `N:` 行号前缀的源码摘录，大部分行在所标的位置附近找不到（不是行号错位，是内容对不上）。
     Excerpt { detail: String },
 }
@@ -184,8 +187,19 @@ const NEAR: usize = 12;
 const LONG_RANGE: usize = 40;
 
 const DEF_KEYWORDS: &[&str] = &[
-    "fn", "struct", "enum", "union", "trait", "type", "const", "static", "class", "def", "func",
-    "interface", "typedef",
+    "fn",
+    "struct",
+    "enum",
+    "union",
+    "trait",
+    "type",
+    "const",
+    "static",
+    "class",
+    "def",
+    "func",
+    "interface",
+    "typedef",
 ];
 
 /// 这一行是不是 `sym` 的定义（或顶层声明）。
@@ -203,10 +217,7 @@ fn is_definition(line: &str, sym: &str) -> bool {
     }
     for i in word_positions(line, sym) {
         let before = line[..i].trim_end();
-        let prev_tok = before
-            .rsplit(|c: char| !is_ident(c))
-            .next()
-            .unwrap_or("");
+        let prev_tok = before.rsplit(|c: char| !is_ident(c)).next().unwrap_or("");
         // `static int` 这种：关键字后面紧跟的是类型名、行就此结束，不是定义。
         if DEF_KEYWORDS.contains(&prev_tok) && !line[i + sym.len()..].trim().is_empty() {
             return true;
@@ -216,10 +227,17 @@ fn is_definition(line: &str, sym: &str) -> bool {
             return true;
         }
         // C 顶层：第 0 列起头的函数定义 / 变量定义 / 声明。
-        let col0 = line.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        let col0 = line
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
         if col0 && !before.contains('(') && !before.contains('=') {
             let after = line[i + sym.len()..].trim_start();
-            if after.starts_with('(') || after.starts_with('[') || after.starts_with('=') || after.starts_with(';') {
+            if after.starts_with('(')
+                || after.starts_with('[')
+                || after.starts_with('=')
+                || after.starts_with(';')
+            {
                 return true;
             }
         }
@@ -241,7 +259,10 @@ fn definition_extent(lines: &[String], idx: usize) -> (usize, usize) {
     if is_define {
         let mut depth = paren_depth(first);
         let mut end = idx;
-        while (lines[end].trim_end().ends_with('\\') || depth > 0) && end + 1 < lines.len() && end - idx < 60 {
+        while (lines[end].trim_end().ends_with('\\') || depth > 0)
+            && end + 1 < lines.len()
+            && end - idx < 60
+        {
             end += 1;
             depth += paren_depth(&lines[end]);
         }
@@ -288,7 +309,11 @@ fn parse_cite(content: &str) -> Option<(String, Vec<(usize, usize)>)> {
     let (path, ranges) = content.rsplit_once(':')?;
     let file = path.rsplit('/').next()?;
     let (stem, ext) = file.rsplit_once('.')?;
-    if stem.is_empty() || ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) || path.contains("://") {
+    if stem.is_empty()
+        || ext.is_empty()
+        || !ext.chars().all(|c| c.is_ascii_alphanumeric())
+        || path.contains("://")
+    {
         return None;
     }
     if path.chars().any(|c| c.is_whitespace() || c == '`') {
@@ -311,7 +336,17 @@ fn parse_cite(content: &str) -> Option<(String, Vec<(usize, usize)>)> {
 /// 代码片段里打头的标识符（`SC_NBINS = 36` → `SC_NBINS`，`sz_s2u()` → `sz_s2u`）。
 fn leading_symbol(content: &str) -> Option<String> {
     let mut s = content.trim();
-    for p in ["#define ", "#define\t", "struct ", "enum ", "union ", "typedef ", "fn ", "*", "&"] {
+    for p in [
+        "#define ",
+        "#define\t",
+        "struct ",
+        "enum ",
+        "union ",
+        "typedef ",
+        "fn ",
+        "*",
+        "&",
+    ] {
         if let Some(r) = s.strip_prefix(p) {
             s = r.trim_start();
         }
@@ -319,7 +354,9 @@ fn leading_symbol(content: &str) -> Option<String> {
     let sym: String = s.chars().take_while(|c| is_ident(*c)).collect();
     // 只核对像「项目里的名字」的标识符：带下划线/大写，或足够长。`int`、`size`
     // 这类关键字和普通词到处都是，按它判出处只会误改。
-    let distinctive = sym.contains('_') || sym.chars().any(|c| c.is_ascii_uppercase()) || sym.chars().count() >= 8;
+    let distinctive = sym.contains('_')
+        || sym.chars().any(|c| c.is_ascii_uppercase())
+        || sym.chars().count() >= 8;
     let ok = distinctive
         && sym.chars().count() >= 3
         && sym.chars().next().is_some_and(|c| !c.is_ascii_digit())
@@ -328,9 +365,28 @@ fn leading_symbol(content: &str) -> Option<String> {
 }
 
 const STOP_WORDS: &[&str] = &[
-    "size_t", "ssize_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "int8_t", "int16_t",
-    "int32_t", "int64_t", "uintptr_t", "intptr_t", "ptrdiff_t", "unsigned", "NULL", "EINVAL",
-    "ENOMEM", "UINT64_MAX", "SIZE_MAX", "SSIZE_MAX", "INT_MAX", "UINT_MAX",
+    "size_t",
+    "ssize_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "uintptr_t",
+    "intptr_t",
+    "ptrdiff_t",
+    "unsigned",
+    "NULL",
+    "EINVAL",
+    "ENOMEM",
+    "UINT64_MAX",
+    "SIZE_MAX",
+    "SSIZE_MAX",
+    "INT_MAX",
+    "UINT_MAX",
 ];
 
 /// 单反引号代码片段：(内容起点, 内容终点) 字节下标。
@@ -430,8 +486,12 @@ pub fn check_text(text: &str, idx: &mut SourceIndex) -> (String, Vec<Finding>) {
                         .and_then(|&(ns, ne)| leading_symbol(&line[ns..ne]))
                 });
             let Some(symbol) = symbol else { continue };
-            let Some(rel) = idx.resolve(&path) else { continue };
-            let Some(lines) = idx.lines(&rel) else { continue };
+            let Some(rel) = idx.resolve(&path) else {
+                continue;
+            };
+            let Some(lines) = idx.lines(&rel) else {
+                continue;
+            };
             let in_range = ranges.iter().any(|&(a, b)| {
                 lines
                     .iter()
@@ -505,9 +565,17 @@ pub fn check_text(text: &str, idx: &mut SourceIndex) -> (String, Vec<Finding>) {
                     // 用到的地方：区间整体平移到覆盖它，篇幅不变。
                     let (ra, rb) = ranges[0];
                     let n = t + 1;
-                    if n < ra { (n, n + (rb - ra)) } else { (n - (rb - ra), n) }
+                    if n < ra {
+                        (n, n + (rb - ra))
+                    } else {
+                        (n - (rb - ra), n)
+                    }
                 };
-                let new_lines = if single || a == b { a.to_string() } else { format!("{a}-{b}") };
+                let new_lines = if single || a == b {
+                    a.to_string()
+                } else {
+                    format!("{a}-{b}")
+                };
                 let new_cite = format!("{path}:{new_lines}");
                 edits.push((s, e, new_cite.clone()));
                 findings.push(Finding {
@@ -571,7 +639,10 @@ fn numbered_line(line: &str) -> Option<(usize, usize, &str)> {
         return None;
     }
     let rest = t[digits.len()..].strip_prefix(':')?;
-    let rest = rest.strip_prefix(' ').or_else(|| rest.strip_prefix('\t')).unwrap_or(rest);
+    let rest = rest
+        .strip_prefix(' ')
+        .or_else(|| rest.strip_prefix('\t'))
+        .unwrap_or(rest);
     Some((off, digits.parse().ok()?, rest))
 }
 
@@ -579,7 +650,9 @@ fn numbered_line(line: &str) -> Option<(usize, usize, &str)> {
 fn header_cite(line: &str, idx: &mut SourceIndex) -> Option<(String, String, (usize, usize))> {
     for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || "_./+-:".contains(c))) {
         let tok = tok.trim_matches(|c| c == '.' || c == ':' || c == '-');
-        let Some((path, ranges)) = parse_cite(tok) else { continue };
+        let Some((path, ranges)) = parse_cite(tok) else {
+            continue;
+        };
         if ranges.len() != 1 {
             continue;
         }
@@ -635,12 +708,15 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
         let body = open_i + 1..close_i;
         let nums: Vec<(usize, usize, usize, String)> = body
             .clone()
-            .filter_map(|i| numbered_line(&lines[i]).map(|(off, n, rest)| (i, off, n, rest.to_string())))
+            .filter_map(|i| {
+                numbered_line(&lines[i]).map(|(off, n, rest)| (i, off, n, rest.to_string()))
+            })
             .collect();
         // 块内头两行若是不带行号的注释（`/* 文件:行号 */`），是块头，不计入「非空行」。
         let is_head_comment = |i: usize| {
             let t = lines[i].trim_start();
-            numbered_line(&lines[i]).is_none() && (t.starts_with("//") || t.starts_with("/*") || t.starts_with('#'))
+            numbered_line(&lines[i]).is_none()
+                && (t.starts_with("//") || t.starts_with("/*") || t.starts_with('#'))
         };
         let nonblank = body
             .clone()
@@ -651,8 +727,17 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
             continue;
         }
         // 块头：块内头两行（非行号行）、块前三个非空行（近的优先）。
-        let mut head_lines: Vec<usize> = body.clone().filter(|&i| numbered_line(&lines[i]).is_none()).take(2).collect();
-        head_lines.extend((0..open_i).rev().filter(|&i| !lines[i].trim().is_empty()).take(3));
+        let mut head_lines: Vec<usize> = body
+            .clone()
+            .filter(|&i| numbered_line(&lines[i]).is_none())
+            .take(2)
+            .collect();
+        head_lines.extend(
+            (0..open_i)
+                .rev()
+                .filter(|&i| !lines[i].trim().is_empty())
+                .take(3),
+        );
         let Some((hl, (token, rel, _))) = head_lines
             .iter()
             .find_map(|&i| header_cite(&lines[i], idx).map(|h| (i, h)))
@@ -739,11 +824,19 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
                     let pos = (*n as i64 + d).clamp(1, src.len() as i64) as usize;
                     // 附近和这一行开头最像的源码行（改写多半只改了后半截），没有像的就按位置。
                     let key = code_key(text);
-                    let prefix = |m: usize| code_key(&src[m - 1]).chars().zip(key.chars()).take_while(|(a, b)| a == b).count();
+                    let prefix = |m: usize| {
+                        code_key(&src[m - 1])
+                            .chars()
+                            .zip(key.chars())
+                            .take_while(|(a, b)| a == b)
+                            .count()
+                    };
                     let lo = pos.saturating_sub(EXCERPT_WINDOW * 2).max(1);
                     let hi = (pos + EXCERPT_WINDOW * 2).min(src.len());
                     let at = (lo..=hi)
-                        .max_by_key(|&m| (prefix(m), std::cmp::Reverse((m as i64 - pos as i64).abs())))
+                        .max_by_key(|&m| {
+                            (prefix(m), std::cmp::Reverse((m as i64 - pos as i64).abs()))
+                        })
                         .filter(|&m| prefix(m) >= 6)
                         .unwrap_or(pos);
                     format!(
@@ -772,7 +865,13 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
         let mut delta_at: Vec<Option<i64>> = locs
             .iter()
             .zip(&nums)
-            .map(|(l, (_, _, n, _))| if let Loc::At(m) = l { Some(*m as i64 - *n as i64) } else { None })
+            .map(|(l, (_, _, n, _))| {
+                if let Loc::At(m) = l {
+                    Some(*m as i64 - *n as i64)
+                } else {
+                    None
+                }
+            })
             .collect();
         let mut carry: Option<i64> = None;
         for d in delta_at.iter_mut() {
@@ -793,7 +892,11 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
             .zip(&delta_at)
             .map(|((_, _, n, _), d)| *n as i64 + d.unwrap_or(0))
             .collect();
-        if new_nums.iter().zip(nums.iter()).all(|(nn, (_, _, n, _))| *nn == *n as i64) {
+        if new_nums
+            .iter()
+            .zip(nums.iter())
+            .all(|(nn, (_, _, n, _))| *nn == *n as i64)
+        {
             continue;
         }
         // 定位到的行，新行号必须严格递增且落在文件内，否则宁可不动。写手自己加的注释行
@@ -804,7 +907,9 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
             .filter(|(l, _)| matches!(l, Loc::At(_)))
             .map(|(_, v)| *v)
             .collect();
-        if located.windows(2).any(|w| w[1] <= w[0]) || new_nums.iter().any(|&v| v < 1 || v as usize > src.len()) {
+        if located.windows(2).any(|w| w[1] <= w[0])
+            || new_nums.iter().any(|&v| v < 1 || v as usize > src.len())
+        {
             continue;
         }
         for ((i, off, _, _), nn) in nums.iter().zip(&new_nums) {
@@ -821,7 +926,11 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
             let nb = if hb == last_claim { new_last } else { hb };
             if (na, nb) != (ha, hb) {
                 if let Some((path, _)) = token.rsplit_once(':') {
-                    let new_token = if na == nb { format!("{path}:{na}") } else { format!("{path}:{na}-{nb}") };
+                    let new_token = if na == nb {
+                        format!("{path}:{na}")
+                    } else {
+                        format!("{path}:{na}-{nb}")
+                    };
                     lines[hl] = lines[hl].replacen(&token, &new_token, 1);
                 }
             }
@@ -830,7 +939,9 @@ fn fix_numbered_excerpts(lines: &mut [String], idx: &mut SourceIndex) -> Vec<Fin
             doc_line: nums[0].0 + 1,
             symbol: "代码摘录行号".into(),
             cite: cite_claimed,
-            kind: FindingKind::Fixed { new_cite: format!("{rel}:{new_first}-{new_last}") },
+            kind: FindingKind::Fixed {
+                new_cite: format!("{rel}:{new_first}-{new_last}"),
+            },
         });
     }
     findings
@@ -851,7 +962,11 @@ pub fn autofix_file(path: &Path, idx: &mut SourceIndex) -> Vec<Finding> {
 /// `text` 里核对不通过的出处原文（含引擎能修的）。返工门禁用：这些出处
 /// 被改掉、删掉都不算「删了原有出处」。
 pub fn wrong_citations(text: &str, idx: &mut SourceIndex) -> BTreeSet<String> {
-    check_text(text, idx).1.into_iter().map(|f| f.cite).collect()
+    check_text(text, idx)
+        .1
+        .into_iter()
+        .map(|f| f.cite)
+        .collect()
 }
 
 #[cfg(test)]
@@ -911,7 +1026,10 @@ sz_size2index(size_t size) {\n\
         // 回归 LAT-110：`SC_LG_MAX_LOOKUP`（`sc.h:247`）→ 宏实际在 250。
         let doc = "边界 `SC_LG_MAX_LOOKUP = 12`（`sc.h:3`）写死。\n守门 `SC_NBINS`（`include/x/sc.h:2-4`）。";
         let (fixed, f) = check_text(doc, &mut idx);
-        assert!(fixed.contains("`SC_LG_MAX_LOOKUP = 12`（`sc.h:7`）"), "{fixed}");
+        assert!(
+            fixed.contains("`SC_LG_MAX_LOOKUP = 12`（`sc.h:7`）"),
+            "{fixed}"
+        );
         // SC_NBINS 在 2 行出现（#if），按词边界算在范围内 → 不动。
         assert!(fixed.contains("`include/x/sc.h:2-4`"), "{fixed}");
         assert_eq!(f.len(), 1);
@@ -922,7 +1040,10 @@ sz_size2index(size_t size) {\n\
     fn range_is_replaced_by_full_definition_extent() {
         let dir = repo();
         let mut idx = SourceIndex::new(dir.path());
-        let (fixed, _) = check_text("`SC_NBINS`（`sc.h:5-6`）\n`sz_size2index`，`sc.h:1-2`", &mut idx);
+        let (fixed, _) = check_text(
+            "`SC_NBINS`（`sc.h:5-6`）\n`sz_size2index`，`sc.h:1-2`",
+            &mut idx,
+        );
         assert!(fixed.contains("`sc.h:10-12`"), "多行宏按括号配对: {fixed}");
         assert!(fixed.contains("`sc.h:15-20`"), "函数到收尾的 }}: {fixed}");
     }
@@ -931,11 +1052,18 @@ sz_size2index(size_t size) {\n\
     fn forward_form_and_ambiguous_definitions() {
         let dir = repo();
         let mut idx = SourceIndex::new(dir.path());
-        let (fixed, f) = check_text("见 `sc.h:1` 的 `SC_LOOKUP_MAXCLASS`；`DUP`（`sc.h:1`）", &mut idx);
+        let (fixed, f) = check_text(
+            "见 `sc.h:1` 的 `SC_LOOKUP_MAXCLASS`；`DUP`（`sc.h:1`）",
+            &mut idx,
+        );
         assert!(fixed.contains("`sc.h:8` 的"), "{fixed}");
         let wrong = f.iter().find(|x| x.symbol == "DUP").unwrap();
         assert!(!wrong.is_fixed(), "两处定义不猜");
-        assert!(wrong.describe().contains("sc.h:22") && wrong.describe().contains("sc.h:24"), "{}", wrong.describe());
+        assert!(
+            wrong.describe().contains("sc.h:22") && wrong.describe().contains("sc.h:24"),
+            "{}",
+            wrong.describe()
+        );
         assert!(fixed.contains("`DUP`（`sc.h:1`）"), "修不了的不动");
     }
 
@@ -953,7 +1081,11 @@ sz_size2index(size_t size) {\n\
     fn ambiguous_short_path_is_not_resolved() {
         let dir = repo();
         std::fs::create_dir_all(dir.path().join("other")).unwrap();
-        std::fs::write(dir.path().join("other/sc.h"), "#define SC_LG_MAX_LOOKUP 1\n").unwrap();
+        std::fs::write(
+            dir.path().join("other/sc.h"),
+            "#define SC_LG_MAX_LOOKUP 1\n",
+        )
+        .unwrap();
         let mut idx = SourceIndex::new(dir.path());
         let (_, f) = check_text("`SC_LG_MAX_LOOKUP`（`sc.h:3`）", &mut idx);
         assert!(f.is_empty(), "两个 sc.h 不知道指哪个");
@@ -965,8 +1097,14 @@ sz_size2index(size_t size) {\n\
     fn wrong_citations_lists_original_tokens() {
         let dir = repo();
         let mut idx = SourceIndex::new(dir.path());
-        let w = wrong_citations("`SC_LG_MAX_LOOKUP`（`sc.h:3`）、`SC_LOOKUP_MAXCLASS`（`sc.h:8`）", &mut idx);
-        assert_eq!(w.into_iter().collect::<Vec<_>>(), vec!["sc.h:3".to_string()]);
+        let w = wrong_citations(
+            "`SC_LG_MAX_LOOKUP`（`sc.h:3`）、`SC_LOOKUP_MAXCLASS`（`sc.h:8`）",
+            &mut idx,
+        );
+        assert_eq!(
+            w.into_iter().collect::<Vec<_>>(),
+            vec!["sc.h:3".to_string()]
+        );
     }
 
     const SZ_H: &str = "/* sz.h */\n\
@@ -1008,9 +1146,19 @@ sz_size2index_compute(size_t size) {\n\
         let (fixed, f) = check_text(doc, &mut idx);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].is_fixed(), "{f:?}");
-        assert!(fixed.contains("/* include/sz.h:3-7 */"), "块头起止同步: {fixed}");
-        assert!(fixed.contains("\n3: static inline szind_t") && fixed.contains("\n4: sz_size2index_compute"), "{fixed}");
-        assert!(fixed.contains("\n7: \t}"), "短行 `}}` 跟随相邻行的偏移: {fixed}");
+        assert!(
+            fixed.contains("/* include/sz.h:3-7 */"),
+            "块头起止同步: {fixed}"
+        );
+        assert!(
+            fixed.contains("\n3: static inline szind_t")
+                && fixed.contains("\n4: sz_size2index_compute"),
+            "{fixed}"
+        );
+        assert!(
+            fixed.contains("\n7: \t}"),
+            "短行 `}}` 跟随相邻行的偏移: {fixed}"
+        );
         // 改完再核对：干净
         assert!(check_text(&fixed, &mut idx).1.is_empty());
     }
@@ -1028,10 +1176,19 @@ sz_size2index_compute(size_t size) {\n\
 ```\n";
         let (fixed, f) = check_text(doc, &mut idx);
         assert_eq!(f.len(), 1, "{f:?}");
-        assert!(fixed.contains("\n13: \tszind_t x = lg_floor(size);"), "跳过注释行后的行号: {fixed}");
+        assert!(
+            fixed.contains("\n13: \tszind_t x = lg_floor(size);"),
+            "跳过注释行后的行号: {fixed}"
+        );
         assert!(fixed.contains("\n14: \treturn x;"), "{fixed}");
-        assert!(fixed.contains("\n9: \tif (size == 0) {") && fixed.contains("\n11: \t}"), "前面的行不动: {fixed}");
-        assert!(fixed.contains("include/sz.h:9-14"), "块前一行的出处同步: {fixed}");
+        assert!(
+            fixed.contains("\n9: \tif (size == 0) {") && fixed.contains("\n11: \t}"),
+            "前面的行不动: {fixed}"
+        );
+        assert!(
+            fixed.contains("include/sz.h:9-14"),
+            "块前一行的出处同步: {fixed}"
+        );
     }
 
     /// 引一大段区域、符号只是顺带提到：不改不判（实测 `sc_data_init`（`sc.h:1-245`）被改成 `sc.h:348`）。
@@ -1051,7 +1208,10 @@ sz_size2index_compute(size_t size) {\n\
         // 短区间照旧会被订正
         let short = "入口 `sc_data_init`（`sc.h:10-12`）。\n";
         let (fixed, f) = check_text(short, &mut idx);
-        assert!(f.len() == 1 && f[0].is_fixed() && fixed.contains("sc.h:301"), "{fixed}");
+        assert!(
+            f.len() == 1 && f[0].is_fixed() && fixed.contains("sc.h:301"),
+            "{fixed}"
+        );
     }
 
     /// 写手在摘录里自己加了源码里没有的注释行（也编了号）：其后的行号整体差 2，只有真实代码行定位行号，
@@ -1072,7 +1232,10 @@ sz_size2index_compute(size_t size) {\n\
         let (fixed, f) = check_text(doc, &mut idx);
         assert_eq!(f.len(), 1, "{f:?}");
         assert!(f[0].is_fixed(), "{f:?}");
-        assert!(fixed.contains("\n5: \tif (unlikely") && fixed.contains("\n9: \tif (size == 0)"), "{fixed}");
+        assert!(
+            fixed.contains("\n5: \tif (unlikely") && fixed.contains("\n9: \tif (size == 0)"),
+            "{fixed}"
+        );
         assert!(fixed.contains("\n8: \tif (size == 0)") == false, "{fixed}");
     }
 
@@ -1090,8 +1253,15 @@ sz_size2index_compute(size_t size) {\n\
         assert!(check_text(wrapped, &mut idx).1.is_empty(), "折行不判错");
         let rewritten = "a.c:1-5\n```c\n1: int f(void) {\n2: \tint mod = compute_mod(size, mask);\n3: \tint lg_delta = lg_tiny_min;\n4: \treturn mod;\n```\n";
         let f = check_text(rewritten, &mut idx).1;
-        assert!(f.len() == 1 && matches!(f[0].kind, FindingKind::Excerpt { .. }), "{f:?}");
-        assert!(f[0].describe().contains("lg_tiny_min") && f[0].describe().contains("lg_base"), "要带上源码真实内容: {}", f[0].describe());
+        assert!(
+            f.len() == 1 && matches!(f[0].kind, FindingKind::Excerpt { .. }),
+            "{f:?}"
+        );
+        assert!(
+            f[0].describe().contains("lg_tiny_min") && f[0].describe().contains("lg_base"),
+            "要带上源码真实内容: {}",
+            f[0].describe()
+        );
     }
 
     /// 压缩摘录（省略了一大段），行号漂得比窗口远：内容在文件里唯一就能认出来。
@@ -1107,7 +1277,11 @@ sz_size2index_compute(size_t size) {\n\
         let doc = "b.c:1-60\n```c\n10: int line_10_marker = 10;\n11: int line_11_marker = 11;\n12: int line_42_marker = 42;\n13: int line_43_marker = 43;\n```\n";
         let (fixed, f) = check_text(doc, &mut idx);
         assert!(f.len() == 1 && f[0].is_fixed(), "{f:?}");
-        assert!(fixed.contains("\n42: int line_42_marker") && fixed.contains("\n43: int line_43_marker"), "{fixed}");
+        assert!(
+            fixed.contains("\n42: int line_42_marker")
+                && fixed.contains("\n43: int line_43_marker"),
+            "{fixed}"
+        );
         assert!(fixed.contains("\n10: int line_10_marker"), "{fixed}");
     }
 
@@ -1132,21 +1306,29 @@ sz_size2index_compute(size_t size) {\n\
 ```\n";
         let (fixed, f) = check_text(doc, &mut idx);
         assert_eq!(f.len(), 1);
-        assert!(matches!(f[0].kind, FindingKind::Excerpt { .. }) && !f[0].is_fixed(), "{f:?}");
+        assert!(
+            matches!(f[0].kind, FindingKind::Excerpt { .. }) && !f[0].is_fixed(),
+            "{f:?}"
+        );
         assert!(f[0].describe().contains("找不到"), "{}", f[0].describe());
-        assert!(fixed.contains("3: if (a_made_up_condition_one)"), "判错的不改动: {fixed}");
+        assert!(
+            fixed.contains("3: if (a_made_up_condition_one)"),
+            "判错的不改动: {fixed}"
+        );
     }
 
     /// 没有块头（解析不到文件）、或不是带行号的块：不判不改。
     #[test]
     fn numbered_excerpt_without_header_or_numbers_is_ignored() {
         let (_d, mut idx) = repo_with_sz();
-        let no_header = "```c\n4: static inline szind_t\n5: sz_size2index_compute(size_t size) {\n```\n";
+        let no_header =
+            "```c\n4: static inline szind_t\n5: sz_size2index_compute(size_t size) {\n```\n";
         assert!(check_text(no_header, &mut idx).1.is_empty());
         let plain = "include/sz.h:3-5\n```c\nstatic inline szind_t\nsz_size2index_compute(size_t size) {\n```\n";
         assert!(check_text(plain, &mut idx).1.is_empty());
         // 一行里 `default: foo` 之类不是行号前缀
-        let sw = "include/sz.h:3-5\n```c\nswitch (x) {\ncase 1: f(); break;\ndefault: g();\n}\n```\n";
+        let sw =
+            "include/sz.h:3-5\n```c\nswitch (x) {\ncase 1: f(); break;\ndefault: g();\n}\n```\n";
         assert!(check_text(sw, &mut idx).1.is_empty());
     }
 
@@ -1154,7 +1336,10 @@ sz_size2index_compute(size_t size) {\n\
     #[test]
     #[ignore]
     fn probe_real_docs() {
-        let (Ok(repo), Ok(docs)) = (std::env::var("LEARN_CITE_REPO"), std::env::var("LEARN_CITE_DOCS")) else {
+        let (Ok(repo), Ok(docs)) = (
+            std::env::var("LEARN_CITE_REPO"),
+            std::env::var("LEARN_CITE_DOCS"),
+        ) else {
             return;
         };
         let mut idx = SourceIndex::new(Path::new(&repo));
@@ -1176,7 +1361,11 @@ sz_size2index_compute(size_t size) {\n\
                 let _ = std::fs::write(p.with_extension("fixed"), fixed_text);
             }
             for f in findings {
-                if f.is_fixed() { fixed += 1 } else { wrong += 1 }
+                if f.is_fixed() {
+                    fixed += 1
+                } else {
+                    wrong += 1
+                }
                 println!("{}:{} {}", p.display(), f.doc_line, f.describe());
             }
         }

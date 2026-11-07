@@ -675,10 +675,7 @@ impl SessionHandle {
         if let Some(p) = &self.persist {
             let label = self.label.lock().clone();
             if let Err(e) = p.lock().materialize(&label) {
-                eprintln!(
-                    "[ui-sessions] materialize {}: {e}",
-                    self.session_id
-                );
+                eprintln!("[ui-sessions] materialize {}: {e}", self.session_id);
             }
         }
     }

@@ -1,0 +1,12 @@
+[任务 LAT-110] 第 2 编第 1 章 · size class：数学结构与查表
+优先级：P2
+描述：围绕 size class 数学体系与查表机制建立概念。做什么：(1) 读 include/jemalloc/internal/sc.h 中关于 SC_NSIZES、SC_NBINS、SC_SMALL_MAXCLASS、SC_LARGE_MINCLASS、SC_LARGE_MAXCLASS、SC_LOOKUP_MAXCLASS 的定义与注释，理解 small/large 边界的数值含义；(2) 读 include/jemalloc/internal/sz.h 中 sz_size2index / sz_size2index_lookup / sz_size2index_compute、sz_psz2ind、sz_pind2sz、sz_s2u 的实现细节，搞清快查表 vs 计算下沉的分支逻辑；(3) 读 src/sc.c 中 size_class()、size_classes()、sc_boot() 的实现，知道表是怎么生成的。验收：(a) 能用一段话讲清 SC_LARGE_MINCLASS 是 small/large 分界线的具体含义：< SC_LARGE_MINCLASS 走 slab（小对象），≥ SC_LARGE_MINCLASS 走整数页直接分配（大对象）；(b) 能讲清 SC_NBINS vs SC_NSIZES vs SC_NPSIZES 三者的语义区别；(c) 能讲清 sz_size2index_lookup 何时走快表、sz_size2index_compute 何时走二分；(d) 能讲清 sz_s2u 与 sz_pind2sz 在分配路径上的角色差异。
+请组织团队完成该任务，完成后给出结果摘要。【父任务链（根 → 直接父，含各层编号语境）】
+  [LAT-101] 建立核心词汇表：size class、arena、bin、edata、tcache
+【兄弟任务（paths 边界：拆出的子任务 paths 不得与它们重叠；依赖看 depends_on）】
+  [LAT-109] 第 1 编 · 词汇表导览：知道这是啥、怎么读（done）paths=learn-tasks/jemalloc-zero-to-deep.md, README
+  [LAT-111] 第 2 编第 2 章 · arena：每线程绑定的容器（in_progress）paths=include/jemalloc/internal/arena_structs.h depends_on=LAT-109
+  [LAT-112] 第 2 编第 3 章 · bin + slab：小对象空闲列表（in_progress）paths=include/jemalloc/internal/bin.h, include/jemalloc/internal/slab_data.h depends_on=LAT-109
+  [LAT-113] 第 2 编第 4 章 · edata：物理页抽象与 5 态机（in_progress）paths=include/jemalloc/internal/edata.h depends_on=LAT-109
+  [LAT-114] 第 2 编第 5 章 · tcache：线程缓存层（in_progress）paths=include/jemalloc/internal/tcache_structs.h, include/jemalloc/internal/cache_bin.h depends_on=LAT-109
+  [LAT-115] 第 3 编 · 验证与输出：分层图 + small/large 边界（todo）paths=docs/learn/ depends_on=LAT-110,LAT-111,LAT-112,LAT-113,LAT-114

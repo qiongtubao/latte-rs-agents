@@ -45,9 +45,13 @@ pub struct Skeleton {
 /// 按扩展名选整行注释符号。
 fn comment_prefix(path: &str) -> &'static str {
     let name = path.rsplit('/').next().unwrap_or(path);
-    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    let ext = name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
     match ext.as_str() {
-        "py" | "sh" | "bash" | "zsh" | "rb" | "pl" | "toml" | "yaml" | "yml" | "cmake" | "mk" | "conf" | "ini" | "r" => "#",
+        "py" | "sh" | "bash" | "zsh" | "rb" | "pl" | "toml" | "yaml" | "yml" | "cmake" | "mk"
+        | "conf" | "ini" | "r" => "#",
         "lua" | "sql" | "hs" => "--",
         _ if matches!(name, "Makefile" | "Dockerfile" | "CMakeLists.txt") => "#",
         _ => "//",
@@ -67,15 +71,19 @@ fn parse_evidence(part: &str) -> Option<(String, usize, usize)> {
 /// 收尾对齐时重算一次即可，不必另存）。
 pub fn skeletons(cwd: &Path, plan: &serde_json::Value) -> Vec<Skeleton> {
     // 源文件 → (区间, 知识点)
-    let mut by_file: BTreeMap<String, (Vec<(usize, usize)>, Vec<(String, String)>)> = BTreeMap::new();
+    let mut by_file: BTreeMap<String, (Vec<(usize, usize)>, Vec<(String, String)>)> =
+        BTreeMap::new();
     for point in plan["knowledge_points"].as_array().into_iter().flatten() {
         if crate::workflow::is_engine_supplement_point(point) {
             continue;
         }
         let id = point["id"].as_str().unwrap_or("").trim().to_string();
         let title = point["title"].as_str().unwrap_or("").trim().to_string();
-        for part in crate::workflow::split_learn_evidence(point["evidence"].as_str().unwrap_or("")) {
-            let Some((file, a, b)) = parse_evidence(&part) else { continue };
+        for part in crate::workflow::split_learn_evidence(point["evidence"].as_str().unwrap_or(""))
+        {
+            let Some((file, a, b)) = parse_evidence(&part) else {
+                continue;
+            };
             if crate::workflow::safe_relative_source(cwd, &file).is_none() {
                 continue;
             }
@@ -89,8 +97,12 @@ pub fn skeletons(cwd: &Path, plan: &serde_json::Value) -> Vec<Skeleton> {
     let mut used_names: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for (file, (mut ranges, points)) in by_file {
-        let Some(full) = crate::workflow::safe_relative_source(cwd, &file) else { continue };
-        let Ok(src) = std::fs::read_to_string(&full) else { continue };
+        let Some(full) = crate::workflow::safe_relative_source(cwd, &file) else {
+            continue;
+        };
+        let Ok(src) = std::fs::read_to_string(&full) else {
+            continue;
+        };
         let lines: Vec<&str> = src.lines().collect();
         if lines.is_empty() {
             continue;
@@ -115,18 +127,27 @@ pub fn skeletons(cwd: &Path, plan: &serde_json::Value) -> Vec<Skeleton> {
         let comment = comment_prefix(&file);
         let base = file.rsplit('/').next().unwrap_or(&file).to_string();
         let ids: Vec<&str> = points.iter().map(|(i, _)| i.as_str()).take(4).collect();
-        let mut name = if ids.is_empty() { base.clone() } else { format!("{}-{base}", ids.join("-")) };
+        let mut name = if ids.is_empty() {
+            base.clone()
+        } else {
+            format!("{}-{base}", ids.join("-"))
+        };
         if used_names.contains(&name) {
             let parent = file.rsplit('/').nth(1).unwrap_or("src");
             name = format!("{parent}-{name}");
         }
         used_names.push(name.clone());
 
-        let cites: Vec<String> = merged.iter().map(|(a, b)| format!("{file}:{a}-{b}")).collect();
+        let cites: Vec<String> = merged
+            .iter()
+            .map(|(a, b)| format!("{file}:{a}-{b}"))
+            .collect();
         let bar = format!("{comment} {}", "=".repeat(60));
         let mut text = String::new();
         text.push_str(&format!("{bar}\n"));
-        text.push_str(&format!("{comment} 学习副本——源文件未改动（代码由引擎逐字拷贝，行号可能随源码演进漂移）\n"));
+        text.push_str(&format!(
+            "{comment} 学习副本——源文件未改动（代码由引擎逐字拷贝，行号可能随源码演进漂移）\n"
+        ));
         text.push_str(&format!("{comment} 原始出处：{}\n", cites.join("、")));
         for (id, title) in &points {
             text.push_str(&format!("{comment} 知识点 {id}：{title}\n"));
@@ -137,7 +158,9 @@ pub fn skeletons(cwd: &Path, plan: &serde_json::Value) -> Vec<Skeleton> {
             if *a > prev_end + 1 {
                 let from = prev_end + 1;
                 let to = a - 1;
-                text.push_str(&format!("\n{comment} …（{file} 第 {from}–{to} 行省略）…\n\n"));
+                text.push_str(&format!(
+                    "\n{comment} …（{file} 第 {from}–{to} 行省略）…\n\n"
+                ));
             }
             for l in &lines[a - 1..*b] {
                 text.push_str(l);
@@ -146,9 +169,20 @@ pub fn skeletons(cwd: &Path, plan: &serde_json::Value) -> Vec<Skeleton> {
             prev_end = *b;
         }
         if prev_end < lines.len() {
-            text.push_str(&format!("\n{comment} …（{file} 第 {}–{} 行省略）…\n", prev_end + 1, lines.len()));
+            text.push_str(&format!(
+                "\n{comment} …（{file} 第 {}–{} 行省略）…\n",
+                prev_end + 1,
+                lines.len()
+            ));
         }
-        out.push(Skeleton { name, source: file, points, ranges: merged, comment, text });
+        out.push(Skeleton {
+            name,
+            source: file,
+            points,
+            ranges: merged,
+            comment,
+            text,
+        });
     }
     out
 }
@@ -162,12 +196,30 @@ fn readme(skels: &[Skeleton], unannotated: &[String]) -> String {
         let points = k
             .points
             .iter()
-            .map(|(i, t)| if t.is_empty() { i.clone() } else { format!("{i} {t}") })
+            .map(|(i, t)| {
+                if t.is_empty() {
+                    i.clone()
+                } else {
+                    format!("{i} {t}")
+                }
+            })
             .collect::<Vec<_>>()
             .join("<br/>");
-        let mark = if unannotated.contains(&k.name) { "（未加注释）" } else { "" };
-        let cites = k.ranges.iter().map(|(a, b)| format!("`{}:{a}-{b}`", k.source)).collect::<Vec<_>>().join("<br/>");
-        s.push_str(&format!("| {points} | [{}]({}){mark} | {cites} |\n", k.name, k.name));
+        let mark = if unannotated.contains(&k.name) {
+            "（未加注释）"
+        } else {
+            ""
+        };
+        let cites = k
+            .ranges
+            .iter()
+            .map(|(a, b)| format!("`{}:{a}-{b}`", k.source))
+            .collect::<Vec<_>>()
+            .join("<br/>");
+        s.push_str(&format!(
+            "| {points} | [{}]({}){mark} | {cites} |\n",
+            k.name, k.name
+        ));
     }
     s
 }
@@ -183,9 +235,11 @@ pub fn write_skeletons(cwd: &Path, base: &Path) -> Result<usize, String> {
     let code = base.join("code");
     std::fs::create_dir_all(&code).map_err(|e| format!("建 code/ 失败：{e}"))?;
     for k in &skels {
-        std::fs::write(code.join(&k.name), &k.text).map_err(|e| format!("写 {} 失败：{e}", k.name))?;
+        std::fs::write(code.join(&k.name), &k.text)
+            .map_err(|e| format!("写 {} 失败：{e}", k.name))?;
     }
-    std::fs::write(code.join("README.md"), readme(&skels, &[])).map_err(|e| format!("写 README 失败：{e}"))?;
+    std::fs::write(code.join("README.md"), readme(&skels, &[]))
+        .map_err(|e| format!("写 README 失败：{e}"))?;
     Ok(skels.len())
 }
 
@@ -250,7 +304,12 @@ pub fn reconcile(skeleton: &str, model: &str) -> Reconciled {
     let s: Vec<&str> = skeleton.lines().collect();
     let m: Vec<&str> = model.lines().collect();
     if s.len().saturating_mul(m.len()) > LCS_MAX_CELLS {
-        return Reconciled { text: skeleton.to_string(), restored: s.len(), dropped: 0, comments: 0 };
+        return Reconciled {
+            text: skeleton.to_string(),
+            restored: s.len(),
+            dropped: 0,
+            comments: 0,
+        };
     }
     // LCS：dp[i][j] = s[i..] 与 m[j..] 的最长匹配。
     let (n, k) = (s.len(), m.len());
@@ -269,7 +328,11 @@ pub fn reconcile(skeleton: &str, model: &str) -> Reconciled {
     let (mut restored, mut dropped, mut comments) = (0, 0, 0);
     let (mut i, mut j) = (0, 0);
     let mut in_block = false; // 模型插入的多行 /* … */ 注释
-    let mut keep_model = |line: &str, out: &mut Vec<String>, in_block: &mut bool, dropped: &mut usize, comments: &mut usize| {
+    let mut keep_model = |line: &str,
+                          out: &mut Vec<String>,
+                          in_block: &mut bool,
+                          dropped: &mut usize,
+                          comments: &mut usize| {
         let t = line.trim_start();
         let opens = t.starts_with("/*") && !t.contains("*/");
         if *in_block || is_comment(t) || t.is_empty() {
@@ -327,7 +390,12 @@ pub fn reconcile(skeleton: &str, model: &str) -> Reconciled {
     }
     let mut text = out.join("\n");
     text.push('\n');
-    Reconciled { text, restored, dropped, comments }
+    Reconciled {
+        text,
+        restored,
+        dropped,
+        comments,
+    }
 }
 
 /// annotate 收尾的结果。
@@ -350,7 +418,11 @@ pub fn reconcile_all(cwd: &Path, base: &Path) -> Result<AnnotateOutcome, String>
     let mut notes = Vec::new();
     let mut unannotated = Vec::new();
     if skels.is_empty() {
-        return Ok(AnnotateOutcome { notes, unannotated, total: 0 });
+        return Ok(AnnotateOutcome {
+            notes,
+            unannotated,
+            total: 0,
+        });
     }
     std::fs::create_dir_all(&code).map_err(|e| format!("建 code/ 失败：{e}"))?;
     for k in &skels {
@@ -365,7 +437,11 @@ pub fn reconcile_all(cwd: &Path, base: &Path) -> Result<AnnotateOutcome, String>
                 "{}：还原 {} 行被改动/删掉的代码{}，注释保留",
                 k.name,
                 r.restored,
-                if r.dropped > 0 { format!("、丢掉 {} 行新造的代码", r.dropped) } else { String::new() }
+                if r.dropped > 0 {
+                    format!("、丢掉 {} 行新造的代码", r.dropped)
+                } else {
+                    String::new()
+                }
             ));
         }
         if r.text != model {
@@ -397,13 +473,20 @@ pub fn reconcile_all(cwd: &Path, base: &Path) -> Result<AnnotateOutcome, String>
         for p in &extras {
             if let Some(n) = p.file_name() {
                 let _ = std::fs::rename(p, q.join(n));
-                notes.push(format!("{}：不是引擎生成的副本，已挪到 quarantine/annotate-extra/", n.to_string_lossy()));
+                notes.push(format!(
+                    "{}：不是引擎生成的副本，已挪到 quarantine/annotate-extra/",
+                    n.to_string_lossy()
+                ));
             }
         }
     }
     std::fs::write(code.join("README.md"), readme(&skels, &unannotated))
         .map_err(|e| format!("写 README 失败：{e}"))?;
-    Ok(AnnotateOutcome { notes, unannotated, total: skels.len() })
+    Ok(AnnotateOutcome {
+        notes,
+        unannotated,
+        total: skels.len(),
+    })
 }
 
 #[cfg(test)]
@@ -438,16 +521,32 @@ mod tests {
     #[test]
     fn skeleton_is_verbatim_with_merged_ranges_and_header() {
         let d = setup("src/own.rs:4-5, 6");
-        assert_eq!(write_skeletons(d.path(), &base(&d)).unwrap(), 1, "同一源文件合成一个副本，不存在的文件跳过");
+        assert_eq!(
+            write_skeletons(d.path(), &base(&d)).unwrap(),
+            1,
+            "同一源文件合成一个副本，不存在的文件跳过"
+        );
         let code = base(&d).join("code");
         let text = std::fs::read_to_string(code.join("k1-k2-own.rs")).unwrap();
-        assert!(text.contains("// 原始出处：src/own.rs:1-9、src/own.rs:21-24"), "{text}");
-        assert!(text.contains("// 知识点 k1：所有权") && text.contains("// 知识点 k2：收尾"), "{text}");
+        assert!(
+            text.contains("// 原始出处：src/own.rs:1-9、src/own.rs:21-24"),
+            "{text}"
+        );
+        assert!(
+            text.contains("// 知识点 k1：所有权") && text.contains("// 知识点 k2：收尾"),
+            "{text}"
+        );
         assert!(text.contains("    let t = s;\n"), "逐字");
-        assert!(text.contains("// …（src/own.rs 第 10–20 行省略）…"), "{text}");
+        assert!(
+            text.contains("// …（src/own.rs 第 10–20 行省略）…"),
+            "{text}"
+        );
         assert!(!text.contains("fn b() {}"), "空档里的代码不拷");
         let readme = std::fs::read_to_string(code.join("README.md")).unwrap();
-        assert!(readme.contains("[k1-k2-own.rs](k1-k2-own.rs)") && readme.contains("`src/own.rs:1-9`"), "{readme}");
+        assert!(
+            readme.contains("[k1-k2-own.rs](k1-k2-own.rs)") && readme.contains("`src/own.rs:1-9`"),
+            "{readme}"
+        );
     }
 
     #[test]
@@ -486,13 +585,21 @@ mod tests {
         let name = "k1-k2-own.rs";
         // 没插任何注释
         let out = reconcile_all(d.path(), &base(&d)).unwrap();
-        assert_eq!((out.total, out.unannotated.clone()), (1, vec![name.to_string()]));
+        assert_eq!(
+            (out.total, out.unannotated.clone()),
+            (1, vec![name.to_string()])
+        );
         assert!(out.notes.is_empty(), "{:?}", out.notes);
-        assert!(std::fs::read_to_string(code.join("README.md")).unwrap().contains("（未加注释）"));
+        assert!(std::fs::read_to_string(code.join("README.md"))
+            .unwrap()
+            .contains("（未加注释）"));
 
         // 插了注释但改了代码，另起了一个文件
         let skel = std::fs::read_to_string(code.join(name)).unwrap();
-        let edited = skel.replace("    let t = s;\n", "    // 交出所有权\n    let t = s.clone();\n");
+        let edited = skel.replace(
+            "    let t = s;\n",
+            "    // 交出所有权\n    let t = s.clone();\n",
+        );
         std::fs::write(code.join(name), edited).unwrap();
         std::fs::write(code.join("k1-mine.rs"), "fn mine() {}\n").unwrap();
         let out = reconcile_all(d.path(), &base(&d)).unwrap();
@@ -500,9 +607,15 @@ mod tests {
         let now = std::fs::read_to_string(code.join(name)).unwrap();
         assert!(now.contains("    // 交出所有权\n    let t = s;\n"), "{now}");
         assert!(!now.contains("clone"));
-        assert!(out.notes.iter().any(|n| n.contains("还原 1 行")), "{:?}", out.notes);
+        assert!(
+            out.notes.iter().any(|n| n.contains("还原 1 行")),
+            "{:?}",
+            out.notes
+        );
         assert!(!code.join("k1-mine.rs").exists());
-        assert!(base(&d).join("quarantine/annotate-extra/k1-mine.rs").is_file());
+        assert!(base(&d)
+            .join("quarantine/annotate-extra/k1-mine.rs")
+            .is_file());
 
         // 副本被删：按原文重建
         std::fs::remove_file(code.join(name)).unwrap();

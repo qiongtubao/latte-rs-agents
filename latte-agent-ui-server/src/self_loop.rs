@@ -14,14 +14,10 @@ pub(crate) struct SelfLoopState {
 }
 
 impl SelfLoopState {
-
     /// 原子 start：检查-登记一把锁内完成，关闭旧裸 `set_progress` 的
     /// TOCTOU——两个并发 start 都覆盖 progress，前一个 node 进程事件
     /// 后续订阅者收不到。try_set_progress 返回 `Err(())` → caller 409。
-    pub(crate) fn try_set_progress(
-        &self,
-        tx: broadcast::Sender<SelfLoopEvent>,
-    ) -> Result<(), ()> {
+    pub(crate) fn try_set_progress(&self, tx: broadcast::Sender<SelfLoopEvent>) -> Result<(), ()> {
         let mut g = self.progress.lock();
         if g.is_some() {
             return Err(());
@@ -64,7 +60,6 @@ mod tests {
         assert!(s.try_set_progress(tx3).is_ok());
     }
 }
-
 
 /// Self-loop 进度事件（SSE / Tauri `ui:self_loop_event` 的载荷）。
 /// `kind`: "started" | "iteration" | "log" | "screenshot" | "done" | "error"

@@ -81,8 +81,13 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         AgentError::ToolLoopDetected { tool, .. } => ModelErrorKind::Other {
             message: format!("tool loop: {tool}"),
         },
-        AgentError::RequestBudgetExceeded { requests, budget, .. } => ModelErrorKind::Other {
+        AgentError::RequestBudgetExceeded {
+            requests, budget, ..
+        } => ModelErrorKind::Other {
             message: format!("request budget exceeded ({requests} requests, budget {budget})"),
+        },
+        AgentError::ToolCallBudgetExceeded { calls, limit, .. } => ModelErrorKind::Other {
+            message: format!("tool call budget exceeded ({calls} started, limit {limit})"),
         },
         AgentError::DeadlineExceeded {
             elapsed_secs,
@@ -718,6 +723,30 @@ pub enum ChatEvent {
         /// 触发的 detector 标签（"D5" / "D6" / "LLM" / "D3" / "D4"）；
         /// `None` 表示来源未明确（例如 LLM 复审失败但降级返回时）
         detector: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_id: Option<String>,
+    },
+
+    /// bash 后台 job 的生命周期：`async: true` 启动、或前台命令超过
+    /// `timeout` 后转为后台继续跑的命令。`status`：`running`（成为后台
+    /// job）/ `completed`（自行结束）/ `stopped`（被 kill：模型主动、
+    /// 所属分派或会话结束、超过最长存活时间）。
+    ///
+    /// `sub_id` 是发起命令的 workflow step / delegate 子会话；主会话
+    /// 角色发起的为 `None`。见 [`crate::bg_jobs`]。
+    BackgroundJob {
+        job_id: String,
+        status: String,
+        command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+        elapsed_secs: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
@@ -1498,6 +1527,14 @@ impl ChatController {
         });
 
         tokio::spawn(async move {
+            // 主会话 runner 的后台 bash job 归属 session_id：driver 退出
+            // （abort / 删除会话 / 进程关闭）时 kill 名下仍在跑的 job。
+            let _job_guard = crate::bg_jobs::JobOwnerGuard::new(
+                &config.session_id,
+                event_tx.clone(),
+                None,
+                "会话已结束，后台 job 被终止",
+            );
             run_driver(
                 config,
                 input_rx,
@@ -5624,6 +5661,17 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("signatures");
+            // 所有 CodeGraph 路径必须基于实际 agent cwd。隔离会话的 cwd 是
+            // linked worktree，不能偷偷回退到 UI server 的主仓 cwd。
+            let cg_cwd = ctx
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cwd"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
             if !matches!(mode, "signatures" | "full") {
                 return Err(ToolError::validation(
                     format!("code_graph: 不支持的 mode='{mode}'。可用：signatures, full"),
@@ -5633,19 +5681,10 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     }],
                 ));
             }
-            if !std::path::Path::new(path).exists() {
+            if !std::path::Path::new(path).exists() && !cg_cwd.join(path).exists() {
                 // 幻觉路径自救：附模糊匹配的相近真实路径，让模型一轮改对
                 // 而不是换个名字再猜（实测 jemalloc 会话：planner 连撞
                 // src/hash.c / src/slab.c 等 ≤5.2 旧文件名，6 连 ToolError）。
-                let cg_cwd = ctx
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("cwd"))
-                    .and_then(|v| v.as_str())
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    });
                 return Err(ToolError::validation(
                     format!(
                         "code_graph: path 不存在：{path}{}",
@@ -5676,27 +5715,53 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                         }],
                     ));
                 }
-                let cwd = ctx
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("cwd"))
-                    .and_then(|v| v.as_str())
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    });
+                // 图模式依赖预建定义索引。首次命中 worktree 时只有限等待，
+                // 构建按索引路径 single-flight；read/search 与普通签名查询从不等待。
+                match crate::code_graph_index::wait_for_index(
+                    &cg_cwd,
+                    crate::code_graph_index::graph_readiness_timeout(),
+                )
+                .await
+                {
+                    crate::code_graph_index::IndexReadiness::Ready => {}
+                    crate::code_graph_index::IndexReadiness::TimedOut => {
+                        return Err(ToolError::execution_str(
+                            "code_graph",
+                            format!(
+                                "code_graph index not ready after {:?}: {}. The build continues in the background; use search plus ranged read now, then retry graph mode later.",
+                                crate::code_graph_index::graph_readiness_timeout(),
+                                crate::code_graph_index::CodeGraphIndex::path(&cg_cwd).display(),
+                            ),
+                        ));
+                    }
+                    crate::code_graph_index::IndexReadiness::BackendUnavailable => {
+                        return Err(ToolError::execution_str(
+                            "code_graph",
+                            "code_graph index unavailable: ast-grep is required to build graph indexes. Use search plus ranged read, or install ast-grep and retry graph mode.",
+                        ));
+                    }
+                    crate::code_graph_index::IndexReadiness::Unavailable => {
+                        return Err(ToolError::execution_str(
+                            "code_graph",
+                            format!(
+                                "code_graph index unavailable after build: {}. Use search plus ranged read now, then retry graph mode later.",
+                                crate::code_graph_index::CodeGraphIndex::path(&cg_cwd).display(),
+                            ),
+                        ));
+                    }
+                }
                 // viz 的 scope 是相对仓库根语义：绝对路径落在 cwd 下时转成相对。
                 let p = std::path::Path::new(path);
                 let rel = if p.is_absolute() {
-                    p.strip_prefix(&cwd)
+                    p.strip_prefix(&cg_cwd)
                         .map(|r| r.to_string_lossy().to_string())
                         .unwrap_or_else(|_| path.to_string())
                 } else {
                     path.to_string()
                 };
                 let result = match g {
-                    "structure" => crate::code_graph_viz::structure_mermaid(&cwd, &rel).await,
-                    _ => crate::code_graph_viz::calls_mermaid(&cwd, &rel).await,
+                    "structure" => crate::code_graph_viz::structure_mermaid(&cg_cwd, &rel).await,
+                    _ => crate::code_graph_viz::calls_mermaid(&cg_cwd, &rel).await,
                 };
                 return match result {
                     Ok(out) => {
@@ -5827,7 +5892,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
                     const MAX_MATCHES: usize = 200;
                     const MAX_CHARS: usize = 12_000;
                     if let Some((lines, total)) = crate::code_graph_index::query_signatures(
-                        std::path::Path::new("."),
+                        &cg_cwd,
                         path,
                         k,
                         name,
@@ -5888,6 +5953,7 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             // 两条路径：语义 kind（走 scan --inline-rules，按节点类型匹配，
             // 召回可靠）与裸 pattern（走 run -p，逃生舱，交给模型自己写）。
             let mut cmd = tokio::process::Command::new(CODE_GRAPH_BACKEND);
+            cmd.current_dir(&cg_cwd);
             let rule_text;
             match (kind, raw_pattern) {
                 (Some(k), _) => {
@@ -5966,13 +6032,10 @@ pub fn code_graph_tool() -> latte_rs_agent_tools::types::Tool {
             let mut lines: Vec<String> = Vec::new();
             let mut chars = 0usize;
             let mut emitted = 0usize;
-            // 输出路径归一化基准：ast-grep 未设 current_dir，继承进程 cwd
-            // （= 仓库根）。给它绝对 path 时它回传绝对 `file`，给它 `.` 时
-            // 回传相对 `file`。而 agent 的 resolve_tool_input_against_cwd 会把
-            // 相对 path 拼成绝对，所以常态是绝对——与预建索引 fast-path 回传的
-            // 相对路径不一致。这里统一 strip 掉 cwd 前缀，让两条路径（索引 /
-            // 实时）以及 read/search/find 的相对显示口径保持一致。
-            let proc_cwd = std::env::current_dir().ok();
+            // 输出路径归一化基准：实时 ast-grep 与预建索引均绑定到 agent
+            // 的实际 cwd（隔离会话即其 linked worktree），因此两条路径返回
+            // 同一套相对仓库根路径。
+            let proc_cwd = Some(cg_cwd.clone());
             for m in parsed.iter().take(MAX_MATCHES) {
                 let file_raw = m.get("file").and_then(|v| v.as_str()).unwrap_or("?");
                 // 绝对路径且落在 cwd 下 → 转相对；否则原样。
@@ -8954,8 +9017,16 @@ fn emit_late_review(
     if v.verdict == Verdict::Ok {
         return;
     }
-    let label = if v.verdict == Verdict::Warn { "⚠️ warn" } else { "🛑 intervene" };
-    let reason = if v.reason.is_empty() { "疑似偏离职责或未完全达成委派任务".to_string() } else { v.reason };
+    let label = if v.verdict == Verdict::Warn {
+        "⚠️ warn"
+    } else {
+        "🛑 intervene"
+    };
+    let reason = if v.reason.is_empty() {
+        "疑似偏离职责或未完全达成委派任务".to_string()
+    } else {
+        v.reason
+    };
     let mut bubble = format!("{label}（{role_id} 委派返回审查·迟到，产出已放行）：{reason}");
     if !v.hint.is_empty() {
         bubble.push_str(&format!("\n\n> 建议：{}", v.hint));
@@ -9502,6 +9573,14 @@ async fn register_delegate_tool(
             let sub_cancel_flag =
                 crate::sub_cancel::register_for_session(&sub_id, Some(session_id.as_str()));
             let _sub_cancel_guard = crate::sub_cancel::SubCancelGuard(sub_id.clone());
+            // 后台 bash job 归属本次分派（runner 的 job owner = sub_id）：
+            // handler 退出时 kill 名下仍在跑的 job（见 crate::bg_jobs）。
+            let _job_guard = crate::bg_jobs::JobOwnerGuard::new(
+                &sub_id,
+                event_tx.clone(),
+                Some(sub_id.clone()),
+                "所属分派已结束，后台 job 被终止",
+            );
             // Fan out ONLY to the subsession memory sink: the
             // `sub_sink` is `Arc<dyn TraceSink>` returning from
             // `SubsessionStore::create` —— 内部已 fanout 到
@@ -9744,9 +9823,9 @@ async fn register_delegate_tool(
                                 // 空产出不算成功：判失败回喂 manager，
                                 // 让它重派或换角色，而不是把空串当结论。
                                 let stripped = strip_think_blocks(&response);
-                                if is_empty_output(&stripped) {
+                                if is_empty_output(&stripped) || is_only_think_blocks(&response) {
                                     result = Err(tool_err(format!(
-                                        "subagent '{role_id}' 返回了空内容"
+                                        "subagent '{role_id}' 没有返回可交付正文（空内容或只有思维链）"
                                     )));
                                 } else {
                                     result = Ok(stripped);

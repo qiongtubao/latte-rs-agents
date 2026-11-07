@@ -1564,9 +1564,8 @@ fn resolve_whitelisted_path(cwd: &std::path::Path, rel: &str) -> Option<std::pat
     {
         return None;
     }
-    let allowed = rel.starts_with(".latte/learn/")
-        || rel.starts_with("docs/")
-        || is_session_learn_path(rel);
+    let allowed =
+        rel.starts_with(".latte/learn/") || rel.starts_with("docs/") || is_session_learn_path(rel);
     if !allowed {
         return None;
     }
@@ -1592,8 +1591,12 @@ mod doc_whitelist_tests {
     #[test]
     fn session_learn_tree_is_readable_but_rest_of_session_is_not() {
         let cwd = std::path::Path::new("/p");
-        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1-2-0/learn/own/draft.md").is_some());
-        assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/own/img/ml-1.svg").is_some());
+        assert!(
+            resolve_whitelisted_path(cwd, ".latte/sessions/ui-1-2-0/learn/own/draft.md").is_some()
+        );
+        assert!(
+            resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/own/img/ml-1.svg").is_some()
+        );
         assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/events.jsonl").is_none());
         assert!(resolve_whitelisted_path(cwd, ".latte/sessions/ui-1/learn/../x.md").is_none());
         assert!(resolve_whitelisted_path(cwd, ".latte/sessions/../learn/a.md").is_none());

@@ -28,8 +28,8 @@ isolated = true
 
 [types.learn]
 label = "学习任务"
-description = "小白向深度讲解，产出六层图解教程"
-default_workflow = "learn"
+description = "文档驱动学习：源码取证、教程、弹窗答题、答错返工，直到掌握"
+default_workflow = "learn_loop"
 color = "#8b5cf6"
 icon = "📚"
 isolated = false

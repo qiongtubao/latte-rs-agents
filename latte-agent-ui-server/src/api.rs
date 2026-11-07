@@ -168,7 +168,15 @@ pub async fn create_session_with_workspace(b: &UiBackend) -> Result<SessionInfo,
     })
     .await
     .ok()
-    .and_then(|r| r.map_err(|e| eprintln!("[sessions] 建会话工作空间失败，退回项目目录: {e}")).ok());
+    .and_then(|r| {
+        r.map_err(|e| eprintln!("[sessions] 建会话工作空间失败，退回项目目录: {e}"))
+            .ok()
+    });
+    // linked worktree 的索引文件与主仓不同，必须在树建好后单独预热。
+    // 不等待：聊天、read、search 均可立即使用；图模式会按需有限等待同一任务。
+    if let Some(worktree) = ws.as_deref() {
+        latte_agent_core::code_graph_index::start_background_build(worktree);
+    }
     create_session_with_id(b, session_id, ws.as_deref()).await
 }
 
@@ -452,7 +460,12 @@ pub async fn delete_session(b: &UiBackend, id: &str) -> Result<(), ApiError> {
             latte_agent_core::workflow::remove_session_runs(&b.cwd, id);
             // 独立工作空间（普通 session 按 id 建；fork 会继承源 session 的目录，
             // 仍有其它 session 在用时不删）。
-            if !b.sessions.read().values().any(|o| o.agent_cwd() == agent_cwd) {
+            if !b
+                .sessions
+                .read()
+                .values()
+                .any(|o| o.agent_cwd() == agent_cwd)
+            {
                 if let Some(branch) =
                     latte_agent_core::task_worktree::TaskWorktree::remove_session_workspace(
                         &b.cwd, id, &agent_cwd,
@@ -2236,8 +2249,7 @@ pub fn workflow_run_start(
             .map(|d| d.as_micros())
             .unwrap_or(0)
     );
-    if b
-        .workflow_run
+    if b.workflow_run
         .try_start(tx.clone(), cancel.clone(), run_id.clone())
         .is_err()
     {
@@ -5311,9 +5323,7 @@ mod workflow_resume_tests {
         write_checkpoint(dir.path(), "wf-live", "learn");
         write_workflow(dir.path(), "learn");
         let flag = Arc::new(AtomicBool::new(false));
-        b.session_workflows
-            .write()
-            .insert(sid.clone(), flag);
+        b.session_workflows.write().insert(sid.clone(), flag);
         let h = resolve_session(&b, Some(&sid)).unwrap();
         h.try_controller()
             .expect("spawned")
@@ -5387,7 +5397,9 @@ mod workflow_resume_tests {
         };
         crate::tasks::Task::set_state(&mut t, "in_progress", "user", None, 0);
         b.tasks.write().insert_task_for_test(t);
-        b.tasks.write().register_workflow_cancel(task_id, flag.clone());
+        b.tasks
+            .write()
+            .register_workflow_cancel(task_id, flag.clone());
         assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
         // 必须走真正的 `chat_abort`：它曾在 `if let … = tasks.read()…` 的体内
         // 再拿 `tasks.write()`（读守卫活到 if-let 结束）→ 同线程自死锁，整个

@@ -51,7 +51,13 @@ fn tokenize(line: &str) -> Vec<Span> {
     let mut brace_stack: Vec<bool> = Vec::new();
     let at = |k: usize| b.get(k).map(|x| x.1);
     let pos = |k: usize| b.get(k).map_or(line.len(), |x| x.0);
-    let push = |out: &mut Vec<Span>, tok: Tok, from: usize, to: usize| out.push(Span { tok, start: pos(from), end: pos(to) });
+    let push = |out: &mut Vec<Span>, tok: Tok, from: usize, to: usize| {
+        out.push(Span {
+            tok,
+            start: pos(from),
+            end: pos(to),
+        })
+    };
     while i < b.len() {
         let c = b[i].1;
         if c == '*' && at(i + 1) == Some('*') {
@@ -68,7 +74,8 @@ fn tokenize(line: &str) -> Vec<Span> {
             let mut text = String::new();
             while j < b.len() {
                 let d = b[j].1;
-                if d.is_ascii_digit() || (d == '.' && at(j + 1).is_some_and(|x| x.is_ascii_digit())) {
+                if d.is_ascii_digit() || (d == '.' && at(j + 1).is_some_and(|x| x.is_ascii_digit()))
+                {
                     text.push(d);
                     j += 1;
                 } else if d == ','
@@ -137,7 +144,12 @@ fn tokenize(line: &str) -> Vec<Span> {
             continue;
         }
         if (c == '<' && at(i + 1) == Some('<')) || (c == '>' && at(i + 1) == Some('>')) {
-            push(&mut out, Tok::Op(if c == '<' { "<<" } else { ">>" }), i, i + 2);
+            push(
+                &mut out,
+                Tok::Op(if c == '<' { "<<" } else { ">>" }),
+                i,
+                i + 2,
+            );
             i += 2;
             continue;
         }
@@ -168,7 +180,11 @@ fn tokenize(line: &str) -> Vec<Span> {
             continue;
         }
         if c == '}' {
-            let tok = if brace_stack.pop() == Some(true) { Tok::Rp } else { Tok::Other };
+            let tok = if brace_stack.pop() == Some(true) {
+                Tok::Rp
+            } else {
+                Tok::Other
+            };
             push(&mut out, tok, i, i + 1);
             i += 1;
             continue;
@@ -290,7 +306,9 @@ fn eval(toks: &[Tok]) -> Option<f64> {
 }
 
 fn decimals_of(text: &str) -> usize {
-    text.rsplit_once('.').map_or(0, |(_, d)| d.chars().take_while(char::is_ascii_digit).count())
+    text.rsplit_once('.').map_or(0, |(_, d)| {
+        d.chars().take_while(char::is_ascii_digit).count()
+    })
 }
 
 fn equal(lhs: f64, rhs: f64, rhs_text: &str) -> bool {
@@ -323,7 +341,10 @@ fn fmt_num(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
-        format!("{v:.4}").trim_end_matches('0').trim_end_matches('.').to_string()
+        format!("{v:.4}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 
@@ -389,7 +410,10 @@ pub fn scan(file: &str, text: &str) -> Vec<Mismatch> {
             fence = Some(t[..3].to_string());
             continue;
         }
-        if crate::learn_cite::is_pending_note(t) || t.starts_with("#### 试学提问") || EXEMPT.iter().any(|w| line.contains(w)) {
+        if crate::learn_cite::is_pending_note(t)
+            || t.starts_with("#### 试学提问")
+            || EXEMPT.iter().any(|w| line.contains(w))
+        {
             continue;
         }
         if !line.contains('=') && !line.contains('＝') {
@@ -424,7 +448,9 @@ pub fn scan(file: &str, text: &str) -> Vec<Mismatch> {
                 let first = usize::from(prev_ident || run[0].tok == Tok::Eq);
                 for w in first..parts.len() - 1 {
                     let (a, b) = (&parts[w], &parts[w + 1]);
-                    let (Some(fa), Some(fb), Some(lb)) = (a.first(), b.first(), b.last()) else { continue };
+                    let (Some(fa), Some(fb), Some(lb)) = (a.first(), b.first(), b.last()) else {
+                        continue;
+                    };
                     let ta: Vec<Tok> = a.iter().map(|s| s.tok).collect();
                     let tb: Vec<Tok> = b.iter().map(|s| s.tok).collect();
                     // 两边至少有一边是真算式（有运算符）；纯 `a = b` 交给别的检查。
@@ -432,9 +458,13 @@ pub fn scan(file: &str, text: &str) -> Vec<Mismatch> {
                     if !has_op(&ta) && !has_op(&tb) {
                         continue;
                     }
-                    let (Some(mut va), Some(vb)) = (eval(&ta), eval(&tb)) else { continue };
+                    let (Some(mut va), Some(vb)) = (eval(&ta), eval(&tb)) else {
+                        continue;
+                    };
                     // 右边是百分数（`= 49.2%`、`= 49.2\%`）：左边的比值乘 100。
-                    let rhs_end_pct = w + 2 == parts.len() && j < spans.len() && line[spans[j].start..spans[j].end].ends_with('%');
+                    let rhs_end_pct = w + 2 == parts.len()
+                        && j < spans.len()
+                        && line[spans[j].start..spans[j].end].ends_with('%');
                     if rhs_end_pct {
                         va *= 100.0;
                     }
@@ -494,7 +524,11 @@ mod tests {
         assert_eq!(m.len(), 1, "{m:?}");
         assert_eq!((m[0].computed, m[0].written), (227.0, 228.0));
         assert_eq!(m[0].expr, "4 * (62 - 6 + 1) - 1 = 228");
-        assert!(m[0].describe().contains("算出来是 227，写的是 228"), "{}", m[0].describe());
+        assert!(
+            m[0].describe().contains("算出来是 227，写的是 228"),
+            "{}",
+            m[0].describe()
+        );
         // 链式：只报错的那一段
         let c = bad("5 + 32 - 1 = 36 = 6 * 7");
         assert_eq!(c.len(), 1, "{c:?}");
@@ -512,9 +546,9 @@ mod tests {
     #[test]
     fn expressions_with_variables_units_and_non_equalities_are_left_alone() {
         for t in [
-            "SC_NGROUP * 57 - 1 = 227",        // 含变量，截出来的 `57 - 1` 不是完整表达式
+            "SC_NGROUP * 57 - 1 = 227", // 含变量，截出来的 `57 - 1` 不是完整表达式
             "SC_NSIZES = SC_NTINY + 4 + 3 = 8", // 变量在前
-            "16 * 1024 = 16 KB",                // 单位
+            "16 * 1024 = 16 KB",        // 单位
             "x <= 3 + 4",
             "a >= 5 - 1",
             "1 + 1 ≈ 3",
@@ -522,8 +556,8 @@ mod tests {
             "if (n == 3 + 4)",
             "这是错的：1 + 1 ≠ 3，不等于 3",
             "不对，1 + 1 = 3 是算错的写法",
-            "SC_NGROUP - 1 = 3",                // 变量后的减号是二元运算
-            "~(0-1) = ~(-1) = 0",              // 按位取反不求值
+            "SC_NGROUP - 1 = 3",  // 变量后的减号是二元运算
+            "~(0-1) = ~(-1) = 0", // 按位取反不求值
             "x & (8 - 1) = 7",
         ] {
             assert!(bad(t).is_empty(), "{t}: {:?}", bad(t));
@@ -538,8 +572,14 @@ mod tests {
     fn mismatch_becomes_a_checkable_engine_issue() {
         let m = &bad("共 4 * 57 = 238 档")[0];
         let i = m.to_issue();
-        assert_eq!((i.kind.as_str(), i.source.as_str(), i.quote.as_str()), ("doc", "engine", "4 * 57 = 238"));
-        assert!(i.check.starts_with("arith:") && i.evidence.is_empty(), "{i:?}");
+        assert_eq!(
+            (i.kind.as_str(), i.source.as_str(), i.quote.as_str()),
+            ("doc", "engine", "4 * 57 = 238")
+        );
+        assert!(
+            i.check.starts_with("arith:") && i.evidence.is_empty(),
+            "{i:?}"
+        );
         // 同一段算式文字，标识稳定
         assert_eq!(i.check, bad("再说一次 4 * 57 = 238。")[0].check());
     }
@@ -548,7 +588,9 @@ mod tests {
     #[test]
     #[ignore]
     fn probe_real_docs() {
-        let Ok(dir) = std::env::var("LEARN_ARITH_DIR") else { return };
+        let Ok(dir) = std::env::var("LEARN_ARITH_DIR") else {
+            return;
+        };
         let base = std::path::Path::new(&dir);
         let mut n = 0;
         for p in crate::learn_novice::walk(&base.join("sections")) {

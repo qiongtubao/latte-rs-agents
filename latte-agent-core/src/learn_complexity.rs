@@ -62,7 +62,11 @@ pub struct Complexity {
 
 impl Complexity {
     pub fn score(&self) -> usize {
-        self.lines + 8 * self.branches + 15 * self.files.saturating_sub(1) + 30 * self.alternatives + 25 * self.hard
+        self.lines
+            + 8 * self.branches
+            + 15 * self.files.saturating_sub(1)
+            + 30 * self.alternatives
+            + 25 * self.hard
     }
 
     pub fn tier(&self) -> Tier {
@@ -131,15 +135,41 @@ pub fn max_points(total_score: usize) -> usize {
 
 fn is_comment_or_blank(line: &str) -> bool {
     let t = line.trim();
-    t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with('#')
+    t.is_empty()
+        || t.starts_with("//")
+        || t.starts_with("/*")
+        || t.starts_with('*')
+        || t.starts_with('#')
 }
 
 /// “短但难”的标记（子串匹配，大小写敏感）：并发原语、unsafe / 裸指针转换。
 const HARD_MARKERS: &[&str] = &[
-    "atomic", "Atomic", "memory_order", "compare_exchange", "fetch_add", "fetch_sub",
-    "mutex", "Mutex", "lock_guard", "unique_lock", "shared_lock", "condition_variable", "CondVar", "RwLock",
-    "std::thread", "pthread_", "__sync_", "__atomic", "volatile", "Ordering::",
-    "unsafe", "reinterpret_cast", "const_cast", "asm!", "__asm", "transmute",
+    "atomic",
+    "Atomic",
+    "memory_order",
+    "compare_exchange",
+    "fetch_add",
+    "fetch_sub",
+    "mutex",
+    "Mutex",
+    "lock_guard",
+    "unique_lock",
+    "shared_lock",
+    "condition_variable",
+    "CondVar",
+    "RwLock",
+    "std::thread",
+    "pthread_",
+    "__sync_",
+    "__atomic",
+    "volatile",
+    "Ordering::",
+    "unsafe",
+    "reinterpret_cast",
+    "const_cast",
+    "asm!",
+    "__asm",
+    "transmute",
 ];
 
 /// 这一行是不是“难点行”：宏定义，或含并发 / unsafe 标记（一行最多计 1）。
@@ -152,13 +182,17 @@ fn is_hard_line(line: &str) -> bool {
 fn branches_in(line: &str) -> usize {
     let mut n = line.matches("&&").count() + line.matches("||").count() + line.matches('?').count();
     let bytes = line.as_bytes();
-    for kw in ["if", "for", "while", "switch", "case", "catch", "match", "loop"] {
+    for kw in [
+        "if", "for", "while", "switch", "case", "catch", "match", "loop",
+    ] {
         let mut from = 0;
         while let Some(pos) = line[from..].find(kw) {
             let i = from + pos;
             let j = i + kw.len();
-            let before_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            let after_ok = j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
+            let before_ok =
+                i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            let after_ok =
+                j >= bytes.len() || !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_');
             if before_ok && after_ok {
                 n += 1;
             }
@@ -170,15 +204,28 @@ fn branches_in(line: &str) -> usize {
 
 /// 量一个知识点的证据。读不到的区间忽略（证据存在性由 plan 校验负责）。
 pub fn measure(cwd: &Path, evidence: &str, grounded_alternatives: usize) -> Complexity {
-    let mut c = Complexity { alternatives: grounded_alternatives, ..Default::default() };
+    let mut c = Complexity {
+        alternatives: grounded_alternatives,
+        ..Default::default()
+    };
     let mut files = std::collections::BTreeSet::new();
     for seg in crate::workflow::split_learn_evidence(evidence) {
-        let Some((file, range)) = seg.rsplit_once(':') else { continue };
+        let Some((file, range)) = seg.rsplit_once(':') else {
+            continue;
+        };
         let (a, b) = range.split_once('-').unwrap_or((range, range));
-        let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else { continue };
-        let Ok(text) = std::fs::read_to_string(cwd.join(file.trim())) else { continue };
+        let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(cwd.join(file.trim())) else {
+            continue;
+        };
         files.insert(file.trim().to_string());
-        for line in text.lines().skip(a.saturating_sub(1)).take(b.saturating_sub(a) + 1) {
+        for line in text
+            .lines()
+            .skip(a.saturating_sub(1))
+            .take(b.saturating_sub(a) + 1)
+        {
             let t = line.trim_start();
             // 宏定义在 is_comment_or_blank 里会被当成预处理行跳过，先单独记为难点。
             if t.starts_with("#define") {
@@ -210,14 +257,21 @@ pub struct PathVolume {
     pub largest: String,
 }
 
-const SOURCE_EXTS: &[&str] = &["c", "cc", "cpp", "cxx", "h", "hh", "hpp", "rs", "go", "py", "java", "js", "ts", "tsx", "kt", "swift"];
+const SOURCE_EXTS: &[&str] = &[
+    "c", "cc", "cpp", "cxx", "h", "hh", "hpp", "rs", "go", "py", "java", "js", "ts", "tsx", "kt",
+    "swift",
+];
 
 fn collect_sources(path: &Path, out: &mut Vec<std::path::PathBuf>, budget: &mut usize) {
     if *budget == 0 {
         return;
     }
     if path.is_file() {
-        if path.extension().and_then(|e| e.to_str()).is_some_and(|e| SOURCE_EXTS.contains(&e)) {
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| SOURCE_EXTS.contains(&e))
+        {
             out.push(path.to_path_buf());
             *budget -= 1;
         }
@@ -235,18 +289,31 @@ pub fn measure_paths(cwd: &Path, paths: &[String]) -> PathVolume {
     let mut files = Vec::new();
     let mut budget = 300usize;
     for p in paths {
-        collect_sources(&cwd.join(p.trim().trim_end_matches('/')), &mut files, &mut budget);
+        collect_sources(
+            &cwd.join(p.trim().trim_end_matches('/')),
+            &mut files,
+            &mut budget,
+        );
     }
     files.sort();
     files.dedup();
-    let mut v = PathVolume { files: files.len(), ..Default::default() };
+    let mut v = PathVolume {
+        files: files.len(),
+        ..Default::default()
+    };
     for f in files {
-        let Ok(text) = std::fs::read_to_string(&f) else { continue };
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
         let n = text.lines().filter(|l| !is_comment_or_blank(l)).count();
         v.lines += n;
         if n > v.max_file_lines {
             v.max_file_lines = n;
-            v.largest = f.strip_prefix(cwd).unwrap_or(&f).to_string_lossy().to_string();
+            v.largest = f
+                .strip_prefix(cwd)
+                .unwrap_or(&f)
+                .to_string_lossy()
+                .to_string();
         }
     }
     v
@@ -260,15 +327,29 @@ mod tests {
     fn branches_count_keywords_on_word_boundaries_and_operators() {
         assert_eq!(branches_in("if (a && b || c) {"), 3);
         assert_eq!(branches_in("for (int i = 0; i < n; ++i)"), 1);
-        assert_eq!(branches_in("int modifier = 0;"), 0, "`modifier` 里的 if 不算");
+        assert_eq!(
+            branches_in("int modifier = 0;"),
+            0,
+            "`modifier` 里的 if 不算"
+        );
         assert_eq!(branches_in("x = (r == 0) ? 1 : 2;"), 1);
         assert_eq!(branches_in("match x { _ => loop {} }"), 2);
-        assert_eq!(branches_in("showcase(format)"), 0, "case / for 在单词里面不算");
+        assert_eq!(
+            branches_in("showcase(format)"),
+            0,
+            "case / for 在单词里面不算"
+        );
     }
 
     #[test]
     fn tiers_follow_the_score_thresholds() {
-        let c = |lines, branches, files, alternatives| Complexity { lines, branches, files, alternatives, hard: 0 };
+        let c = |lines, branches, files, alternatives| Complexity {
+            lines,
+            branches,
+            files,
+            alternatives,
+            hard: 0,
+        };
         // LAT-100 实测：Slice 35 行 / 8 分支 / 1 文件 → 99；SliceParts 拼接 → 72；Status 113 行 → 200。
         assert_eq!(c(35, 8, 1, 0).score(), 99);
         assert_eq!(c(35, 8, 1, 0).tier(), Tier::Simple);
@@ -290,7 +371,11 @@ mod tests {
         // 每个被 tier_skips 跳过的节，在该档都没有上限；没被跳过的都有。
         for tier in [Tier::Simple, Tier::Medium, Tier::Large] {
             for n in 0..=9u8 {
-                assert_eq!(tier_skips(tier).contains(&n), part_cap(tier, n).is_none(), "{tier:?} 第 {n} 节");
+                assert_eq!(
+                    tier_skips(tier).contains(&n),
+                    part_cap(tier, n).is_none(),
+                    "{tier:?} 第 {n} 节"
+                );
             }
         }
     }
@@ -306,7 +391,11 @@ mod tests {
     #[test]
     fn measure_counts_code_lines_skipping_comments_and_blanks() {
         let d = tempfile::tempdir().unwrap();
-        std::fs::write(d.path().join("a.c"), "// c\nint f(int x) {\n\n  if (x) return 1;\n  return 0; // t\n}\n").unwrap();
+        std::fs::write(
+            d.path().join("a.c"),
+            "// c\nint f(int x) {\n\n  if (x) return 1;\n  return 0; // t\n}\n",
+        )
+        .unwrap();
         let c = measure(d.path(), "a.c:1-6", 0);
         assert_eq!((c.lines, c.branches, c.files), (4, 1, 1));
         assert_eq!(measure(d.path(), "nope.c:1-6", 0).files, 0);
@@ -319,7 +408,14 @@ mod tests {
         std::fs::write(d.path().join("src/a.cc"), "int a;\nint b;\n// c\n").unwrap();
         std::fs::write(d.path().join("src/sub/b.h"), "int x;\n").unwrap();
         std::fs::write(d.path().join("src/readme.txt"), "忽略\n").unwrap();
-        let v = measure_paths(d.path(), &["src".to_string(), "src/a.cc".to_string(), "nope".to_string()]);
+        let v = measure_paths(
+            d.path(),
+            &[
+                "src".to_string(),
+                "src/a.cc".to_string(),
+                "nope".to_string(),
+            ],
+        );
         assert_eq!((v.lines, v.files, v.max_file_lines), (3, 2, 2), "{v:?}");
         assert_eq!(v.largest, "src/a.cc");
     }
@@ -334,8 +430,16 @@ mod tests {
                     n->next = h;\n  }\n  auto* p = reinterpret_cast<char*>(n);\n  std::lock_guard<std::mutex> g(mu_);\n  return true;\n}\n";
         std::fs::write(d.path().join("lf.cc"), code).unwrap();
         let c = measure(d.path(), "lf.cc:1-12", 0);
-        assert_eq!(c.hard, 6, "2 个宏 + load + CAS + reinterpret_cast + lock_guard: {c:?}");
-        assert_eq!(c.tier(), Tier::Medium, "10 行无锁 push 不是简单档：{}", c.describe());
+        assert_eq!(
+            c.hard, 6,
+            "2 个宏 + load + CAS + reinterpret_cast + lock_guard: {c:?}"
+        );
+        assert_eq!(
+            c.tier(),
+            Tier::Medium,
+            "10 行无锁 push 不是简单档：{}",
+            c.describe()
+        );
         assert!(!is_hard_line("int modifier = 0;"));
         assert!(c.describe().contains("难点行 6"));
     }

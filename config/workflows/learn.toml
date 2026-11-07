@@ -147,6 +147,12 @@ id = "verify"
 description = "reviewer 双重校验（只审不改）"
 speakers = ["reviewer"]
 output_key = "verify_report"
+# reviewer 的格式契约失败时至少给一次原地纠正机会；请求软预算 20、
+# 硬上限 30，避免长时间反复取证却始终不提交裁决。
+max_retries = 1
+max_requests = 20
+max_tool_calls = 40
+hard_timeout_secs = 600
 task = """校验下面这篇小白教程（你只审、不改文件、不放行——修复与放行是后续两步的事）：
 
 【write 产出】
@@ -184,12 +190,18 @@ task = """reviewer 对教程「{{topic}}」的校验报告如下：
 min_chars = 10
 forbid = []
 
-# 4c. reviewer 独立复核修复后的文件——这才是放行门。FAIL 则跳回 fix。
+# 4c. reviewer 独立复核修复后的文件——只提交结构化问题清单；放行由下一步机械门推导。
 [[steps]]
 id = "recheck"
-description = "reviewer 复核修复结果并给放行裁决"
+description = "reviewer 复核修复结果并提交结构化问题清单"
 speakers = ["reviewer"]
 output_key = "report"
+# 契约失败至少纠正一次；请求软预算 20、硬上限 30。
+max_retries = 1
+max_requests = 20
+max_tool_calls = 40
+hard_timeout_secs = 600
+require_verdict_json = true
 task = """你在上一轮校验了教程「{{topic}}」，programmer 已按你的意见做了修正。
 
 【你上轮的校验报告】
@@ -199,21 +211,26 @@ task = """你在上一轮校验了教程「{{topic}}」，programmer 已按你�
 {{fix_note}}
 
 现在**独立复核修复后的实际文件**（用 read/工具重新读文档文件，不要只看修正说明的自述——以文件真实内容为准）：
-1. 你上轮列的每条问题是否真的改好了（逐条核对，别被「已修复」的措辞带过）；
-2. 修正有没有引入新问题（改错行号、图又坏了、结构被破坏）。
+1. 你上轮列的每条问题是否真的改好了；
+2. 修正有没有引入新的 blocking / important / nit 问题。
 
-输出：**第一行**必须是 `VERDICT: PASS`（问题已全部改好，可交付）或 `VERDICT: FAIL`（仍有未改好/新引入的问题）。FAIL 时其后逐条列出**还差什么**，供 programmer 再修一轮。
-
-⚠️ 输出 `VERDICT: FAIL` 时，正文里不得再出现字符串 `VERDICT: PASS`（放行按子串匹配，会被误判为放行）。"""
-
-# 放行门在 reviewer 手里：复核判 PASS 才放行；判 FAIL 跳回 fix 再修一轮
-# （fix 会拿到本步的 report 作为「上轮复核反馈」）。修问题 #5 的核心：
-# loop_until 判的是 **reviewer（复核者）** 的输出，不再是 programmer 自宣。
-loop_until = "VERDICT: PASS"
-loop_back_to = "fix"
-max_iterations = 2
+不要输出 `VERDICT: PASS/FAIL`，放行由引擎按结构化问题的 severity 推导。先写简短复核记录，然后在末尾输出**唯一一个** ```json 代码块：
+{"issues": [{"id": "B1", "severity": "blocking|important|nit", "rework": "fix", "summary": "一句话问题", "evidence": "文件:行号或实际内容", "fix": "具体改法"}]}
+- 仍需返工的问题统一写 `rework: "fix"`。
+- 没有任何问题时输出 `{"issues": []}`。
+- blocking 必须给 evidence；不要在 JSON 后追加正文。"""
 
 [steps.output_contract]
 min_chars = 20
-require_any = ["VERDICT: PASS", "VERDICT: FAIL"]
-forbid = []
+max_chars = 12000
+forbid = ["VERDICT: PASS", "VERDICT: FAIL"]
+
+# 4d. 零模型机械门：有 blocking 才返工；无 blocking 自动产出唯一 PASS 标记。
+[[steps]]
+id = "release"
+description = "按 reviewer 结构化问题清单机械放行"
+gate_from = "report"
+loop_until = "VERDICT: PASS"
+loop_back_to = "fix"
+loop_no_release_on = "VERDICT: REJECT"
+max_iterations = 2

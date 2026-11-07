@@ -2,8 +2,8 @@
 //!
 //! latte 的 `code_graph` 工具本身是**无索引**的 ast-grep 实时扫描：每次
 //! 调用现场 spawn `ast-grep` 扫源码。对大仓库第一次「建
-//! 地图」要冷扫全仓，几百毫秒~数秒。本模块在 **UI 启动时**后台预扫一遍
-//! cwd 仓库的定义类符号（function/struct/class/type/enum/trait/interface），
+//! 地图」要冷扫全仓，几百毫秒~数秒。本模块在 **UI 启动**以及**隔离
+//! worktree 创建后**后台预扫定义类符号（function/struct/class/type/enum/trait/interface），
 //! 把 `文件 → 符号签名 + 行号` 落盘成 `.latte/code_graph/index.json`，让
 //! 后续「先建地图」这类查询可以直接读索引、秒回，而不必冷扫。
 //!
@@ -23,7 +23,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 /// 索引里收录的「定义类」语义 kind —— 构成一张代码地图的骨架。
 /// 刻意排除 call/import/decl（数量大、非地图语义）。
@@ -464,6 +466,122 @@ pub enum BuildOutcome {
     Built { files: usize, symbols: usize },
 }
 
+/// 图模式对索引的有限等待结果。
+///
+/// `code_graph(kind=...)` 的签名查询本身可回退为实时 ast-grep，因此不应
+/// 调用本 API；只有 `graph=structure|calls` 需要预建定义索引时才等待。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexReadiness {
+    Ready,
+    TimedOut,
+    BackendUnavailable,
+    Unavailable,
+}
+
+type BuildWatch = watch::Receiver<Option<BuildOutcome>>;
+
+/// 正在构建的索引，按最终索引文件路径去重。linked worktree 的路径带后缀，
+/// 所以它们天然独立；同一棵树的 UI 预热与首个图请求则共享一次扫描。
+static IN_FLIGHT_BUILDS: OnceLock<Mutex<BTreeMap<PathBuf, BuildWatch>>> = OnceLock::new();
+
+fn in_flight_builds() -> &'static Mutex<BTreeMap<PathBuf, BuildWatch>> {
+    IN_FLIGHT_BUILDS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn index_is_usable(cwd: &Path) -> bool {
+    std::fs::read_to_string(CodeGraphIndex::path(cwd))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<CodeGraphIndex>(&raw).ok())
+        .is_some_and(|idx| idx.version == CodeGraphIndex::CURRENT_VERSION)
+}
+
+/// 启动或加入一项后台构建。此函数从不等待，适合 UI 创建 worktree 后预热。
+fn start_or_join_build(cwd: &Path) -> BuildWatch {
+    let index_path = CodeGraphIndex::path(cwd);
+    let mut builds = in_flight_builds()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = builds.get(&index_path) {
+        return existing.clone();
+    }
+
+    let (tx, rx) = watch::channel(None);
+    builds.insert(index_path.clone(), rx.clone());
+    drop(builds);
+
+    let build_cwd = cwd.to_path_buf();
+    tokio::spawn(async move {
+        let outcome = build_or_update(&build_cwd).await;
+        let _ = tx.send(Some(outcome));
+        let mut builds = in_flight_builds()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        builds.remove(&index_path);
+    });
+    rx
+}
+
+/// 等待同一 cwd 的构建完成。UI 启动和周期刷新走此入口，确保首个图请求
+/// 不会与 UI 预建对同一个索引重复扫描。
+pub async fn build_or_join(cwd: &Path) -> BuildOutcome {
+    let mut rx = start_or_join_build(cwd);
+    if let Some(outcome) = rx.borrow().clone() {
+        return outcome;
+    }
+    match rx.changed().await {
+        Ok(()) => rx.borrow().clone().unwrap_or(BuildOutcome::AstGrepMissing),
+        Err(_) => BuildOutcome::AstGrepMissing,
+    }
+}
+
+/// 为一个工作目录预热索引，不阻塞会话创建和任何直接文件读取。
+pub fn start_background_build(cwd: &Path) {
+    if !index_is_usable(cwd) {
+        let _ = start_or_join_build(cwd);
+    }
+}
+
+/// 等待预建索引最多 `timeout`。仅图模式调用；超时后构建仍在后台继续。
+pub async fn wait_for_index(cwd: &Path, timeout: Duration) -> IndexReadiness {
+    if index_is_usable(cwd) {
+        return IndexReadiness::Ready;
+    }
+
+    let mut rx = start_or_join_build(cwd);
+    if let Some(outcome) = rx.borrow().clone() {
+        return readiness_after_build(cwd, outcome);
+    }
+
+    match tokio::time::timeout(timeout, rx.changed()).await {
+        Ok(Ok(())) => match rx.borrow().clone() {
+            Some(outcome) => readiness_after_build(cwd, outcome),
+            None => IndexReadiness::Unavailable,
+        },
+        Ok(Err(_)) => IndexReadiness::Unavailable,
+        Err(_) => IndexReadiness::TimedOut,
+    }
+}
+
+fn readiness_after_build(cwd: &Path, outcome: BuildOutcome) -> IndexReadiness {
+    match outcome {
+        BuildOutcome::AstGrepMissing => IndexReadiness::BackendUnavailable,
+        BuildOutcome::Built { .. } | BuildOutcome::UpToDate if index_is_usable(cwd) => {
+            IndexReadiness::Ready
+        }
+        BuildOutcome::Built { .. } | BuildOutcome::UpToDate => IndexReadiness::Unavailable,
+    }
+}
+
+/// 图模式首次按需等待上限。保持可配置，避免大型仓库把 workflow 卡死。
+pub fn graph_readiness_timeout() -> Duration {
+    let millis = std::env::var("LATTE_CODE_GRAPH_READY_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(5_000);
+    Duration::from_millis(millis)
+}
+
 /// 判断是否需要重建：任一源文件 mtime 晚于 `built_at`，或索引缺失/版本旧。
 /// 用 ast-grep 的文件清单来枚举「源文件」，避免自己 walk + 处理 gitignore。
 async fn needs_rebuild(cwd: &Path, existing: &Option<CodeGraphIndex>) -> bool {
@@ -569,12 +687,17 @@ pub async fn build_or_update(cwd: &Path) -> BuildOutcome {
     let n_files = index.files.len();
     let n_syms = index.symbol_count();
 
-    // 落盘（best-effort）。
+    // 原子落盘：按需构建后会有并发图查询；先写同目录临时文件再 rename，
+    // 读者只能看到上一版完整索引或新的一版完整索引，绝不会读到半截 JSON。
     if let Some(dir) = index_path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_string(&index) {
-        let _ = std::fs::write(&index_path, json);
+        let tmp_path =
+            index_path.with_extension(format!("json.tmp-{}-{}", std::process::id(), now_unix()));
+        if std::fs::write(&tmp_path, json).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &index_path);
+        }
     }
 
     BuildOutcome::Built {

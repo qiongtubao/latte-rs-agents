@@ -223,7 +223,8 @@ fn rewrite_line(line: &str, f: &mut dyn FnMut(&str) -> Option<String>) -> String
                     }
                     _ => (inner.trim(), ""),
                 };
-                let (bare, angle) = match target.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
+                let (bare, angle) = match target.strip_prefix('<').and_then(|t| t.strip_suffix('>'))
+                {
                     Some(t) => (t, true),
                     None => (target, false),
                 };
@@ -232,10 +233,13 @@ fn rewrite_line(line: &str, f: &mut dyn FnMut(&str) -> Option<String>) -> String
                         Some(i) => (&bare[..i], &bare[i..]),
                         None => (bare, ""),
                     };
-                    (!path.is_empty())
-                        .then(|| f(path))
-                        .flatten()
-                        .map(|p| if angle { format!("<{p}{frag}>") } else { format!("{p}{frag}") })
+                    (!path.is_empty()).then(|| f(path)).flatten().map(|p| {
+                        if angle {
+                            format!("<{p}{frag}>")
+                        } else {
+                            format!("{p}{frag}")
+                        }
+                    })
                 } else {
                     None
                 };
@@ -412,7 +416,9 @@ fn unquote(s: &str) -> String {
     for q in ['"', '\'', '「'] {
         let close = if q == '「' { '」' } else { q };
         if t.len() >= 2 && t.starts_with(q) && t.ends_with(close) {
-            return t[q.len_utf8()..t.len() - close.len_utf8()].trim().to_string();
+            return t[q.len_utf8()..t.len() - close.len_utf8()]
+                .trim()
+                .to_string();
         }
     }
     t.to_string()
@@ -463,7 +469,11 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
                 let label = unquote(label);
                 lanes.push(Lane {
                     id: id.to_string(),
-                    label: if label.is_empty() { id.to_string() } else { label },
+                    label: if label.is_empty() {
+                        id.to_string()
+                    } else {
+                        label
+                    },
                     items: Vec::new(),
                 });
             }
@@ -488,7 +498,9 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
                 };
                 let mut kind = CellKind::Data;
                 let (first, more) = {
-                    let (f, m) = tail.split_once(char::is_whitespace).unwrap_or((tail.as_str(), ""));
+                    let (f, m) = tail
+                        .split_once(char::is_whitespace)
+                        .unwrap_or((tail.as_str(), ""));
                     (f.to_string(), m.trim().to_string())
                 };
                 if let Some(k) = CellKind::parse(&first) {
@@ -496,16 +508,27 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
                     tail = more;
                 }
                 let mut offset = None;
-                if let Some(at) = tail.rfind(" @").map(|i| i + 1).or_else(|| tail.starts_with('@').then_some(0)) {
+                if let Some(at) = tail
+                    .rfind(" @")
+                    .map(|i| i + 1)
+                    .or_else(|| tail.starts_with('@').then_some(0))
+                {
                     match parse_size(&tail[at + 1..]) {
                         Some(o) => {
                             offset = Some(o);
                             tail = tail[..at].trim().to_string();
                         }
-                        None => errs.push(format!("第 {ln} 行 cell {id} 的偏移「{}」不合法", &tail[at..])),
+                        None => errs.push(format!(
+                            "第 {ln} 行 cell {id} 的偏移「{}」不合法",
+                            &tail[at..]
+                        )),
                     }
                 }
-                if lane.items.iter().any(|it| matches!(it, Item::Cell { id: x, .. } if x == id)) {
+                if lane
+                    .items
+                    .iter()
+                    .any(|it| matches!(it, Item::Cell { id: x, .. } if x == id))
+                {
                     errs.push(format!("第 {ln} 行 cell id「{}.{id}」重复", lane.id));
                 }
                 let label = unquote(&tail);
@@ -513,7 +536,11 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
                     id: id.to_string(),
                     size,
                     kind,
-                    label: if label.is_empty() { id.to_string() } else { label },
+                    label: if label.is_empty() {
+                        id.to_string()
+                    } else {
+                        label
+                    },
                     offset,
                 });
             }
@@ -529,17 +556,28 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
                 };
                 lane.items.push(Item::Gap {
                     size,
-                    label: if label.is_empty() { "…".into() } else { label },
+                    label: if label.is_empty() {
+                        "…".into()
+                    } else {
+                        label
+                    },
                 });
             }
             "ptr" => {
                 let Some((from, after)) = rest.split_once("->") else {
-                    errs.push(format!("第 {ln} 行 ptr 要写成 `ptr 行.格 -> 行.格 \"说明\"`"));
+                    errs.push(format!(
+                        "第 {ln} 行 ptr 要写成 `ptr 行.格 -> 行.格 \"说明\"`"
+                    ));
                     continue;
                 };
                 let after = after.trim();
                 let (to, label) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
-                raw_ptrs.push((ln, from.trim().to_string(), to.trim().to_string(), unquote(label)));
+                raw_ptrs.push((
+                    ln,
+                    from.trim().to_string(),
+                    to.trim().to_string(),
+                    unquote(label),
+                ));
             }
             other => errs.push(format!(
                 "第 {ln} 行未知指令「{other}」（只认 title / lane / cell / gap / ptr）"
@@ -550,7 +588,10 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
         errs.push("没有任何 lane（一行内存 = 一个 lane）".into());
     }
     if lanes.len() > ML_MAX_LANES {
-        errs.push(format!("lane 有 {} 个，最多 {ML_MAX_LANES} 个：拆成两张图", lanes.len()));
+        errs.push(format!(
+            "lane 有 {} 个，最多 {ML_MAX_LANES} 个：拆成两张图",
+            lanes.len()
+        ));
     }
     for l in &lanes {
         if !l.items.iter().any(|it| matches!(it, Item::Cell { .. })) {
@@ -576,11 +617,17 @@ pub fn parse_memlayout(src: &str) -> Result<MemLayout, Vec<String>> {
     let mut ptrs = Vec::new();
     for (ln, from, to, label) in raw_ptrs {
         match (resolve(&from), resolve(&to)) {
-            (Some(f), Some(t)) => ptrs.push(Ptr { from: f, to: t, label }),
+            (Some(f), Some(t)) => ptrs.push(Ptr {
+                from: f,
+                to: t,
+                label,
+            }),
             (f, t) => {
                 for (r, ok) in [(&from, f.is_some()), (&to, t.is_some())] {
                     if !ok {
-                        errs.push(format!("第 {ln} 行 ptr 端点「{r}」不存在（写成 lane.cell）"));
+                        errs.push(format!(
+                            "第 {ln} 行 ptr 端点「{r}」不存在（写成 lane.cell）"
+                        ));
                     }
                 }
             }
@@ -603,7 +650,9 @@ fn memlayout_offset_problems(ml: &MemLayout) -> Vec<String> {
         let mut cursor: Option<u64> = Some(0);
         for it in &l.items {
             match it {
-                Item::Cell { id, size, offset, .. } => {
+                Item::Cell {
+                    id, size, offset, ..
+                } => {
                     if let (Some(o), Some(c)) = (offset, cursor) {
                         if *o > c {
                             errs.push(format!(
@@ -720,7 +769,11 @@ fn memlayout_claim_problems(ml: &MemLayout) -> Vec<String> {
         if let Some(total) = total {
             for (raw, bytes) in declared_sizes(&l.label) {
                 if bytes != total {
-                    let (more, d) = if total > bytes { ("多", total - bytes) } else { ("少", bytes - total) };
+                    let (more, d) = if total > bytes {
+                        ("多", total - bytes)
+                    } else {
+                        ("少", bytes - total)
+                    };
                     errs.push(format!(
                         "lane {} 的说明写「= {raw}」（{bytes} B），但它的格子加起来是 {total} B（{}），{more}了 {d} B：\
                          先回源码确认这块内存里到底有哪些格子——多出来/缺少的那部分是不是想当然画上去的（如并不内嵌的头部/元数据）？\
@@ -732,7 +785,9 @@ fn memlayout_claim_problems(ml: &MemLayout) -> Vec<String> {
             }
         }
         let kinds = |pred: fn(CellKind) -> bool| {
-            l.items.iter().any(|it| matches!(it, Item::Cell { kind, .. } if pred(*kind)))
+            l.items
+                .iter()
+                .any(|it| matches!(it, Item::Cell { kind, .. } if pred(*kind)))
         };
         let has_meta = kinds(|k| matches!(k, CellKind::Meta));
         let has_data = kinds(|k| matches!(k, CellKind::Used | CellKind::Free | CellKind::Data));
@@ -767,7 +822,11 @@ fn memlayout_claim_problems(ml: &MemLayout) -> Vec<String> {
 fn title_total_matches(totals: &[u64], target: u64) -> bool {
     let n = totals.len().min(16);
     (1u32..(1u32 << n)).any(|mask| {
-        (0..n).filter(|i| mask >> i & 1 == 1).map(|i| totals[i]).sum::<u64>() == target
+        (0..n)
+            .filter(|i| mask >> i & 1 == 1)
+            .map(|i| totals[i])
+            .sum::<u64>()
+            == target
     })
 }
 
@@ -782,8 +841,11 @@ fn has_file_line(text: &str) -> bool {
                 .rsplit(|c: char| c.is_whitespace() || "（(`,，".contains(c))
                 .next()
                 .is_some_and(|w| {
-                    w.rsplit_once('.')
-                        .is_some_and(|(stem, ext)| !stem.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()))
+                    w.rsplit_once('.').is_some_and(|(stem, ext)| {
+                        !stem.is_empty()
+                            && !ext.is_empty()
+                            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                    })
                 })
     })
 }
@@ -906,7 +968,9 @@ pub fn render_memlayout_svg(ml: &MemLayout) -> String {
         seen
     };
     let legend_h = 30.0;
-    let h = title_h + ml.lanes.len() as f64 * lane_h + (ml.lanes.len().saturating_sub(1)) as f64 * LANE_GAP
+    let h = title_h
+        + ml.lanes.len() as f64 * lane_h
+        + (ml.lanes.len().saturating_sub(1)) as f64 * LANE_GAP
         + legend_h
         + MARGIN;
 
@@ -916,7 +980,9 @@ pub fn render_memlayout_svg(ml: &MemLayout) -> String {
          font-family=\"-apple-system,'PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif\">\n"
     ));
     s.push_str("<defs><marker id=\"ah\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\"><path d=\"M0,0 L10,5 L0,10 z\" fill=\"#c0392b\"/></marker></defs>\n");
-    s.push_str(&format!("<rect width=\"{W}\" height=\"{h:.0}\" fill=\"#ffffff\"/>\n"));
+    s.push_str(&format!(
+        "<rect width=\"{W}\" height=\"{h:.0}\" fill=\"#ffffff\"/>\n"
+    ));
     if !ml.title.is_empty() {
         s.push_str(&format!(
             "<text x=\"{MARGIN}\" y=\"24\" font-size=\"15\" font-weight=\"600\" fill=\"#222\">{}</text>\n",
@@ -963,7 +1029,13 @@ pub fn render_memlayout_svg(ml: &MemLayout) -> String {
         for (ii, it) in lane.items.iter().enumerate() {
             let b = &boxes[li][ii];
             match it {
-                Item::Cell { size, kind, label, offset, .. } => {
+                Item::Cell {
+                    size,
+                    kind,
+                    label,
+                    offset,
+                    ..
+                } => {
                     if let Some(o) = offset {
                         cursor = Some(*o);
                     }
@@ -1030,7 +1102,10 @@ pub fn render_memlayout_svg(ml: &MemLayout) -> String {
     // 指针：源格 → 目标格。跨行走竖向贝塞尔；同一行从格子上方拱过去。
     for (pi, p) in ml.ptrs.iter().enumerate() {
         let (fb, tb) = (&boxes[p.from.0][p.from.1], &boxes[p.to.0][p.to.1]);
-        let (fy0, ty0) = (lane_y(p.from.0) + LANE_LABEL_H, lane_y(p.to.0) + LANE_LABEL_H);
+        let (fy0, ty0) = (
+            lane_y(p.from.0) + LANE_LABEL_H,
+            lane_y(p.to.0) + LANE_LABEL_H,
+        );
         let fx = fb.x + fb.w / 2.0 + (pi % 3) as f64 * 4.0 - 4.0;
         let tx = tb.x + tb.w / 2.0;
         let (d, lx, ly) = if p.from.0 == p.to.0 {
@@ -1060,7 +1135,11 @@ pub fn render_memlayout_svg(ml: &MemLayout) -> String {
         };
         s.push_str(&format!(
             "<circle cx=\"{fx:.1}\" cy=\"{:.1}\" r=\"3\" fill=\"#c0392b\"/>\n",
-            if p.from.0 > p.to.0 || p.from.0 == p.to.0 { fy0 } else { fy0 + CELL_H }
+            if p.from.0 > p.to.0 || p.from.0 == p.to.0 {
+                fy0
+            } else {
+                fy0 + CELL_H
+            }
         ));
         s.push_str(&format!(
             "<path d=\"{d}\" fill=\"none\" stroke=\"#c0392b\" stroke-width=\"1.6\" marker-end=\"url(#ah)\"/>\n"
@@ -1146,8 +1225,16 @@ pub fn render_memlayout_blocks(text: &str, img_dir: &Path, img_rel: &str) -> Str
             }
         }
         out.push_str(&text[last..range.start]);
-        let alt = if ml.title.is_empty() { "内存布局图".to_string() } else { ml.title.replace(['[', ']'], "") };
-        let rel = if img_rel.is_empty() { name } else { format!("{img_rel}/{name}") };
+        let alt = if ml.title.is_empty() {
+            "内存布局图".to_string()
+        } else {
+            ml.title.replace(['[', ']'], "")
+        };
+        let rel = if img_rel.is_empty() {
+            name
+        } else {
+            format!("{img_rel}/{name}")
+        };
         out.push_str(&format!("![{alt}]({rel})\n"));
         last = range.end;
     }
@@ -1190,7 +1277,11 @@ pub fn publish_assets(
         Some(format!("{name}/{p}"))
     });
     // 传递闭包：被发布的 md 里的相对链接（相对它自己的目录）。
-    let mut queue: Vec<String> = files.iter().filter(|f| f.ends_with(".md")).cloned().collect();
+    let mut queue: Vec<String> = files
+        .iter()
+        .filter(|f| f.ends_with(".md"))
+        .cloned()
+        .collect();
     while let Some(md) = queue.pop() {
         let Ok(src) = std::fs::read_to_string(base.join(&md)) else {
             continue;
@@ -1253,7 +1344,10 @@ mod tests {
 
     #[test]
     fn learn_root_uses_session_dir_and_rejects_unsafe_ids() {
-        assert_eq!(learn_root_rel(Some("ui-1-2-0")), ".latte/sessions/ui-1-2-0/learn");
+        assert_eq!(
+            learn_root_rel(Some("ui-1-2-0")),
+            ".latte/sessions/ui-1-2-0/learn"
+        );
         assert_eq!(learn_root_rel(None), ".latte/learn");
         assert_eq!(learn_root_rel(Some("")), ".latte/learn");
         assert_eq!(learn_root_rel(Some("../x")), ".latte/learn");
@@ -1266,7 +1360,10 @@ mod tests {
 
     #[test]
     fn publish_name_strips_task_prefix_only() {
-        assert_eq!(publish_name("lat-110-jemalloc-size-class"), "jemalloc-size-class");
+        assert_eq!(
+            publish_name("lat-110-jemalloc-size-class"),
+            "jemalloc-size-class"
+        );
         assert_eq!(publish_name("rust-ownership"), "rust-ownership");
         assert_eq!(publish_name("lat-110"), "lat-110");
         assert_eq!(publish_name("lat-110-ab"), "lat-110-ab");
@@ -1338,7 +1435,11 @@ ptr meta.bm -> page.r1 "bit1=1 → 空闲"
         assert!(svg.contains("+4096"), "lane end offset");
         assert!(svg.contains("4072 B"));
         assert!(svg.contains("e_addr = 页首地址"));
-        assert_eq!(svg.matches("marker-end=").count(), 3, "2 ptrs + legend arrow");
+        assert_eq!(
+            svg.matches("marker-end=").count(),
+            3,
+            "2 ptrs + legend arrow"
+        );
     }
 
     #[test]
@@ -1349,7 +1450,10 @@ ptr meta.bm -> page.r1 "bit1=1 → 空闲"
         let e = &errs[0];
         assert!(e.contains("先写 lane"), "{e}");
         assert!(e.contains("大小「8q」"), "{e}");
-        assert!(e.contains("端点「p.b」") && e.contains("端点「q.z」"), "{e}");
+        assert!(
+            e.contains("端点「p.b」") && e.contains("端点「q.z」"),
+            "{e}"
+        );
         assert!(e.contains("未知指令「foo」"), "{e}");
         assert!(lint_memlayout_blocks(&format!("```memlayout{SLAB}```\n")).is_empty());
         let jump = "```memlayout\nlane t\ncell a 1\ncell b 1 @8\ncell c 1 @1\n```\n";
@@ -1368,8 +1472,12 @@ cell s1 14K free "14 KiB 对象槽位 1"
 
     #[test]
     fn memlayout_claims_catch_invented_slab_header() {
-        let e = lint_memlayout_blocks(&format!("```memlayout{SLAB_WITH_FAKE_HEADER}```\n")).join("\n");
-        assert!(e.contains("= 28 KiB") && e.contains("29696 B") && e.contains("多了 1024 B"), "{e}");
+        let e =
+            lint_memlayout_blocks(&format!("```memlayout{SLAB_WITH_FAKE_HEADER}```\n")).join("\n");
+        assert!(
+            e.contains("= 28 KiB") && e.contains("29696 B") && e.contains("多了 1024 B"),
+            "{e}"
+        );
         // 同一行混着 meta 和数据格子，又没给出处 → 也要被点名。
         assert!(e.contains("元数据内嵌在数据区里"), "{e}");
     }
@@ -1387,14 +1495,20 @@ cell addr 8 meta "e_addr"
 cell bm 8 meta "bitmap"
 ptr edata.addr -> slab.s0 "指向 slab 基址"
 "#;
-        assert_eq!(lint_memlayout_blocks(&format!("```memlayout{good}```\n")), Vec::<String>::new());
+        assert_eq!(
+            lint_memlayout_blocks(&format!("```memlayout{good}```\n")),
+            Vec::<String>::new()
+        );
         // 确实内嵌时：给出处就放行。
         let inline = r#"
 lane chunk "glibc chunk（malloc.c:1050 头部内嵌 size 字段）"
 cell hdr 16 meta "prev_size+size"
 cell body 48 used "用户数据"
 "#;
-        assert_eq!(lint_memlayout_blocks(&format!("```memlayout{inline}```\n")), Vec::<String>::new());
+        assert_eq!(
+            lint_memlayout_blocks(&format!("```memlayout{inline}```\n")),
+            Vec::<String>::new()
+        );
         // 没有等号的「14 KiB 对象」是单格描述，不是总数，不对账。
         let desc = "lane p \"每格 14 KiB\"\ncell a 1K used \"a\"\n";
         assert!(lint_memlayout_blocks(&format!("```memlayout\n{desc}```\n")).is_empty());
@@ -1407,7 +1521,10 @@ cell body 48 used "用户数据"
     fn memlayout_title_claim_must_match_some_lane() {
         let bad = "title 一页 = 8 KiB\nlane p \"页\"\ncell a 4K data \"a\"\n";
         let e = lint_memlayout_blocks(&format!("```memlayout\n{bad}```\n")).join("\n");
-        assert!(e.contains("标题写「= 8 KiB」") && e.contains("4 KiB"), "{e}");
+        assert!(
+            e.contains("标题写「= 8 KiB」") && e.contains("4 KiB"),
+            "{e}"
+        );
     }
 
     /// 标题概括整张图时，等于几行之和也是合法的（jemalloc ch_options k1 实测被误判）。
@@ -1420,12 +1537,19 @@ cell body 48 used "用户数据"
         let wrong = two_pages.replace("= 8K", "= 9K");
         let e = lint_memlayout_blocks(&format!("```memlayout\n{wrong}```\n")).join("\n");
         assert!(e.contains("标题写「= 9K」") && e.contains("哪几行"), "{e}");
-        assert!(title_total_matches(&[64, 4096, 4096], 8192) && !title_total_matches(&[64, 4096], 8192));
+        assert!(
+            title_total_matches(&[64, 4096, 4096], 8192) && !title_total_matches(&[64, 4096], 8192)
+        );
     }
 
     #[test]
     fn declared_sizes_only_reads_equals_with_unit() {
-        let got = |s: &str| declared_sizes(s).into_iter().map(|(_, b)| b).collect::<Vec<_>>();
+        let got = |s: &str| {
+            declared_sizes(s)
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(got("7 页 = 28 KiB = 28672 B"), vec![28672, 28672]);
         assert_eq!(got("4KB页＝4096字节"), vec![4096]);
         assert!(got("nregs = 4，reg_size = 1024").is_empty(), "没有单位不认");
@@ -1446,7 +1570,10 @@ cell body 48 used "用户数据"
         let dir = tempfile::tempdir().unwrap();
         let text = format!("前文\n\n```memlayout{SLAB}```\n\n后文\n```c\n```memlayout\n```\n");
         let out = render_memlayout_blocks(&text, &dir.path().join("img"), "../img");
-        assert!(out.contains("![一个 4 KiB slab 页切成 512 个 8 B region](../img/ml-"), "{out}");
+        assert!(
+            out.contains("![一个 4 KiB slab 页切成 512 个 8 B region](../img/ml-"),
+            "{out}"
+        );
         assert!(out.contains("前文") && out.contains("后文"));
         assert!(!out.contains("lane page"), "{out}");
         let svgs: Vec<_> = std::fs::read_dir(dir.path().join("img")).unwrap().collect();
@@ -1470,14 +1597,24 @@ cell body 48 used "用户数据"
         let docs = dir.path().join("docs/learn");
         let body = "[k1](sections/k1.md) ![a](img/a.svg) [src](src/sz.c)";
         let (out, n) = publish_assets(body, &base, &docs, "topic").unwrap();
-        assert_eq!(out, "[k1](topic/sections/k1.md) ![a](topic/img/a.svg) [src](src/sz.c)");
+        assert_eq!(
+            out,
+            "[k1](topic/sections/k1.md) ![a](topic/img/a.svg) [src](src/sz.c)"
+        );
         assert_eq!(n, 2, "只拷引用闭包");
         assert!(docs.join("topic/sections/k1.md").is_file());
         assert!(!docs.join("topic/sections/feedback.md").exists());
         assert!(docs.join("topic/img/a.svg").is_file());
-        assert!(!docs.join("topic/code/x.c").exists(), "没被引用的副本不发布");
+        assert!(
+            !docs.join("topic/code/x.c").exists(),
+            "没被引用的副本不发布"
+        );
         // 章节里再链到的东西随章节一起发布（传递闭包），旧章不发布。
-        std::fs::write(base.join("sections/k1.md"), "![a](../img/a.svg) [x](../code/x.c)").unwrap();
+        std::fs::write(
+            base.join("sections/k1.md"),
+            "![a](../img/a.svg) [x](../code/x.c)",
+        )
+        .unwrap();
         let (_, n) = publish_assets("[k1](sections/k1.md)", &base, &docs, "topic").unwrap();
         assert_eq!(n, 3);
         assert!(docs.join("topic/code/x.c").is_file());
@@ -1485,4 +1622,3 @@ cell body 48 used "用户数据"
         assert!(!docs.join("topic/img/old.svg").exists());
     }
 }
-

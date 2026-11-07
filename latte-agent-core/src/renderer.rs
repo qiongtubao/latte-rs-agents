@@ -274,6 +274,32 @@ pub trait ChatRenderer: Send + Sync {
                 ))
                 .await;
             }
+            // bash 后台 job 起止：一行状态。
+            ChatEvent::BackgroundJob {
+                job_id,
+                status,
+                command,
+                exit_code,
+                elapsed_secs,
+                detail,
+                ..
+            } => {
+                let state = match (status.as_str(), exit_code) {
+                    ("running", _) => "后台运行中".to_string(),
+                    ("completed", Some(code)) => format!("已结束 exit={code}"),
+                    ("stopped", _) => format!(
+                        "已终止{}",
+                        detail
+                            .as_deref()
+                            .map(|d| format!("（{d}）"))
+                            .unwrap_or_default()
+                    ),
+                    (other, _) => other.to_string(),
+                };
+                let cmd: String = command.chars().take(80).collect();
+                self.on_status(&format!("⚙ {job_id} {state} [{elapsed_secs}s] {cmd}"))
+                    .await;
+            }
             // task_report 工具汇报：CLI 仅打印状态行，web UI 走事件→
             // POST /api/tasks/:id/report 桥接完成实际的状态推进。
             ChatEvent::TaskReport {

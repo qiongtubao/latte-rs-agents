@@ -107,6 +107,16 @@ pub enum AgentError {
         last_tool: Option<String>,
         partial: String,
     },
+    /// 本 turn 将要启动的一批工具调用会超过硬上限。检查发生在任何调用
+    /// spawn/execute 之前，因此 `calls` 是已经启动的数量，第 N+1 个工具
+    /// 不会产生副作用。
+    #[error("tool call budget exceeded: started {calls}, limit {limit}{}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
+    ToolCallBudgetExceeded {
+        calls: usize,
+        limit: usize,
+        last_tool: Option<String>,
+        partial: String,
+    },
     /// Wall-clock deadline exceeded before completion.
     #[error("deadline exceeded after {elapsed_secs}s ({tool_rounds} tool rounds){}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
     DeadlineExceeded {

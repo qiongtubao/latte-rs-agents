@@ -321,9 +321,8 @@ fn run_usage(id: &str, dir: Option<&std::path::Path>) -> Result<(), Box<dyn std:
         if id.is_empty() || id.contains("..") {
             return Err(format!("invalid session id '{id}'").into());
         }
-        let candidates: Vec<PathBuf> = dir
-            .map(|d| vec![d.join("ui-sessions")])
-            .unwrap_or_else(|| {
+        let candidates: Vec<PathBuf> =
+            dir.map(|d| vec![d.join("ui-sessions")]).unwrap_or_else(|| {
                 let mut v = vec![PathBuf::from(".latte/ui-sessions")];
                 if let Some(h) = trace_store::latte_home() {
                     v.push(h.join("ui-sessions"));
@@ -349,7 +348,10 @@ fn run_usage(id: &str, dir: Option<&std::path::Path>) -> Result<(), Box<dyn std:
         for e in rd.flatten() {
             let p = e.path();
             if p.extension().is_some_and(|x| x == "jsonl") {
-                let sub_id = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                let sub_id = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
                 subs.push((sub_id, read_lines(&p)));
             }
         }

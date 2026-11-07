@@ -101,9 +101,15 @@ fn line_cites(line: &str, idx: &mut SourceIndex) -> Vec<(String, String, (usize,
     let mut out: Vec<(String, String, (usize, usize))> = Vec::new();
     for tok in line.split(|c: char| !(c.is_ascii_alphanumeric() || "_./+-:".contains(c))) {
         let tok = tok.trim_matches(|c| c == '.' || c == ':' || c == '-');
-        let Some((path, ranges)) = crate::learn_cite::parse_cite_pub(tok) else { continue };
-        let Some(rel) = idx.resolve(&path) else { continue };
-        let Some(&(a, b)) = ranges.first() else { continue };
+        let Some((path, ranges)) = crate::learn_cite::parse_cite_pub(tok) else {
+            continue;
+        };
+        let Some(rel) = idx.resolve(&path) else {
+            continue;
+        };
+        let Some(&(a, b)) = ranges.first() else {
+            continue;
+        };
         if !out.iter().any(|(t, ..)| t == tok) {
             out.push((tok.to_string(), rel, (a, b)));
         }
@@ -148,7 +154,12 @@ fn render_evidence(rel: &str, token: &str, (a, b): (usize, usize), lines: &[Stri
     let idxs: Vec<usize> = (lo..=hi).collect();
     let shown: Vec<Option<usize>> = if idxs.len() > MAX_EVIDENCE_LINES {
         let half = MAX_EVIDENCE_LINES / 2;
-        idxs[..half].iter().map(|&n| Some(n)).chain([None]).chain(idxs[idxs.len() - half..].iter().map(|&n| Some(n))).collect()
+        idxs[..half]
+            .iter()
+            .map(|&n| Some(n))
+            .chain([None])
+            .chain(idxs[idxs.len() - half..].iter().map(|&n| Some(n)))
+            .collect()
     } else {
         idxs.iter().map(|&n| Some(n)).collect()
     };
@@ -193,7 +204,9 @@ pub fn extract(files: &[(String, String)], idx: &mut SourceIndex) -> Vec<Claim> 
             let mut evidence = String::new();
             let mut used = Vec::new();
             for (tok, rel, range) in cites.iter().take(3) {
-                let Some(lines) = idx.lines(rel) else { continue };
+                let Some(lines) = idx.lines(rel) else {
+                    continue;
+                };
                 let e = render_evidence(rel, tok, *range, &lines);
                 if !e.is_empty() {
                     evidence.push_str(&e);
@@ -310,10 +323,23 @@ pub fn ingest(raw: &str, claims: &[Claim], ids: &[usize]) -> (Vec<Verdict>, Vec<
         return (Vec::new(), vec!["回答不是合法 JSON".into()]);
     };
     let mut out = Vec::new();
-    for item in v.get("verdicts").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
+    for item in v
+        .get("verdicts")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
         let id = item.get("id").and_then(|x| x.as_str()).unwrap_or("");
-        let quote = item.get("source_quote").and_then(|x| x.as_str()).unwrap_or("").trim();
-        let reason = item.get("reason").and_then(|x| x.as_str()).unwrap_or("").trim();
+        let quote = item
+            .get("source_quote")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
+        let reason = item
+            .get("reason")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .trim();
         let Some(&ci) = ids.iter().find(|&&i| claims[i].id == id) else {
             dropped.push(format!("{id}：批里没有这个编号"));
             continue;
@@ -324,7 +350,11 @@ pub fn ingest(raw: &str, claims: &[Claim], ids: &[usize]) -> (Vec<Verdict>, Vec<
             .map(|l| {
                 let t = l.trim_start();
                 let d = t.chars().take_while(|c| c.is_ascii_digit()).count();
-                if d > 0 && t[d..].starts_with(':') { t[d + 1..].trim_start() } else { t }
+                if d > 0 && t[d..].starts_with(':') {
+                    t[d + 1..].trim_start()
+                } else {
+                    t
+                }
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -336,7 +366,11 @@ pub fn ingest(raw: &str, claims: &[Claim], ids: &[usize]) -> (Vec<Verdict>, Vec<
             dropped.push(format!("{id}：source_quote 不在证据里（模型凭想象判错）"));
             continue;
         }
-        out.push(Verdict { claim: ci, source_quote: clip(quote, 200), reason: clip(reason, 240) });
+        out.push(Verdict {
+            claim: ci,
+            source_quote: clip(quote, 200),
+            reason: clip(reason, 240),
+        });
     }
     (out, dropped)
 }
@@ -394,30 +428,57 @@ mod tests {
                    引了不存在的 `nope.c:3` 共 5 处。\n\
                    判空逻辑是 `usize == 0 || usize > MAX`（`src/large.c:42`），第 41 行算 ausize。\n";
         let c = extract(&files(doc), &mut idx);
-        assert_eq!(c.len(), 1, "纯指路、代码块、待确认、无出处、解析不到、完全重复的都不算: {c:?}");
+        assert_eq!(
+            c.len(),
+            1,
+            "纯指路、代码块、待确认、无出处、解析不到、完全重复的都不算: {c:?}"
+        );
         assert_eq!(c[0].line, 2);
         assert_eq!(c[0].cites, vec!["src/large.c:42".to_string()]);
         // 单行出处前后各扩 3 行，带行号
-        assert!(c[0].evidence.contains("39: int stmt_39 = 39;") && c[0].evidence.contains("42: if (unlikely(ausize == 0"), "{}", c[0].evidence);
-        assert!(c[0].evidence.contains("44: }") && !c[0].evidence.contains("38:"), "前 3 行后 3 行，到文件尾为止: {}", c[0].evidence);
+        assert!(
+            c[0].evidence.contains("39: int stmt_39 = 39;")
+                && c[0].evidence.contains("42: if (unlikely(ausize == 0"),
+            "{}",
+            c[0].evidence
+        );
+        assert!(
+            c[0].evidence.contains("44: }") && !c[0].evidence.contains("38:"),
+            "前 3 行后 3 行，到文件尾为止: {}",
+            c[0].evidence
+        );
     }
 
     #[test]
     fn long_ranges_keep_head_and_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let src: String = (1..=120).map(|i| format!("int stmt_{i} = {i};\n")).collect();
+        let src: String = (1..=120)
+            .map(|i| format!("int stmt_{i} = {i};\n"))
+            .collect();
         std::fs::write(dir.path().join("big.c"), src).unwrap();
         let mut idx = SourceIndex::new(dir.path());
         let doc = "整段逻辑共 100 行（`big.c:1-100`）。\n";
         let c = extract(&files(doc), &mut idx);
         let e = &c[0].evidence;
-        assert!(e.contains("中间省略") && e.contains("\n1: int stmt_1") && e.contains("\n102: int stmt_102"), "{e}");
+        assert!(
+            e.contains("中间省略")
+                && e.contains("\n1: int stmt_1")
+                && e.contains("\n102: int stmt_102"),
+            "{e}"
+        );
         assert!(!e.contains("\n50: "), "{e}");
     }
 
     #[test]
     fn batches_split_by_size_and_keep_order() {
-        let mk = |n: usize| Claim { id: String::new(), file: "f".into(), line: n, text: "x".repeat(100), cites: vec![], evidence: "y".repeat(100) };
+        let mk = |n: usize| Claim {
+            id: String::new(),
+            file: "f".into(),
+            line: n,
+            text: "x".repeat(100),
+            cites: vec![],
+            evidence: "y".repeat(100),
+        };
         let cs: Vec<Claim> = (0..7).map(mk).collect();
         let b = batches(&cs, 600);
         assert_eq!(b.iter().map(Vec::len).sum::<usize>(), 7);
@@ -447,11 +508,27 @@ mod tests {
         assert_eq!(ok.len(), 1, "{ok:?} {dropped:?}");
         assert_eq!(ok[0].claim, 0);
         assert_eq!(dropped.len(), 3, "{dropped:?}");
-        assert!(dropped.iter().any(|d| d.contains("不在证据里")) && dropped.iter().any(|d| d.contains("没有这个编号")));
+        assert!(
+            dropped.iter().any(|d| d.contains("不在证据里"))
+                && dropped.iter().any(|d| d.contains("没有这个编号"))
+        );
         let issue = to_issue(&cs[0], &ok[0]);
-        assert_eq!((issue.kind.as_str(), issue.source.as_str(), issue.chapter.as_str()), ("doc", "engine", "k1"));
-        assert_eq!(issue.evidence, "src/large.c:42", "带依据：回 FIXED 时被指出的原文必须真的改掉");
-        assert!(issue.problem.contains("ausize") && issue.check.starts_with("fact:"), "{issue:?}");
+        assert_eq!(
+            (
+                issue.kind.as_str(),
+                issue.source.as_str(),
+                issue.chapter.as_str()
+            ),
+            ("doc", "engine", "k1")
+        );
+        assert_eq!(
+            issue.evidence, "src/large.c:42",
+            "带依据：回 FIXED 时被指出的原文必须真的改掉"
+        );
+        assert!(
+            issue.problem.contains("ausize") && issue.check.starts_with("fact:"),
+            "{issue:?}"
+        );
         // 空结果 / 非 JSON
         assert!(ingest(r#"{"verdicts": []}"#, &cs, &ids).0.is_empty());
         assert!(ingest("没有问题", &cs, &ids).1[0].contains("没有 JSON"));
@@ -465,14 +542,22 @@ mod tests {
         let c = extract(&files("共 3 处（`src/large.c:6`）\n"), &mut idx);
         assert_ne!(a[0].key(), b[0].key());
         assert_ne!(a[0].key(), c[0].key());
-        assert_eq!(a[0].key(), extract(&files("共 3 处（`src/large.c:5`）\n"), &mut idx)[0].key());
+        assert_eq!(
+            a[0].key(),
+            extract(&files("共 3 处（`src/large.c:5`）\n"), &mut idx)[0].key()
+        );
     }
 
     /// 手动探针：`LEARN_CLAIMS_DIR=<学习工作区> LEARN_CLAIMS_REPO=<仓库> cargo test -- --ignored probe_real_docs --nocapture`。
     #[test]
     #[ignore]
     fn probe_real_docs() {
-        let (Ok(dir), Ok(repo)) = (std::env::var("LEARN_CLAIMS_DIR"), std::env::var("LEARN_CLAIMS_REPO")) else { return };
+        let (Ok(dir), Ok(repo)) = (
+            std::env::var("LEARN_CLAIMS_DIR"),
+            std::env::var("LEARN_CLAIMS_REPO"),
+        ) else {
+            return;
+        };
         let base = std::path::Path::new(&dir);
         let mut files: Vec<(String, String)> = crate::learn_novice::walk(&base.join("sections"))
             .into_iter()
@@ -488,7 +573,12 @@ mod tests {
         let claims = extract(&files, &mut idx);
         let bs = batches(&claims, BATCH_CHARS);
         let chars: usize = claims.iter().map(Claim::size).sum();
-        println!("claims={} batches={} total_chars={}", claims.len(), bs.len(), chars);
+        println!(
+            "claims={} batches={} total_chars={}",
+            claims.len(),
+            bs.len(),
+            chars
+        );
         if let Some(c) = claims.get(7) {
             println!("sample:\n{}\n{}", c.text, c.evidence);
         }
@@ -501,7 +591,10 @@ mod tests {
                 let _ = std::fs::write(format!("{out}/b{n:02}.txt"), p);
                 // 证据表：id → 证据，给外部脚本核对 source_quote
                 let ev: Vec<serde_json::Value> = ids.iter().map(|&i| serde_json::json!({"id": claims[i].id, "evidence": claims[i].evidence, "file": claims[i].file, "line": claims[i].line, "text": claims[i].text})).collect();
-                let _ = std::fs::write(format!("{out}/b{n:02}.json"), serde_json::to_string(&ev).unwrap());
+                let _ = std::fs::write(
+                    format!("{out}/b{n:02}.json"),
+                    serde_json::to_string(&ev).unwrap(),
+                );
             }
         }
     }

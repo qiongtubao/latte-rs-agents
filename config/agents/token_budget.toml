@@ -1,0 +1,12 @@
+# workflow 共享 token 计量器的行为。
+# 缺席的键 = 未配置，交给下层（global）或内置默认。
+# 优先级：环境变量 > 项目配置 > 全局配置 > 内置默认。
+#
+# enforce = false（默认）：**只统计不拦截**。每次模型调用照常放行，用量照常
+#   累计（收尾 Status、失败 checkpoint 的 tokens_used 都靠它），超限也不中断。
+# enforce = true：请求发出前按估算预占，放不进 workflow_limit 就拒绝，报
+#   TokenBudgetExceeded。注意拦截线用的是 prompt 估算，系统性偏低，且拒绝
+#   会就地判死整步——只在该步有可降级采纳的产出时才值得开。
+[token_budget]
+enforce = false
+workflow_limit = 1000000

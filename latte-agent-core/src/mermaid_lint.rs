@@ -74,12 +74,15 @@ fn node_position(prefix: &str) -> bool {
 /// `subgraph 名字 [标题]`：名字部分只有允许的字符、标题部分已加引号或不含特殊
 /// 字符——实测能渲染（`subgraph malloc 前台 [malloc 前台: szind 体系]`）。
 fn bracket_title_ok(title: &str) -> bool {
-    let Some(open) = title.find('[') else { return false };
+    let Some(open) = title.find('[') else {
+        return false;
+    };
     if !title.ends_with(']') {
         return false;
     }
     let (name, inner) = (&title[..open], &title[open + 1..title.len() - 1]);
-    name.chars().all(|c| c.is_alphanumeric() || SUBGRAPH_TITLE_OK.contains(&c))
+    name.chars()
+        .all(|c| c.is_alphanumeric() || SUBGRAPH_TITLE_OK.contains(&c))
         && ((inner.starts_with('"') && inner.ends_with('"')) || !inner.contains(NODE_SPECIAL))
 }
 
@@ -96,7 +99,11 @@ impl LineFix<'_> {
         let mut i = 0;
         while i < chars.len() {
             if chars[i] == '"' {
-                if let Some(end) = chars[i + 1..].iter().position(|&c| c == '"').map(|p| i + 1 + p) {
+                if let Some(end) = chars[i + 1..]
+                    .iter()
+                    .position(|&c| c == '"')
+                    .map(|p| i + 1 + p)
+                {
                     let inner: String = chars[i + 1..end].iter().collect();
                     out.push('"');
                     out.push_str(&inner);
@@ -111,7 +118,8 @@ impl LineFix<'_> {
                             k += 1;
                         }
                         if chars.get(k) == Some(&'"') {
-                            self.notes.push("标签里用 `\"a\" + \"b\"` 拼字符串，mermaid 不支持".into());
+                            self.notes
+                                .push("标签里用 `\"a\" + \"b\"` 拼字符串，mermaid 不支持".into());
                             i = k + 1;
                             // 把后半段接到同一个引号里：不输出闭引号，从后半段内容继续。
                             let rest_end = chars[i..].iter().position(|&c| c == '"').map(|p| i + p);
@@ -144,7 +152,9 @@ impl LineFix<'_> {
         // 前三种：一个引号串夹在两段箭头之间。
         let mut search = 0;
         while let Some(q) = s[search..].find('"').map(|p| search + p) {
-            let Some(qe) = s[q + 1..].find('"').map(|p| q + 1 + p) else { break };
+            let Some(qe) = s[q + 1..].find('"').map(|p| q + 1 + p) else {
+                break;
+            };
             let before = s[..q].trim_end();
             let after = s[qe + 1..].trim_start();
             let label = &s[q..=qe];
@@ -152,7 +162,8 @@ impl LineFix<'_> {
                 Some((before.len() - 4, "-.", ".->", 3))
             } else if before.ends_with("-->") && after.starts_with("-->") {
                 Some((before.len() - 3, "--", "-->", 3))
-            } else if before.ends_with("--") && !before.ends_with("<--") && after.starts_with(".->") {
+            } else if before.ends_with("--") && !before.ends_with("<--") && after.starts_with(".->")
+            {
                 Some((before.len() - 2, "-.", ".->", 3))
             } else {
                 None
@@ -168,13 +179,22 @@ impl LineFix<'_> {
             }
         }
         // 第四种：`-.` 后直接跟文字（不是 `-.->` / `-. `），文字里还夹着引号串。
-        if let Some(p) = s.find("-.").filter(|&p| s[..p].matches('"').count() % 2 == 0) {
+        if let Some(p) = s
+            .find("-.")
+            .filter(|&p| s[..p].matches('"').count() % 2 == 0)
+        {
             let rest = &s[p + 2..];
             let next = rest.chars().next().unwrap_or(' ');
             if next != '-' && next != ' ' {
                 if let Some(end) = rest.find(".->").filter(|&e| rest[..e].contains('"')) {
-                    let text: String = rest[..end].replace('"', " ").split_whitespace().collect::<Vec<_>>().join(" ");
-                    self.notes.push(format!("虚线文字「{text}」写法不合法，写成 `A -. \"文字\" .-> B`"));
+                    let text: String = rest[..end]
+                        .replace('"', " ")
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.notes.push(format!(
+                        "虚线文字「{text}」写法不合法，写成 `A -. \"文字\" .-> B`"
+                    ));
                     s = format!("{}-. {} .->{}", &s[..p], quote(&text), &rest[end + 3..]);
                 }
             }
@@ -188,8 +208,15 @@ impl LineFix<'_> {
         let toks: Vec<&str> = line.split_whitespace().collect();
         let is_id = |t: &str| !t.is_empty() && t.chars().all(ident_char);
         let is_arrow = |t: &str| ARROWS.contains(&t);
-        if toks.len() >= 5 && is_id(toks[0]) && is_arrow(toks[1]) && is_id(toks[2]) && is_id(toks[3]) && is_arrow(toks[4]) {
-            self.notes.push(format!("一行里写了两条连线：`{line}`，每条连线单独一行"));
+        if toks.len() >= 5
+            && is_id(toks[0])
+            && is_arrow(toks[1])
+            && is_id(toks[2])
+            && is_id(toks[3])
+            && is_arrow(toks[4])
+        {
+            self.notes
+                .push(format!("一行里写了两条连线：`{line}`，每条连线单独一行"));
             let first = toks[..3].join(" ");
             let rest = toks[3..].join(" ");
             return format!("{first}\n{indent}{}", self.split_edges(&rest, indent));
@@ -218,7 +245,9 @@ impl LineFix<'_> {
             let text = &line[a + 1..b];
             out.push_str(&line[last..=a]);
             if !text.starts_with('"') && text.contains(EDGE_SPECIAL) {
-                self.notes.push(format!("连线文字「{text}」含括号/@ 却没加双引号，写成 `-->|\"{text}\"|`"));
+                self.notes.push(format!(
+                    "连线文字「{text}」含括号/@ 却没加双引号，写成 `-->|\"{text}\"|`"
+                ));
                 out.push_str(&quote(text));
             } else {
                 out.push_str(text);
@@ -239,21 +268,28 @@ impl LineFix<'_> {
         while i < chars.len() {
             let c = chars[i];
             if c == '"' {
-                let end = chars[i + 1..].iter().position(|&x| x == '"').map_or(chars.len(), |p| i + 2 + p);
+                let end = chars[i + 1..]
+                    .iter()
+                    .position(|&x| x == '"')
+                    .map_or(chars.len(), |p| i + 2 + p);
                 out.extend(&chars[i..end]);
                 i = end;
                 continue;
             }
             if c == '|' {
                 // 连线文字整段跳过（edge_labels 已处理）。
-                let end = chars[i + 1..].iter().position(|&x| x == '|').map_or(chars.len(), |p| i + 2 + p);
+                let end = chars[i + 1..]
+                    .iter()
+                    .position(|&x| x == '|')
+                    .map_or(chars.len(), |p| i + 2 + p);
                 out.extend(&chars[i..end]);
                 i = end;
                 continue;
             }
             // 节点只出现在行首、箭头 / `|文字|` / `&` 之后；`A -- f(x) --> B`
             // 里的 `f(x)` 是连线文字（实测能渲染），不能当节点改。
-            let id_start = ident_char(c) && (i == 0 || !ident_char(chars[i - 1])) && node_position(&out);
+            let id_start =
+                ident_char(c) && (i == 0 || !ident_char(chars[i - 1])) && node_position(&out);
             if !id_start {
                 out.push(c);
                 i += 1;
@@ -294,13 +330,22 @@ impl LineFix<'_> {
             }
             let inner: String = chars[j + 1..k].iter().collect();
             // 复合形状 `[[ ]]` `([ ])` `[( )]` `(( ))` `{{ }}`：剥掉内层一对再看文字。
-            let (pre, text, post) = match inner.chars().next().and_then(|f| closer(f).map(|cl| (f, cl))) {
-                Some((f, cl)) if inner.len() >= 2 && inner.ends_with(cl) => {
-                    (f.to_string(), inner[f.len_utf8()..inner.len() - cl.len_utf8()].to_string(), cl.to_string())
-                }
+            let (pre, text, post) = match inner
+                .chars()
+                .next()
+                .and_then(|f| closer(f).map(|cl| (f, cl)))
+            {
+                Some((f, cl)) if inner.len() >= 2 && inner.ends_with(cl) => (
+                    f.to_string(),
+                    inner[f.len_utf8()..inner.len() - cl.len_utf8()].to_string(),
+                    cl.to_string(),
+                ),
                 _ => (String::new(), inner.clone(), String::new()),
             };
-            let shape_ok = !text.starts_with('"') && !text.starts_with('/') && !text.starts_with('\\') && !text.starts_with('>');
+            let shape_ok = !text.starts_with('"')
+                && !text.starts_with('/')
+                && !text.starts_with('\\')
+                && !text.starts_with('>');
             if shape_ok && !text.is_empty() && text.contains(NODE_SPECIAL) {
                 self.notes.push(format!("节点文字「{}」含括号/竖线/@ 却没加双引号，写成 `{}{open}{pre}\"…\"{post}{close}`", text.trim(), chars[i..j].iter().collect::<String>()));
                 out.push(open);
@@ -337,22 +382,44 @@ pub fn check(src: &str) -> MermaidCheck {
         !t.is_empty() && !t.starts_with("%%")
     }) else {
         fatal.push("图是空的".into());
-        return MermaidCheck { fixable, fatal, fixed: None };
+        return MermaidCheck {
+            fixable,
+            fatal,
+            fixed: None,
+        };
     };
     let head = lines[first_idx].trim();
-    let kind = head.split_whitespace().next().unwrap_or("").trim_end_matches(':');
-    let known = head.starts_with("---") || KINDS.iter().any(|k| kind == *k || kind.starts_with(&format!("{k}-")));
+    let kind = head
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(':');
+    let known = head.starts_with("---")
+        || KINDS
+            .iter()
+            .any(|k| kind == *k || kind.starts_with(&format!("{k}-")));
     let mut prefix = String::new();
     let is_flow = if known {
         kind == "flowchart" || kind == "graph"
     } else {
         // 第一行就是节点/连线语句（`A[…]`、`A --> B`）：缺了图类型头，补 flowchart TD。
-        let id_len = head.chars().take_while(|&c| c.is_ascii_alphanumeric() || c == '_').count();
+        let id_len = head
+            .chars()
+            .take_while(|&c| c.is_ascii_alphanumeric() || c == '_')
+            .count();
         let after = head[id_len..].trim_start();
-        let stmt = id_len > 0 && (after.starts_with(['[', '(', '{']) || ["-->", "---", "-.", "==>"].iter().any(|a| after.starts_with(a)));
+        let stmt = id_len > 0
+            && (after.starts_with(['[', '(', '{'])
+                || ["-->", "---", "-.", "==>"]
+                    .iter()
+                    .any(|a| after.starts_with(a)));
         if !stmt {
             fatal.push(format!("第一行「{head}」不是图类型（应为 flowchart TD / sequenceDiagram / stateDiagram-v2 …）"));
-            return MermaidCheck { fixable, fatal, fixed: None };
+            return MermaidCheck {
+                fixable,
+                fatal,
+                fixed: None,
+            };
         }
         fixable.push(format!("缺图类型头：第一行「{head}」前要有 `flowchart TD`"));
         prefix = "flowchart TD\n".into();
@@ -379,28 +446,55 @@ pub fn check(src: &str) -> MermaidCheck {
             continue;
         }
         let first = body.split_whitespace().next().unwrap_or("");
-        if ["end", "classDef", "class", "style", "linkStyle", "click", "direction"].contains(&first) {
+        if [
+            "end",
+            "classDef",
+            "class",
+            "style",
+            "linkStyle",
+            "click",
+            "direction",
+        ]
+        .contains(&first)
+        {
             out_lines.push(raw.to_string());
             continue;
         }
         // 连线没有终点（`A -->` 结尾）：几乎总是输出被截断，修不了。
-        if ["-->", "--", "-.->", "==>", "---", "-."].iter().any(|a| body.ends_with(a)) {
-            fatal.push(format!("连线没有终点：`{body}`（图源可能被截断，补全这一行）"));
+        if ["-->", "--", "-.->", "==>", "---", "-."]
+            .iter()
+            .any(|a| body.ends_with(a))
+        {
+            fatal.push(format!(
+                "连线没有终点：`{body}`（图源可能被截断，补全这一行）"
+            ));
             out_lines.push(raw.to_string());
             continue;
         }
-        let mut fx = LineFix { notes: &mut fixable };
+        let mut fx = LineFix {
+            notes: &mut fixable,
+        };
         if first == "subgraph" {
             let title = body["subgraph".len()..].trim();
-            let id_len = title.chars().take_while(|&c| ident_char(c)).map(char::len_utf8).sum::<usize>();
+            let id_len = title
+                .chars()
+                .take_while(|&c| ident_char(c))
+                .map(char::len_utf8)
+                .sum::<usize>();
             // `id[标题]` / `id [标题]`（中间有空格也合法，实测通过）。
             let shape_at = id_len + (title.len() - id_len - title[id_len..].trim_start().len());
-            let has_shape = id_len > 0 && title[shape_at..].starts_with('[') && title.ends_with(']');
+            let has_shape =
+                id_len > 0 && title[shape_at..].starts_with('[') && title.ends_with(']');
             let line = if has_shape {
                 // 按节点文字规则处理（统一去掉 id 与 `[` 之间的空格）。
-                format!("subgraph {}", fx.node_labels(&format!("{}{}", &title[..id_len], &title[shape_at..])))
+                format!(
+                    "subgraph {}",
+                    fx.node_labels(&format!("{}{}", &title[..id_len], &title[shape_at..]))
+                )
             } else if (title.starts_with('"') && title.ends_with('"'))
-                || title.chars().all(|c| c.is_alphanumeric() || SUBGRAPH_TITLE_OK.contains(&c))
+                || title
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || SUBGRAPH_TITLE_OK.contains(&c))
                 || bracket_title_ok(title)
             {
                 format!("subgraph {title}")
@@ -424,7 +518,11 @@ pub fn check(src: &str) -> MermaidCheck {
         fixed.push('\n');
     }
     let fixed = (!fixable.is_empty() && fixed != src).then_some(fixed);
-    MermaidCheck { fixable, fatal, fixed }
+    MermaidCheck {
+        fixable,
+        fatal,
+        fixed,
+    }
 }
 
 /// 一段 markdown 里每个 ```mermaid 围栏的 (源码起止字节, 源码)。未闭合的围栏到文末为止。
@@ -496,10 +594,18 @@ pub fn check_doc(text: &str) -> DocCheck {
         if let Some(fixed) = c.fixed {
             let again = check(&fixed);
             if again.fixable.is_empty() && again.fatal.len() <= c.fatal.len() {
-                fixed_notes.extend(c.fixable.iter().map(|p| format!("第 {n} 张 mermaid 图：{p}")));
+                fixed_notes.extend(
+                    c.fixable
+                        .iter()
+                        .map(|p| format!("第 {n} 张 mermaid 图：{p}")),
+                );
                 replacement = Some(fixed);
             } else {
-                fatal.extend(c.fixable.iter().map(|p| format!("第 {n} 张 mermaid 图：{p}")));
+                fatal.extend(
+                    c.fixable
+                        .iter()
+                        .map(|p| format!("第 {n} 张 mermaid 图：{p}")),
+                );
             }
         }
         fixed_text.push_str(&text[last..range.start]);
@@ -554,8 +660,14 @@ mod tests {
     #[test]
     fn quotes_node_labels_with_brackets() {
         let out = fixed("flowchart TD\n  A[前端调用 resolve_one(choice_id, q)] --> D[通过柔性数组 arena->bins[bin_ind] 定位]\n  R2[@x 5 个] --> A\n");
-        assert!(out.contains("A[\"前端调用 resolve_one(choice_id, q)\"]"), "{out}");
-        assert!(out.contains("D[\"通过柔性数组 arena->bins[bin_ind] 定位\"]"), "{out}");
+        assert!(
+            out.contains("A[\"前端调用 resolve_one(choice_id, q)\"]"),
+            "{out}"
+        );
+        assert!(
+            out.contains("D[\"通过柔性数组 arena->bins[bin_ind] 定位\"]"),
+            "{out}"
+        );
         assert!(out.contains("R2[\"@x 5 个\"]"), "{out}");
         assert!(out.ends_with('\n'));
     }
@@ -592,7 +704,10 @@ mod tests {
     #[test]
     fn quotes_edge_labels() {
         let out = fixed("flowchart TD\n  base -->|base_alloc_impl (src/base.c:485)| ed\n  R -->|@role line| I\n  A -->|有空闲(1)| G\n");
-        assert!(out.contains("-->|\"base_alloc_impl (src/base.c:485)\"| ed"), "{out}");
+        assert!(
+            out.contains("-->|\"base_alloc_impl (src/base.c:485)\"| ed"),
+            "{out}"
+        );
         assert!(out.contains("-->|\"@role line\"| I"), "{out}");
         assert!(out.contains("-->|\"有空闲(1)\"| G"), "{out}");
     }
@@ -670,11 +785,17 @@ mod tests {
     fn autofix_file_writes_back() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.md");
-        std::fs::write(&p, "```mermaid\nflowchart TD\n  subgraph 用户（低频）\n  A\n  end\n```\n").unwrap();
+        std::fs::write(
+            &p,
+            "```mermaid\nflowchart TD\n  subgraph 用户（低频）\n  A\n  end\n```\n",
+        )
+        .unwrap();
         let (fixed, fatal) = autofix_file(&p);
         assert_eq!(fixed.len(), 1);
         assert!(fatal.is_empty());
-        assert!(std::fs::read_to_string(&p).unwrap().contains("subgraph sg1[\"用户（低频）\"]"));
+        assert!(std::fs::read_to_string(&p)
+            .unwrap()
+            .contains("subgraph sg1[\"用户（低频）\"]"));
         let (fixed, _) = autofix_file(&p);
         assert!(fixed.is_empty(), "第二次无事可做");
     }
