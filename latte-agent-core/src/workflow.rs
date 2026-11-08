@@ -4210,6 +4210,19 @@ fn workflow_token_budget() -> u64 {
         .unwrap_or(DEFAULT_WORKFLOW_TOKEN_BUDGET)
 }
 
+/// Fraction of the currently remaining workflow budget held back from a
+/// first attempt. Validation retries can consume this reserve; the next
+/// successfully reached step recomputes from the new remaining balance.
+const DEFAULT_WORKFLOW_REPAIR_RESERVE_RATIO: f64 = 0.20;
+
+fn workflow_repair_reserve_ratio() -> f64 {
+    std::env::var("LATTE_AGENT_WORKFLOW_REPAIR_RESERVE_RATIO")
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .unwrap_or(DEFAULT_WORKFLOW_REPAIR_RESERVE_RATIO)
+        .clamp(0.05, 0.5)
+}
+
 /// 一次 workflow run（含其**全部嵌套子 run**）能派出去的分派单元总数上限。
 ///
 /// # 为什么需要它
@@ -10460,8 +10473,9 @@ async fn run_workflow_inner(
         if budget.budget() > 0 {
             let _ = ctx.event_tx.send(ChatEvent::Status {
                 message: format!(
-                    "🧮 本次 workflow（含全部嵌套流程）共享 {} token 硬上限；达到后保留 checkpoint 并停止新模型请求",
-                    budget.budget()
+                    "🧮 本次 workflow（含全部嵌套流程）共享 {} token 硬上限；每个首次分派动态预留 {:.0}% 剩余额度给校验返修，请求发送前先预占预算，达到后保留 checkpoint 并停止新模型请求",
+                    budget.budget(),
+                    workflow_repair_reserve_ratio() * 100.0
                 ),
             });
         }
@@ -11235,6 +11249,7 @@ async fn build_role_runner(
     // 包装版（写重定向 + 读 overlay），见 crate::staging。
     staging: Option<Arc<crate::staging::Staging>>,
     token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
+    token_budget_ceiling: Option<u64>,
     step_tools: &[String],
     read_path_allowlist: &[String],
     write_path_allowlist: &[String],
@@ -11481,6 +11496,9 @@ async fn build_role_runner(
     }
     if let Some(budget) = token_budget {
         r = r.with_shared_token_budget(budget);
+        if let Some(ceiling) = token_budget_ceiling {
+            r = r.with_shared_token_budget_ceiling(ceiling);
+        }
     }
     if let Some(id) = sub_id {
         r = r.with_sub_id(id.to_string());
@@ -11538,6 +11556,9 @@ struct SpeakerDispatch {
     dispatch_budget: Option<Arc<DispatchBudget>>,
     /// 根 workflow 共享 token 预算；所有 speaker runner 写入同一计数器。
     token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
+    /// 本次分派在共享预算里的 admission ceiling。首次尝试按剩余额度
+    /// 预留返修空间；机械校验重试可使用总硬上限。
+    token_budget_ceiling: Option<u64>,
     /// step 级工具过滤（`WorkflowStepDef::tools`），空 = 角色全集。
     step_tools: Vec<String>,
     /// 引擎强制的 read 路径白名单（按路径段 `*` 模式匹配），而不是
@@ -11629,6 +11650,7 @@ impl SpeakerDispatch {
             staging: ctx.staging.clone(),
             dispatch_budget: ctx.dispatch_budget.clone(),
             token_budget: ctx.token_budget.clone(),
+            token_budget_ceiling: None,
             step_tools,
             read_path_allowlist: Vec::new(),
             write_path_allowlist: Vec::new(),
@@ -11798,6 +11820,28 @@ fn context_overflow_detail(error: &crate::error::AgentError) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+fn learn_plan_validation_repair_prompt(
+    topic: &str,
+    learn_root_rel: &str,
+    slug: &str,
+    reason: &str,
+    truncated_hint: &str,
+) -> String {
+    format!(
+        "【plan.json 定向返修】\n\
+         主题：{}\n\
+         当前 slug：{slug}\n\
+         当前文件：{learn_root_rel}/{slug}/plan.json\n\n\
+         {truncated_hint}引擎校验失败：\n{}\n\n\
+         这是窄上下文返修，不重放首次课程设计的长提示和取证历史。\
+         先 read 当前 plan.json，再用 edit 只修上面点名的字段；\
+         只有证据行号有问题时才定向读取对应源码。不要重新做全仓搜索，\
+         不要用 write 重写整份文件。修完后只输出 slug。",
+        output_excerpt(topic, 1200),
+        output_excerpt(reason, 12_000),
+    )
 }
 
 fn context_overflow_restart_prompt(
@@ -12063,6 +12107,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     inp.cancel_flag.clone(),
                     inp.staging.clone(),
                     inp.token_budget.clone(),
+                    inp.token_budget_ceiling,
                     &inp.step_tools,
                     &inp.read_path_allowlist,
                     &inp.write_path_allowlist,
@@ -13481,6 +13526,9 @@ async fn run_workflow_serial(
                     );
                 }
                 let mut base_prompt = clean_prompt.clone();
+                // A loop-back carries reviewer feedback into a fresh attempt.
+                // Treat it like validation repair for shared-budget admission.
+                let loop_repair = step_transcript.is_empty() && pending_feedback.is_some();
                 // 循环返工批注：跳回目标 step 的第一个 speaker 的 prompt
                 // = 渲染后的 task + 上轮审查反馈（loop step 的产出）。
                 if step_transcript.is_empty() {
@@ -13525,6 +13573,12 @@ async fn run_workflow_serial(
                         answer_log.clone(),
                         topic.to_string(),
                     );
+                    dispatch.token_budget_ceiling = dispatch.token_budget.as_ref().map(|budget| {
+                        budget.attempt_ceiling(
+                            loop_repair || attempt > 0,
+                            workflow_repair_reserve_ratio(),
+                        )
+                    });
                     // no_advisor：既不审查委派返回，也不挂 in-session intervene 门。
                     if step.no_advisor {
                         dispatch.advisor_gate = None;
@@ -13959,7 +14013,13 @@ async fn run_workflow_serial(
                                 ,truncation_retry_hint(&response)
                             );
                             step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
-                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            prompt = learn_plan_validation_repair_prompt(
+                                topic,
+                                &learn_root_rel(ctx),
+                                response.trim(),
+                                &reason,
+                                truncation_retry_hint(&response),
+                            );
                             continue;
                         }
                     }
@@ -14826,6 +14886,12 @@ async fn run_dag_step(
                 staging: inp.staging.clone(),
                 dispatch_budget: inp.dispatch_budget.clone(),
                 token_budget: inp.token_budget.clone(),
+                token_budget_ceiling: inp.token_budget.as_ref().map(|budget| {
+                    budget.attempt_ceiling(
+                        inp.feedback.is_some() || attempt > 0,
+                        workflow_repair_reserve_ratio(),
+                    )
+                }),
                 step_tools: step.tools.clone(),
                 read_path_allowlist: step.read_path_allowlist.clone(),
                 write_path_allowlist: render_scope_patterns(&step.write_path_allowlist, &inp.vars),
@@ -19418,6 +19484,7 @@ forbid = ["TBD"]
             Arc::new(AtomicBool::new(false)),
             None,
             None,
+            None,
             &[],
             &[],
             &[],
@@ -19457,6 +19524,7 @@ forbid = ["TBD"]
             &event_tx,
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
             None,
             &[],
@@ -19534,6 +19602,7 @@ forbid = ["TBD"]
             &event_tx,
             None,
             Arc::new(AtomicBool::new(false)),
+            None,
             None,
             None,
             &[],

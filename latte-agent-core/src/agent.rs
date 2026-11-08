@@ -1425,6 +1425,10 @@ pub struct AgentRunner {
     /// Shared workflow/session token meter. Every attached runner contributes
     /// actual input + output + thinking usage after each model response.
     shared_token_budget: Option<std::sync::Arc<SharedTokenBudget>>,
+    /// This dispatch's admission ceiling inside the shared budget. Workflow
+    /// first attempts leave a repair reserve; validation retries may use the
+    /// full shared budget. `None` uses the meter's global ceiling.
+    shared_token_budget_ceiling: Option<u64>,
     /// Optional event channel for human intervention on broken JSON/inputs (Scheme A).
     tool_fix_event_tx: Option<tokio::sync::broadcast::Sender<crate::controller::ChatEvent>>,
     /// 会话级 todo 状态（见 [`crate::todo`]）：todo 工具 handler 读写，
@@ -1578,41 +1582,124 @@ fn short_tool_name(name: &str) -> &str {
 /// A token meter shared by every runner in one workflow/session scope.
 /// `budget == 0` disables enforcement while retaining usage accounting.
 pub struct SharedTokenBudget {
-    used: std::sync::atomic::AtomicU64,
+    state: std::sync::Mutex<SharedTokenBudgetState>,
     budget: u64,
+}
+
+#[derive(Default)]
+struct SharedTokenBudgetState {
+    used: u64,
+    reserved: u64,
+}
+
+/// Admission permit for one provider request. Dropping an unsettled permit
+/// releases the reservation, so cancellation and provider failures do not
+/// permanently consume the workflow budget.
+pub struct SharedTokenReservation {
+    budget: std::sync::Arc<SharedTokenBudget>,
+    reserved: u64,
+    settled: bool,
+}
+
+impl SharedTokenReservation {
+    pub fn settle(mut self, actual: u64) -> u64 {
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.reserved = state.reserved.saturating_sub(self.reserved);
+        state.used = state.used.saturating_add(actual);
+        self.settled = true;
+        state.used
+    }
+}
+
+impl Drop for SharedTokenReservation {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut state = self.budget.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.reserved = state.reserved.saturating_sub(self.reserved);
+    }
 }
 
 impl SharedTokenBudget {
     pub fn new(budget: u64) -> Self {
         Self {
-            used: std::sync::atomic::AtomicU64::new(0),
+            state: std::sync::Mutex::new(SharedTokenBudgetState::default()),
             budget,
         }
     }
 
     pub fn record(&self, tokens: u64) -> u64 {
-        let previous = self
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.used = state.used.saturating_add(tokens);
+        state.used
+    }
+
+    /// Reserve the estimated prompt plus bounded completion allowance before
+    /// sending a request. The dispatch-local `ceiling` may be lower than the
+    /// workflow hard limit to preserve room for a validation repair.
+    pub fn try_reserve(
+        self: &std::sync::Arc<Self>,
+        tokens: u64,
+        ceiling: u64,
+    ) -> Result<SharedTokenReservation, (u64, u64)> {
+        let ceiling = if self.budget == 0 {
+            0
+        } else {
+            ceiling.min(self.budget)
+        };
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let projected = state
             .used
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |used| Some(used.saturating_add(tokens)),
-            )
-            .unwrap_or_else(|used| used);
-        previous.saturating_add(tokens)
+            .saturating_add(state.reserved)
+            .saturating_add(tokens);
+        if ceiling > 0 && projected > ceiling {
+            return Err((state.used.saturating_add(state.reserved), ceiling));
+        }
+        state.reserved = state.reserved.saturating_add(tokens);
+        drop(state);
+        Ok(SharedTokenReservation {
+            budget: self.clone(),
+            reserved: tokens,
+            settled: false,
+        })
     }
 
     pub fn exceeded(&self) -> Option<(u64, u64)> {
-        let used = self.used.load(std::sync::atomic::Ordering::Relaxed);
-        (self.budget > 0 && used >= self.budget).then_some((used, self.budget))
+        self.exceeded_at(self.budget)
+    }
+
+    pub fn exceeded_at(&self, ceiling: u64) -> Option<(u64, u64)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let ceiling = if self.budget == 0 {
+            0
+        } else {
+            ceiling.min(self.budget)
+        };
+        (ceiling > 0 && state.used.saturating_add(state.reserved) >= ceiling)
+            .then_some((state.used.saturating_add(state.reserved), ceiling))
     }
 
     pub fn used(&self) -> u64 {
-        self.used.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).used
     }
 
     pub fn budget(&self) -> u64 {
         self.budget
+    }
+
+    /// First attempts may spend only a fraction of the currently remaining
+    /// budget. A later step recomputes from its new starting point, while a
+    /// validation retry can use the full hard limit.
+    pub fn attempt_ceiling(&self, repair: bool, reserve_ratio: f64) -> u64 {
+        if self.budget == 0 || repair {
+            return self.budget;
+        }
+        let used = self.used();
+        let remaining = self.budget.saturating_sub(used);
+        let reserve_ratio = reserve_ratio.clamp(0.05, 0.5);
+        let spendable = ((remaining as f64) * (1.0 - reserve_ratio)) as u64;
+        used.saturating_add(spendable).min(self.budget)
     }
 }
 
@@ -3019,6 +3106,7 @@ impl AgentRunner {
             request_budget: None,
             max_tool_calls: None,
             shared_token_budget: None,
+            shared_token_budget_ceiling: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             job_stop_reminders: 0,
@@ -3068,6 +3156,7 @@ impl AgentRunner {
             request_budget: None,
             max_tool_calls: None,
             shared_token_budget: None,
+            shared_token_budget_ceiling: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             job_stop_reminders: 0,
@@ -3115,6 +3204,7 @@ impl AgentRunner {
             request_budget: None,
             max_tool_calls: None,
             shared_token_budget: None,
+            shared_token_budget_ceiling: None,
             todo_state: None,
             todo_tracker: crate::todo::TodoTracker::default(),
             job_stop_reminders: 0,
@@ -4127,6 +4217,14 @@ impl AgentRunner {
         self
     }
 
+    /// Restrict this runner to a dispatch-local ceiling within the shared
+    /// workflow budget. This is how a first attempt leaves room for a focused
+    /// validation repair without creating a second, independent token meter.
+    pub fn with_shared_token_budget_ceiling(mut self, ceiling: u64) -> Self {
+        self.shared_token_budget_ceiling = (ceiling > 0).then_some(ceiling);
+        self
+    }
+
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
         self.deadline = Some(deadline);
     }
@@ -4604,11 +4702,12 @@ impl AgentRunner {
         let mut shared_budget_hit: Option<(u64, u64)> = None;
         let mut budget_nudged = false;
         loop {
-            if let Some(hit) = self
-                .shared_token_budget
-                .as_ref()
-                .and_then(|budget| budget.exceeded())
-            {
+            if let Some(hit) = self.shared_token_budget.as_ref().and_then(|budget| {
+                budget.exceeded_at(
+                    self.shared_token_budget_ceiling
+                        .unwrap_or_else(|| budget.budget()),
+                )
+            }) {
                 shared_budget_hit = Some(hit);
                 break;
             }
@@ -4783,6 +4882,39 @@ impl AgentRunner {
                     p.tool_choice = latte_ai::models::ToolChoice::Specific(name);
                 }
                 Some(p)
+            };
+            // Request admission happens before any provider future is created.
+            // Reserve the estimated prompt plus a bounded completion allowance;
+            // otherwise one large call (or several concurrent DAG calls) can
+            // all observe the same remaining budget and overshoot it together.
+            let shared_reservation = if let Some(budget) = &self.shared_token_budget {
+                let input_estimate = messages
+                    .iter()
+                    .map(|m| m.as_text().len())
+                    .sum::<usize>()
+                    .div_ceil(4) as u64;
+                let output_allowance = u64::from(
+                    chat_params
+                        .as_ref()
+                        .and_then(|p| p.max_tokens)
+                        .unwrap_or(8_192)
+                        .min(16_384),
+                );
+                let projected = input_estimate
+                    .saturating_add(input_estimate / 5)
+                    .saturating_add(output_allowance);
+                let ceiling = self
+                    .shared_token_budget_ceiling
+                    .unwrap_or_else(|| budget.budget());
+                match budget.try_reserve(projected, ceiling) {
+                    Ok(permit) => Some(permit),
+                    Err(hit) => {
+                        shared_budget_hit = Some(hit);
+                        break;
+                    }
+                }
+            } else {
+                None
             };
             let completion = if self.is_stream_mode() {
                 // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
@@ -5055,16 +5187,15 @@ impl AgentRunner {
             };
             let latency_ms = chat_start.elapsed().as_millis() as u64;
 
+            let actual_usage = u64::from(completion.usage.input_tokens)
+                .saturating_add(u64::from(completion.usage.output_tokens))
+                .saturating_add(u64::from(completion.usage.thinking_tokens));
+            if let Some(reservation) = shared_reservation {
+                reservation.settle(actual_usage);
+            }
             self.total_usage.input_tokens += completion.usage.input_tokens;
             self.total_usage.output_tokens += completion.usage.output_tokens;
             self.total_usage.thinking_tokens += completion.usage.thinking_tokens;
-            if let Some(budget) = &self.shared_token_budget {
-                budget.record(
-                    u64::from(completion.usage.input_tokens)
-                        .saturating_add(u64::from(completion.usage.output_tokens))
-                        .saturating_add(u64::from(completion.usage.thinking_tokens)),
-                );
-            }
             total_input += completion.usage.input_tokens;
             total_output += completion.usage.output_tokens;
             total_thinking += completion.usage.thinking_tokens;

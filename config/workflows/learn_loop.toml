@@ -55,6 +55,13 @@ description = "读代码取证，拆解知识点、出题并写入 plan.json / l
 role = "tutor"
 output_key = "plan_out"
 max_retries = 2
+# 事故回归（rocksdb ui-90268）：plan 在连续取证中累计重传约 30K token 的
+# prompt，直到整棵 workflow 的 1M 共享预算耗尽，返修 runner 连第一次请求
+# 都发不出去。12 次先催收尾、18 次硬停；工具调用再单独封顶，确保后续校验
+# 与正文步骤仍有预算。单次 prompt 也不许因大 read/search 结果膨胀超过 64K。
+max_requests = 12
+max_tool_calls = 32
+prompt_token_budget = 64000
 tools = ["read", "code_graph", "search", "write", "edit"]
 require_tools_any = ["read", "code_graph", "search"]
 require_tools = ["write"]
