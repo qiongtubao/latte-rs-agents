@@ -174,3 +174,18 @@ require_learn_chapters = true
 # 断点续扇只补缺章；定向返工时 gate 删掉被点名章的文件，这里只重做它们；
 # breakdown 重写骨架后 mtime 变新，旧产物全部失效、全量重做。
 skip_fresh = ".latte/learn-plan/tasks/{{item_id}}.json"
+# 单章失败不再拖死整单。
+#
+# 实测（jemalloc ui-1492703-1793725281641-w0）：15 章扇出，14 章产物已落盘，
+# 只有 ch08 的模型连续 3 次「只回文字、不调 write」。缺省 fail-fast 让这一条
+# 把整条 learn_book_pages 判死、外层 learn_plan 连带 failed（已完成 1/2 步），
+# 14 章产物全部失效。
+#
+# 打开后的链路（全部是既有机制，不需要新代码）：
+#   单章失败 → 「FAN_OUT_ITEM_FAILED <id>: <原因>」，其余章照常收尾
+#   → assemble 的 collect_plan_tasks 报「缺章 chNN」
+#   → 命中 learn_plan 的 collect_plan_tasks.on_fail：删该章产物、跳回 rechapter
+#   → rechapter 复用 skip_fresh：已新鲜的 14 章跳过，只重扇缺的那一章
+# 于是同一章额外拿到 max_attempts 次机会，且不重烧其余章节。
+# 对比 doc_review_loop：它 6 个扇出点全部开着这一项。
+tolerate_failures = true
