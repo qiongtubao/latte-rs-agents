@@ -787,6 +787,96 @@ const MAX_LENGTH_CONTINUATIONS: u8 = 5;
 /// 带显式标记交给下游（契约 / 解析会拒绝，由步骤级重试接手）。
 const LENGTH_DISCARD_MAX_RETRIES: u8 = 2;
 
+/// 模型只回文字就收尾、但本 turn 的必需工具（[`AgentRunner::with_required_tools`]）还没调过时，
+/// 在同一对话里最多提醒几次。
+///
+/// 修的 bug（实测实锤：jemalloc 会话 `ui-1492703-1793725281641-w0`，`learn_book_pages` 的
+/// detail 步）：glm-5.3 读完锚点文件后只回一句「写入任务文件。」就结束（`finish_reason`
+/// 为空、零工具调用）。引擎把它当最终答复，workflow 的 `require_tools` 判失败后**新开
+/// 子代理**从头重做——重读同样的文件、撞同样的毛病，ch08 连撞 3 次整条 workflow 判死。
+/// 同会话 11/28 个分派都出现过这种「说了不做」。做法借鉴 oh-my-pi 的 unexpected-stop /
+/// soft tool requirement：保留它刚才的回复，追加一条提醒让它把调用补上——上下文里
+/// 已有读过的内容，补一次调用只花一次模型请求。
+const REQUIRED_TOOL_MAX_NUDGES: u8 = 2;
+
+/// 必需工具提醒用完一次后，是否把下一次请求的 `tool_choice` 强制成该工具。
+///
+/// 默认**关**：不少 OpenAI 兼容端点（智谱 GLM 系、部分中转站）只认 `tool_choice: "auto"`，
+/// 下发 function 对象会 400，进而触发整条模型链 fallback / 暂停——比漏调一次工具更糟。
+/// 确认端点支持时设 `LATTE_AGENT_FORCE_REQUIRED_TOOL=1` 打开。
+fn force_required_tool_from_env() -> bool {
+    std::env::var("LATTE_AGENT_FORCE_REQUIRED_TOOL")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// 本 turn 与 workflow `require_tools` / `require_tools_any` 的差距。
+///
+/// 两者语义不同，批注必须分开写，否则模型会把 OR 读成 AND：
+/// - `all_of`（`require_tools`，AND）：**每个**都得调，缺哪个点哪个。
+/// - `any_of`（`require_tools_any`，OR）：**至少一个**。全部没调时把拿得到的
+///   候选都列出来让模型挑，而不是点名一个逼它调——`breakdown` 步的取证
+///   既可 `read` 也可 `code_graph` 也可 `search`，点名等于凭引擎偏好剥夺选择。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RequiredToolGap {
+    all_of: Vec<String>,
+    any_of: Vec<String>,
+}
+
+impl RequiredToolGap {
+    fn is_empty(&self) -> bool {
+        self.all_of.is_empty() && self.any_of.is_empty()
+    }
+}
+
+/// 必需工具提醒文本。`write` 同时点名 `edit`（与 workflow `check_required_tools` 的判据一致）。
+fn required_tool_nudge(gap: &RequiredToolGap, attempt: u8) -> String {
+    let edit_hint = if gap
+        .all_of
+        .iter()
+        .chain(gap.any_of.iter())
+        .any(|m| m == "write")
+    {
+        "（落盘既可以用 write，也可以用 edit 改已有文件）"
+    } else {
+        ""
+    };
+    let mut demand = String::new();
+    if !gap.all_of.is_empty() {
+        demand.push_str(&format!(
+            "本步要求必须实际调用 [{}]",
+            gap.all_of.join(", ")
+        ));
+    }
+    if !gap.any_of.is_empty() {
+        if !demand.is_empty() {
+            demand.push_str("；并且");
+        }
+        demand.push_str(&format!(
+            "必须至少实际调用 [{}] 之中的一个（任意一个即可，不必全调）",
+            gap.any_of.join(" / ")
+        ));
+    }
+    format!(
+        "你上一条回复只有文字、没有真正调用工具就结束了。{demand}{edit_hint}——\
+         在正文里说「写入 / 落盘 / 已完成」不算数，引擎只认真实发生的工具调用。\n\
+         现在直接发起这次工具调用：不要重复之前的分析，不要重新读已经读过的文件，\
+         上文里已有的内容直接用。（第 {attempt}/{REQUIRED_TOOL_MAX_NUDGES} 次提醒）"
+    )
+}
+
+/// 归一必需工具名：去 `namespace.` 前缀与空白，丢掉空串。
+///
+/// 与 workflow `check_required_tools` 共用同一套短名规则——那边比对的是
+/// `called_tool_names` 的短名，这里若留着 `tutor.write` 就永远匹配不上。
+fn normalize_required_tools(tools: Vec<String>) -> Vec<String> {
+    tools
+        .into_iter()
+        .map(|t| short_tool_name(t.trim()).to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
 fn length_continuation_from_env() -> bool {
     std::env::var("LATTE_AGENT_LENGTH_RECOVERY")
         .map(|v| v.trim().eq_ignore_ascii_case("continue"))
@@ -1149,6 +1239,19 @@ pub struct AgentRunner {
     /// 正文撞长度上限时是否**续写拼接**（旧行为）。默认 false：丢弃截断的这一轮并要求模型缩短重来，
     /// 见 [`LENGTH_DISCARD_MAX_RETRIES`]。`LATTE_AGENT_LENGTH_RECOVERY=continue` 或 [`AgentRunner::with_length_continuation`] 打开。
     length_continuation: bool,
+    /// 本 turn **必须真的调用**的工具（短名，AND 语义；`write` 可由 `edit` 满足）。
+    /// workflow step 的 `require_tools` 经 [`AgentRunner::with_required_tools`] 传进来。
+    /// 模型只回文字就收尾、而这些工具还没调过时，在**同一对话**里追加提醒让它
+    /// 接着调（见 [`REQUIRED_TOOL_MAX_NUDGES`]），而不是让 workflow 新开子代理从头重做。
+    required_tools: Vec<String>,
+    /// 本 turn **至少调用一个**的工具（短名，OR 语义）。workflow step 的
+    /// `require_tools_any` 经 [`AgentRunner::with_required_tools_any`] 传进来。
+    ///
+    /// 与 `required_tools` 分开的理由同 workflow 侧：`breakdown` 步的取证既
+    /// 可以 `read` 也可以 `code_graph` 也可以 `search`，写成 AND 等于逼它三个
+    /// 都调一遍。没有这一条时，一次取证都不做的骨架设计会**静默跑完**——
+    /// `check_tool_usage` 在 turn 之后才判，那时上下文已经销毁。
+    required_tools_any: Vec<String>,
 }
 /// `AgentRunner` 的模型热更新源：记录链是从哪个 resolver + 解析参数
 /// 来的，以及构建时的配置代际。
@@ -2614,6 +2717,8 @@ impl AgentRunner {
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
+            required_tools: Vec::new(),
+            required_tools_any: Vec::new(),
         }
     }
     /// 构造带工具的 runner。
@@ -2658,6 +2763,8 @@ impl AgentRunner {
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
+            required_tools: Vec::new(),
+            required_tools_any: Vec::new(),
         }
     }
     /// Attach an event broadcaster so the runner can trigger human-intervention
@@ -2700,6 +2807,8 @@ impl AgentRunner {
             todo_tracker: crate::todo::TodoTracker::default(),
             prompt_token_budget: None,
             length_continuation: length_continuation_from_env(),
+            required_tools: Vec::new(),
+            required_tools_any: Vec::new(),
         }
     }
 
@@ -2713,6 +2822,57 @@ impl AgentRunner {
     pub fn with_length_continuation(mut self, on: bool) -> Self {
         self.length_continuation = on;
         self
+    }
+    /// 声明本 runner 每个 turn 必须真的调用的工具（见 `required_tools` 字段）。
+    pub fn with_required_tools(mut self, tools: Vec<String>) -> Self {
+        self.required_tools = normalize_required_tools(tools);
+        self
+    }
+
+    /// 声明本 runner 每个 turn **至少调用一个**的工具（见 `required_tools_any` 字段）。
+    pub fn with_required_tools_any(mut self, tools: Vec<String>) -> Self {
+        self.required_tools_any = normalize_required_tools(tools);
+        self
+    }
+
+    /// 本 turn 还没调用过、且本 runner 确实拿得到的必需工具（短名）。
+    ///
+    /// 依据是 `last_turn_tool_summaries`（只记**执行成功**的调用，续跑时由快照还原），
+    /// 与 workflow `check_required_tools` 用的是同一份事实。拿不到的工具不催：
+    /// 提醒一个不存在的工具只会让模型去编造调用。
+    fn missing_required_tools(&self, available: &[latte_ai::models::Tool]) -> RequiredToolGap {
+        if self.required_tools.is_empty() && self.required_tools_any.is_empty() {
+            return RequiredToolGap::default();
+        }
+        let called: Vec<&str> = self
+            .last_turn_tool_summaries
+            .iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(short_tool_name)
+            .collect();
+        // `write` 的语义是「真把产出落盘」：`edit` 改已有文件同样落了盘。与
+        // workflow `check_required_tools` 同一条判据，两处不能漂移。
+        let satisfied = |r: &str| called.contains(&r) || (r == "write" && called.contains(&"edit"));
+        let has = |name: &str| available.iter().any(|t| short_tool_name(&t.name) == name);
+        let all_of: Vec<String> = self
+            .required_tools
+            .iter()
+            .filter(|r| !satisfied(r) && has(r))
+            .cloned()
+            .collect();
+        // OR 组：只要其中一个被调用过就算满足；全都没调才催，且列出**所有**
+        // 拿得到的候选，让模型自己挑。
+        let any_satisfied = self.required_tools_any.iter().any(|r| satisfied(r));
+        let any_of: Vec<String> = if any_satisfied {
+            Vec::new()
+        } else {
+            self.required_tools_any
+                .iter()
+                .filter(|r| has(r))
+                .cloned()
+                .collect()
+        };
+        RequiredToolGap { all_of, any_of }
     }
 
     pub fn with_prompt_token_budget(mut self, budget: usize) -> Self {
@@ -3973,6 +4133,9 @@ impl AgentRunner {
         let mut total_cache_write: u32 = 0;
         // 悬挂工具标记的卫生重试计数（每 turn 至多 1 次）。
         let mut markup_retried: u8 = 0;
+        // 必需工具提醒已用次数（见 REQUIRED_TOOL_MAX_NUDGES），与下一次请求要强制的工具。
+        let mut required_nudges: u8 = 0;
+        let mut forced_tool: Option<String> = None;
         // 正文撞长度上限后的**续写**次数。旧实现是「重试一次让模型
         // 压缩重写」——已生成的半截 token 全丢、且逼模型砍内容才能装下
         // （实测：implementation_plan 清单被从 30 子任务压到 ≤18 才不
@@ -4192,6 +4355,11 @@ impl AgentRunner {
                 // turn/请求级的东西。调用方显式设过就不覆盖。
                 if p.prompt_cache_key.is_none() && !self.session_id.is_empty() {
                     p.prompt_cache_key = Some(self.session_id.clone());
+                }
+                // 必需工具强制（opt-in，见 force_required_tool_from_env）：只作用于这一次请求，
+                // 取出即清空——下一轮（工具结果回来之后）恢复调用方原本的 tool_choice。
+                if let Some(name) = forced_tool.take() {
+                    p.tool_choice = latte_ai::models::ToolChoice::Specific(name);
                 }
                 Some(p)
             };
@@ -4679,6 +4847,41 @@ impl AgentRunner {
                             .to_string(),
                     ));
                     continue;
+                }
+                // 必需工具提醒：本 turn 声明了必须调用的工具（workflow `require_tools` /
+                // `require_tools_any`），模型却只回文字就收尾。截断的情况上面已处理
+                // （缩短重来 / 续写），不在此叠加。
+                if !output_truncated && required_nudges < REQUIRED_TOOL_MAX_NUDGES {
+                    let available: &[latte_ai::models::Tool] = chat_params
+                        .as_ref()
+                        .map(|p| p.tools.as_slice())
+                        .unwrap_or(&[]);
+                    let gap = self.missing_required_tools(available);
+                    if !gap.is_empty() {
+                        required_nudges += 1;
+                        tracing::warn!(
+                            stop_reason = %completion.stop_reason,
+                            missing_all_of = ?gap.all_of,
+                            missing_any_of = ?gap.any_of,
+                            attempt = required_nudges,
+                            "text-only reply skipped a required tool; nudging in the same conversation"
+                        );
+                        // 保留它刚才的回复（哪怕只有一句「写入任务文件。」），让它知道自己停在哪；
+                        // 空回复补占位，避免连续两条 user 被个别兼容端点拒绝。
+                        messages.push(Message::assistant(if final_response.trim().is_empty() {
+                            "（上一条回复为空）".to_string()
+                        } else {
+                            final_response.clone()
+                        }));
+                        messages.push(Message::user(required_tool_nudge(&gap, required_nudges)));
+                        // 第一次只提醒（不动 tool_choice，保住 prompt 缓存）；再犯且端点支持时强制。
+                        // AND 组优先：那是"必须每个都调"的硬要求，OR 组任意一个都行。
+                        if required_nudges >= 2 && force_required_tool_from_env() {
+                            forced_tool = gap.all_of.first().or(gap.any_of.first()).cloned();
+                        }
+                        final_response.clear();
+                        continue;
+                    }
                 }
                 // TodoTracker stop reminder：模型停止输出、无待处理工具
                 // 调用，而会话 todo 还有 pending/in_progress 项——注入一条
@@ -11578,6 +11781,398 @@ tools = ["read", "write"]
         assert_eq!(out.matches("SEG").count(), 1, "只保留最后一次的内容，不累加: {out}");
         let reqs = server.received_requests().await.expect("mock 应记录请求");
         assert_eq!(reqs.len(), 1 + usize::from(LENGTH_DISCARD_MAX_RETRIES));
+    }
+
+    // ─── require_tools / require_tools_any：同会话补调用提醒 ──────────────
+    //
+    // 回归 jemalloc 会话 `ui-1492703-1793725281641-w0` 的 learn_book_pages
+    // detail 步：glm-5.3 读完锚点后只回一句「写入任务文件。」就收尾
+    // （finish_reason 为空、零工具调用）。workflow 的 `require_tools` 判失败后
+    // 由引擎**新开子代理**从头重做——重读同样的文件、撞同样的毛病，ch08
+    // 连撞 3 次把整条 workflow 判死。实测该会话 27 次章节分派里 13 次
+    // （48%）是这种「说了不做」，3 次额度下 15 章至少死一章的概率 83%。
+
+    /// 注册一批 no-op 工具：只为让工具名出现在 schema 与工具摘要里。
+    fn noop_tool_manager(names: &[&str]) -> Arc<dyn latte_rs_agent_tools::types::ToolManager> {
+        use latte_rs_agent_tools::prelude::create_tool_manager;
+        use latte_rs_agent_tools::types::{
+            SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
+        };
+        let tm = create_tool_manager();
+        for name in names {
+            let handler: SharedToolHandler =
+                Arc::new(|_input, _ctx| Box::pin(async { Ok(serde_json::json!({ "ok": true })) }));
+            tm.register(
+                Tool::builder(
+                    *name,
+                    "noop",
+                    ToolInputSchema {
+                        schema_type: SchemaType,
+                        properties: Default::default(),
+                        required: None,
+                        additional_properties: None,
+                        defs: None,
+                    },
+                    handler,
+                )
+                .build(),
+                None,
+            );
+        }
+        tm
+    }
+
+    /// 非流式 OpenAI 响应体，携带一条 tool call。
+    fn openai_tool_call_body(id: &str, name: &str, args: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": args }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    /// 事故形态端到端：read → 只回文字收尾 → 同会话提醒 → 补 write → 收尾。
+    ///
+    /// 判据是**请求次数（4）与请求内容**，不是返回值：若走了「新开子代理重做」
+    /// 的老路，第一次请求不会带着 read 的 tool 往返，总请求数也不会是 4。
+    #[tokio::test]
+    async fn text_only_reply_nudges_missing_required_tool_in_same_conversation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // ① 读锚点（事故里的第一步）
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_tool_call_body("call_r", "read", r#"{"path":"src/rtree.c"}"#),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        // ② 只回一句「落盘」就收尾，零工具调用 —— 事故形态
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("锚点已核实，落盘任务条目：", "stop"),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        // ③ 被提醒后补上 write
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_tool_call_body(
+                            "call_w",
+                            "write",
+                            r#"{"path":".latte/learn-plan/tasks/ch08.json","content":"{}"}"#,
+                        ),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        // ④ 正常收尾
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("完成", "stop"),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "required-tool".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner =
+            AgentRunner::new_with_tools(agent, noop_tool_manager(&["read", "write"]))
+                .with_required_tools(vec!["write".into()]);
+        let out = runner
+            .run_turn(&[Message::user("细化 ch08")], None)
+            .await
+            .unwrap();
+
+        assert_eq!(out, "完成", "补调用后正常收尾: {out}");
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(
+            reqs.len(),
+            4,
+            "提醒必须在同一对话里补调用（read→文字→write→收尾），不是重新开子代理: {}",
+            reqs.len()
+        );
+        // 第 3 次请求 = 带提醒的那次：既要有提醒，也要保留它读到的上文。
+        let third = String::from_utf8_lossy(&reqs[2].body).to_string();
+        assert!(
+            third.contains("没有真正调用工具就结束了") && third.contains("第 1/2 次提醒"),
+            "第 3 次请求必须携带补调用提醒: {third}"
+        );
+        assert!(
+            third.contains("落盘任务条目"),
+            "它刚才那句回复要留在上下文里，模型才知道自己停在哪: {third}"
+        );
+        assert!(
+            third.contains("call_r"),
+            "提醒轮必须带着已完成的 read 取证（同会话续跑的全部意义）: {third}"
+        );
+        // 第 4 次请求：write 已成功，不再生成**新的**提醒（历史里那条仍在，
+        // 提醒是普通 user 消息，会随对话历史一起下发）。
+        let fourth = String::from_utf8_lossy(&reqs[3].body).to_string();
+        assert_eq!(
+            fourth.matches("没有真正调用工具就结束了").count(),
+            1,
+            "write 调过之后不得再追加提醒: {fourth}"
+        );
+        assert!(
+            fourth.contains("call_w"),
+            "第 4 次请求必须带着 write 的往返记录: {fourth}"
+        );
+    }
+
+    /// 正常路径不得多花请求：必需工具第一次就调了。
+    #[tokio::test]
+    async fn required_tool_already_called_is_not_nudged() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_tool_call_body(
+                            "call_w",
+                            "write",
+                            r#"{"path":"plan.json","content":"{}"}"#,
+                        ),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("完成", "stop"),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "required-tool-ok".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(agent, noop_tool_manager(&["write"]))
+            .with_required_tools(vec!["write".into()]);
+        let out = runner.run_turn(&[Message::user("写计划")], None).await.unwrap();
+        assert_eq!(out, "完成");
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 2, "正常路径不得多花请求: {}", reqs.len());
+        let second = String::from_utf8_lossy(&reqs[1].body).to_string();
+        assert!(!second.contains("没有真正调用工具就结束了"), "{second}");
+    }
+
+    /// `require_tools_any`（OR）：任一候选调过即满足；全没调时把**所有**可用
+    /// 候选都列出来，而不是像 AND 那样点名逼一个。
+    #[tokio::test]
+    async fn require_tools_any_accepts_any_candidate_and_lists_all_when_missing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        // ① 只回文字（一个取证工具都没调）
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("目录骨架如下：", "stop"),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        // ② 被提醒后调 code_graph（OR 组里任一个都算）
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_tool_call_body("call_g", "code_graph", "{}"),
+                    ))
+                    .up_to_n_times(1),
+            )
+            .await;
+        // ③ 收尾
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(
+                        openai_completion_body_with_finish("完成", "stop"),
+                    )),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "required-any".into(),
+            test_role(),
+            vec![model_at(&server, "stub")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new_with_tools(
+            agent,
+            noop_tool_manager(&["read", "search", "code_graph"]),
+        )
+        .with_required_tools_any(vec![
+            "read".into(),
+            "code_graph".into(),
+            "search".into(),
+        ]);
+        let out = runner
+            .run_turn(&[Message::user("出骨架")], None)
+            .await
+            .unwrap();
+        assert_eq!(out, "完成");
+
+        let reqs = server.received_requests().await.expect("mock 应记录请求");
+        assert_eq!(reqs.len(), 3, "一次提醒即可: {}", reqs.len());
+        let second = String::from_utf8_lossy(&reqs[1].body).to_string();
+        // OR 语义要写清楚，否则模型会把三个都调一遍。
+        assert!(
+            second.contains("至少实际调用") && second.contains("任意一个即可"),
+            "OR 组提醒必须说明「任意一个即可」: {second}"
+        );
+        for name in ["read", "code_graph", "search"] {
+            assert!(
+                second.contains(name),
+                "OR 组应列出全部候选（含 {name}）: {second}"
+            );
+        }
+    }
+
+    /// `write` 由 `edit` 满足；拿不到的工具不催；未声明时永不催。
+    /// 与 workflow `check_required_tools` 同一份判据，避免两处口径漂移。
+    #[test]
+    fn missing_required_tools_respects_edit_and_available_tools() {
+        use latte_ai::models::Tool as WireTool;
+
+        let wire = |name: &str| WireTool {
+            name: name.into(),
+            description: None,
+            parameters: serde_json::json!({}),
+            strict: None,
+        };
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_required_tools(vec!["write".into(), "absent".into(), "read".into()]);
+
+        // 什么都没有：只催「拿得到且没调过」的两个；absent 不在 schema 里，不催。
+        runner.last_turn_tool_summaries = vec!["search {\"pattern\":\"x\"} → ok".to_string()];
+        let gap = runner.missing_required_tools(&[wire("write"), wire("read")]);
+        assert_eq!(
+            gap.all_of,
+            vec!["write".to_string(), "read".to_string()],
+            "{gap:?}"
+        );
+        assert!(gap.any_of.is_empty(), "{gap:?}");
+
+        // edit 视同落盘。
+        runner.last_turn_tool_summaries = vec![
+            "edit {\"path\":\"a.json\"} → ok".to_string(),
+            "read {\"path\":\"a.rs\"} → ok".to_string(),
+        ];
+        let gap = runner.missing_required_tools(&[wire("write"), wire("read")]);
+        assert!(gap.is_empty(), "{gap:?}");
+
+        // 空声明：永远不催。
+        let quiet = AgentRunner::new(
+            Agent::new_with_chain(
+                "t".into(),
+                test_role(),
+                vec![test_model()],
+                GenerateParams::default(),
+            )
+            .unwrap(),
+        );
+        assert!(quiet.missing_required_tools(&[wire("write")]).is_empty());
+    }
+
+    /// 短名归一：`tutor.write` 与 `write` 必须命中同一条判据，否则配置里带
+    /// namespace 的 `require_tools` 会静默失效（永不提醒、永不满足）。
+    #[test]
+    fn required_tools_are_normalized_to_short_names() {
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent)
+            .with_required_tools(vec![" tutor.write ".into(), "".into()])
+            .with_required_tools_any(vec!["ns.search".into()]);
+        assert_eq!(runner.required_tools, vec!["write".to_string()]);
+        assert_eq!(runner.required_tools_any, vec!["search".to_string()]);
+
+        runner.last_turn_tool_summaries = vec!["write {\"path\":\"a\"} → ok".to_string()];
+        let gap = runner.missing_required_tools(&[
+            latte_ai::models::Tool {
+                name: "write".into(),
+                description: None,
+                parameters: serde_json::json!({}),
+                strict: None,
+            },
+            latte_ai::models::Tool {
+                name: "search".into(),
+                description: None,
+                parameters: serde_json::json!({}),
+                strict: None,
+            },
+        ]);
+        assert!(
+            gap.all_of.is_empty(),
+            "带 namespace 的 write 应被判为已满足: {gap:?}"
+        );
+        assert_eq!(gap.any_of, vec!["search".to_string()], "{gap:?}");
     }
 
     #[test]

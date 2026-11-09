@@ -11666,6 +11666,17 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                 if let Some(gate) = &inp.advisor_pause {
                     r = r.with_pause_gate(gate.clone());
                 }
+                // 必需工具（require_tools / require_tools_any）交给 runner：模型只回文字
+                // 就收尾时在同一对话里提醒它补调用，而不是等本函数返回后由引擎新开子
+                // 代理从头重做（那样读过的内容全丢、重蹈覆辙）。
+                if let Some(step) = &inp.gate_step {
+                    if !step.require_tools.is_empty() {
+                        r = r.with_required_tools(step.require_tools.clone());
+                    }
+                    if !step.require_tools_any.is_empty() {
+                        r = r.with_required_tools_any(step.require_tools_any.clone());
+                    }
+                }
                 r
             }
         };
@@ -21675,6 +21686,147 @@ task = "汇总 {{{{chapters}}}}"
         assert!(
             fin.contains(&format!("{FAN_OUT_ITEM_FAILED} b")),
             "下游必须看到失败标记: {fin}"
+        );
+    }
+
+    /// workflow 层端到端：step 的 `require_tools = ["write"]` 未满足、模型只回
+    /// 文字时，nudge 必须发生在**同一个 runner 的同一个对话**里。
+    ///
+    /// 与 `agent::tests::text_only_reply_nudges_missing_required_tool_in_same_conversation`
+    /// 的分工：那条验 runner 的判据，这条验**接线**——`run_step_speaker` 有没有把
+    /// `step.require_tools` 真的交给 runner（漏接的话 runner 永远不知道要催，
+    /// 两条单测都不会发现）。判据是第 2 次请求里带着 nudge 文案与第 1 次调用的
+    /// tool 往返，而不是「新开子代理重做」。
+    #[tokio::test]
+    async fn workflow_step_nudges_missing_required_tool_in_same_conversation() {
+        // 模型第一轮调 read（取证），第二轮只回文字（事故形态），
+        // 第三轮在被提醒后补 write。
+        struct Nudgey;
+        impl wiremock::Respond for Nudgey {
+            fn respond(&self, req: &wiremock::Request) -> ResponseTemplate {
+                let body = String::from_utf8_lossy(&req.body).to_string();
+                // 已经出现过提醒文案 → 补 write。
+                let out = if body.contains("没有真正调用工具就结束了") {
+                    serde_json::json!({
+                        "id": "chatcmpl-w",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_w",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write",
+                                        "arguments": "{\"path\":\"out.json\",\"content\":\"{}\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                    })
+                    .to_string()
+                } else if body.contains("call_r") {
+                    // read 的往返已经在上下文里 → 只回文字收尾。
+                    openai_body("锚点已核实，落盘任务条目：")
+                } else {
+                    // 第一轮：取证。
+                    serde_json::json!({
+                        "id": "chatcmpl-r",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": "",
+                                "tool_calls": [{
+                                    "id": "call_r",
+                                    "type": "function",
+                                    "function": { "name": "read", "arguments": "{\"path\":\"a.txt\"}" }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }],
+                        "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+                    })
+                    .to_string()
+                };
+                ResponseTemplate::new(200).set_body_string(out)
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(Nudgey)
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "anchor").unwrap();
+
+        // 角色必须真的带 read/write 工具，否则 runner 认为「拿不到」就不催
+        // （这是刻意的设计：催一个不存在的工具只会让模型编造调用）。
+        let mut config = (*test_config_at(&server.uri())).clone();
+        if let Some(worker) = config.roles.get_mut("worker") {
+            worker.tools = vec!["read".into(), "write".into()];
+        }
+        // `candidates_for` 只认显式映射（per-role → 全局 tier），不做目录兜底，
+        // 所以这里必须写出 worker 的 premium 档指向哪个模型。
+        config.models.tiers = Some(HashMap::from([("premium".into(), "Test Premium".into())]));
+        let config = Arc::new(config);
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "require_tools_nudge"
+[[steps]]
+id = "write_step"
+role = "worker"
+tools = ["read", "write"]
+require_tools = ["write"]
+max_retries = 0
+task = "核实锚点并落盘"
+"#,
+        )
+        .unwrap();
+
+        let (ctx, _rx) = test_ctx_at(config, dir.path().to_path_buf());
+        run_workflow(&wf, "t", &ctx)
+            .await
+            .expect("nudge 补上 write 后本步应当成功（不需要步骤级重试）");
+
+        assert!(
+            dir.path().join("out.json").exists(),
+            "write 必须真的落盘"
+        );
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        let nudged = bodies
+            .iter()
+            .position(|b| b.contains("没有真正调用工具就结束了"))
+            .expect("必须发出过一次补调用提醒");
+        assert!(
+            bodies[nudged].contains("call_r"),
+            "提醒轮必须带着已完成的 read 取证（同会话续跑的全部意义）: {}",
+            bodies[nudged]
+        );
+        // max_retries = 0：若走的是「步骤级重试」而非 nudge，这里会直接失败。
+        assert!(
+            bodies.len() >= 3,
+            "read → 文字 → （提醒）write，至少 3 次模型调用: {}",
+            bodies.len()
         );
     }
 

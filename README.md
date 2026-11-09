@@ -133,6 +133,7 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 | `LATTE_AGENT_STEP_WARN_SECS` | 900 | workflow step 的 `TimeoutWarning` 复发周期：只提醒「这一步跑了很久」，不杀，不超过上面的兜底 |
 | `LATTE_AGENT_REQUEST_BUDGET_SCALE` | 1.0 | **请求次数预算**的全局缩放（钳 `0..=10`，`0` = 关闭）。workflow step 按档位给软预算：`small` 30 / `default` 80（缺省）/ `large` 200，step 上写 `budget = "small"` 或精确的 `max_requests = N`（`0` = 不设）；delegate 按 `large`。到软预算时引擎注入「立即落盘收尾」，到 1.5 倍仍未收尾就强停并降级采纳已有产出。按次数而不是墙钟（对齐 oh-my-pi 的 `SOFT_REQUEST_BUDGET`）：慢但在干活的不误杀，「一直读、从不写」的原地打转被次数抓住 |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
+| `LATTE_AGENT_FORCE_REQUIRED_TOOL` | 关 | workflow step 声明了 `require_tools` / `require_tools_any`、模型却只回文字收尾时，runner 会在**同一对话里**提醒它补调用（保留刚才的回复 + 已完成的工具往返，最多 2 次），而不是让引擎新开子代理从头重做。本开关在第 2 次提醒时把该请求的 `tool_choice` 强制成缺失的工具（OpenAI 传 function 对象、Anthropic 传 `{"type":"tool"}`）。默认**关**：智谱 GLM 等 OpenAI 兼容端点只认 `tool_choice: "auto"`，下发 function 对象会 400 并触发整条模型链 fallback。确认端点支持后再开 |
 | `LATTE_AI_FIRST_EVENT_TIMEOUT_SECS` | 100 | 首 token（TTFB）超时。reasoning 模型思考久，窗口给得宽。模型目录里的 `timeout_secs` **精确覆盖**它（既能放宽也能收紧，用于给已知秒回的模型配快速失败） |
 | `LATTE_AI_IDLE_TIMEOUT_SECS` | 120 | 两个 SSE chunk 之间的最大间隔。只要 token 在流动就不触发，总生成时间无上限。同样被 per-model `timeout_secs` 精确覆盖 |
 | `LATTE_AGENT_AUTO_PAUSE_MAX_RETRIES` | 5 | 模型全链不可用时自动暂停后的退避重试次数上限，用尽转人工（0 = 不自动重试，立刻等人点 ▶） |
