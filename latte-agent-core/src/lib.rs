@@ -140,6 +140,22 @@ pub(crate) mod test_util {
     /// 锁中毒，**所有**用 `.unwrap()` 的测试随即连锁失败，报
     /// `PoisonError { .. }`——把一条真实失败放大成 9 条假失败
     /// （实测 `config::tests` / `advisor_monitor::tests`），真实病因被埋掉。
+    ///
+    /// # 使用约束：**只在同步测试里持锁**
+    ///
+    /// `std::sync::Mutex` 的 guard 不是 `Send`，在 `#[tokio::test]` 里跨
+    /// `.await` 持有它会让整个测试二进制退化成串行；一旦某个 async 测试在
+    /// 持锁期间等待另一个也需要这把锁的测试，就是死锁（实测：给 11 个 async
+    /// 测试加这把锁后，单线程运行直接卡在第一条）。
+    ///
+    /// 所以：**同步测试**（`#[test]`）持锁是安全的；**async 测试**
+    /// （`#[tokio::test]`）不要持锁，改为把"改 env + 读回"收进一个同步
+    /// 作用域里完成，之后再不碰 env。
+    ///
+    /// 已知限制：并行跑全量测试时，少数同时改 `LATTE_HOME` 的 async 测试之间
+    /// 仍可能互相覆盖，表现为**偶发**失败（实测并行 12 条、单线程 5 条）。
+    /// `cargo test -- --test-threads=1` 可以完全消除这类干扰，代价是从
+    /// ~68s 变成 ~165s。
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
