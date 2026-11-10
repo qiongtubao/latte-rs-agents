@@ -2206,6 +2206,9 @@ async fn run_multi_role_loop(
     // 与 ChatController 共享的原始用户诉求句柄（委派返回审查的准绳）。
     last_user_input: Arc<parking_lot::Mutex<String>>,
 ) {
+    // 子代理用量累加器：delegate 的消耗回流到这里。discuss 路径没有 goal
+    // 账本，但 session 预算仍然要看得见这部分开销。
+    let subagent_usage = Arc::new(SubagentUsageMeter::default());
     let repo_root = match WorkspaceManager::resolve_repo_root(&config.cwd) {
         Ok(root) => root,
         Err(e) => {
@@ -2387,6 +2390,9 @@ async fn run_multi_role_loop(
             plan_mode.load(Ordering::SeqCst),
             agent_pause_gate.clone(),
             config.stream_mode.clone(),
+            // discuss 路径的完成契约是轮次 + Supervisor 预算，不记 goal 账；
+            // 但专用计量器仍要传（delegate 可能在此路径被调用）。
+            Arc::clone(&subagent_usage),
         )
         .await
         {
@@ -2997,6 +3003,10 @@ async fn run_single_role_loop(
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     last_user_input: Arc<parking_lot::Mutex<String>>,
 ) {
+    // 子代理用量累加器：delegate 的消耗回流到这里，供下面的
+    // session 预算与 goal token 账本读取（两者都按 runner 的
+    // total_usage 增量计费，看不见子会话）。
+    let subagent_usage = Arc::new(SubagentUsageMeter::default());
     let merged = &config.agent_config;
     let resolver = &config.model_resolver;
     let default_params = &config.default_params;
@@ -3038,6 +3048,7 @@ async fn run_single_role_loop(
         plan_mode.load(Ordering::SeqCst),
         agent_pause_gate.clone(),
         config.stream_mode.clone(),
+        Arc::clone(&subagent_usage),
     )
     .await
     {
@@ -3407,7 +3418,7 @@ async fn run_single_role_loop(
                                                 continue;
                                             };
                                             let history: Vec<Message> = runner.context().messages().to_vec();
-                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                            match build_runner(merged, resolver, default_params, new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone(), Arc::clone(&subagent_usage)).await {
                                                 Ok((mut new_runner, rid)) => {
                                                     for m in history { new_runner.context_mut().push(m); }
                                                     runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3429,7 +3440,7 @@ async fn run_single_role_loop(
                                                 Ok(new_tier) => {
                                                     let role = current_role.clone();
                                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                                    match build_runner(merged, resolver, default_params, &role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone(), Arc::clone(&subagent_usage)).await {
                                                         Ok((mut new_runner, _)) => {
                                                             for m in history { new_runner.context_mut().push(m); }
                                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3682,7 +3693,7 @@ async fn run_single_role_loop(
                                 let mode_now = plan_mode.load(Ordering::SeqCst);
                                 if mode_now != runner_plan_mode {
                                     let history: Vec<Message> = runner.context().messages().to_vec();
-                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), mode_now, agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                    match build_runner(merged, resolver, default_params, &current_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), mode_now, agent_pause_gate.clone(), config.stream_mode.clone(), Arc::clone(&subagent_usage)).await {
                                         Ok((mut new_runner, _)) => {
                                             for m in history { new_runner.context_mut().push(m); }
                                             runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3742,6 +3753,15 @@ async fn run_single_role_loop(
                                     Ok(response) => {
                                         let mid = runner.agent().model_chain.first().map(|mc| mc.model.id.clone()).unwrap_or_else(|| "?".into());
                                         let ico = merged.roles.get(&current_role).map(|r| r.icon.clone()).unwrap_or_else(|| role_icon(&current_role));
+                                        // 子代理（delegate / workflow step）的消耗
+                                        // 落在各自的 runner 上，manager 的
+                                        // `total_usage` 看不见——不并进来，
+                                        // 下面的 session 预算与 goal 账本都会
+                                        // 系统性漏算（实测 jemalloc ui-95227：
+                                        // 真实 1.03M token，goal 账本记 0）。
+                                        if let Some(sub) = subagent_usage.take() {
+                                            runner.absorb_usage(&sub);
+                                        }
                                         let usage_after = runner.total_usage();
                                         let in_delta = usage_after.input_tokens - usage_before.input_tokens;
                                         let out_delta = usage_after.output_tokens - usage_before.output_tokens;
@@ -3971,7 +3991,7 @@ async fn run_single_role_loop(
                                     continue;
                                 }
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &new_role, current_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone(), Arc::clone(&subagent_usage)).await {
                                     Ok((mut new_runner, rid)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -3986,7 +4006,7 @@ async fn run_single_role_loop(
                             }
                             Some(ControllerInput::SwitchModel(new_tier)) => {
                                 let history: Vec<Message> = runner.context().messages().to_vec();
-                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone()).await {
+                                match build_runner(merged, resolver, default_params, &current_role, new_tier, current_primary.as_deref(), event_tx, &config.cwd, config.subsession_store.clone(), &config.session_id, cancel_flag.clone(), turn_cancel_flag.clone(), last_user_input.clone(), config.advisor_monitor.runner_gate(), advisor_pause.clone(), &plan_stage, &todo_state, Some(&goal_state), plan_mode.load(Ordering::SeqCst), agent_pause_gate.clone(), config.stream_mode.clone(), Arc::clone(&subagent_usage)).await {
                                     Ok((mut new_runner, _)) => {
                                         for m in history { new_runner.context_mut().push(m); }
                                         runner = attach_pause_gate(new_runner.with_advisor_hints(advisor_hints.clone()));
@@ -4079,6 +4099,9 @@ async fn build_runner(
     plan_mode: bool,
     agent_pause_gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     stream_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // 子代理用量累加器：delegate / workflow 的消耗回流到这里，供上层的
+    // session 预算与 goal token 账本读取。见 [`SubagentUsageMeter`]。
+    subagent_usage: Arc<SubagentUsageMeter>,
 ) -> AgentResult<(AgentRunner, String)> {
     // ControllerConfig.session_id is the authoritative UI tab id. Bind its
     // deterministic transcript; never enumerate ui-sessions or choose latest.
@@ -4229,6 +4252,7 @@ async fn build_runner(
                 main_topic.clone(),
                 // 顶层 manager 的委派深度。
                 0,
+                subagent_usage.clone(),
             )
             .await
             .map_err(|e| AgentError::Tool(format!("register delegate: {e}")))?;
@@ -9397,6 +9421,7 @@ fn register_delegate_tool_boxed<'a>(
     max_delegates: u32,
     main_topic: Arc<parking_lot::Mutex<String>>,
     depth: u8,
+    subagent_usage: Arc<SubagentUsageMeter>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
     Box::pin(register_delegate_tool(
         tm,
@@ -9416,6 +9441,7 @@ fn register_delegate_tool_boxed<'a>(
         max_delegates,
         main_topic,
         depth,
+        subagent_usage,
     ))
 }
 
@@ -9453,6 +9479,11 @@ async fn register_delegate_tool(
     // specialist = 1，以此类推。handler 里递归注册子级 delegate 时 +1，
     // 深度门见 [`max_delegate_depth`]。
     depth: u8,
+    // 子代理真实消耗的累加器。manager 的 `total_usage` 看不见子会话里的
+    // token，上层按 usage 增量计费的账（session 预算 / goal token 账本）
+    // 会整块漏掉这部分开销——实测 jemalloc ui-95227 真实 1.03M token，
+    // goal 账本记 0。见 [`SubagentUsageMeter`]。
+    subagent_usage: Arc<SubagentUsageMeter>,
 ) -> Result<(), String> {
     use latte_rs_agent_tools::types::{SchemaType, SharedToolHandler, Tool};
     use tokio::sync::Semaphore;
@@ -9558,6 +9589,9 @@ async fn register_delegate_tool(
         let child_depth = depth.saturating_add(1);
         // 主会话诉求句柄：每次 invocation 现读（它每轮都变）。
         let main_topic = Arc::clone(&main_topic);
+        // 子代理用量累加器同理：`async move` 会拿走所有权，而 handler 可被
+        // 多次调用，所以显式再 clone 一份进来。
+        let subagent_usage = Arc::clone(&subagent_usage);
         Box::pin(async move {
             let tool_err = |msg: String| latte_rs_agent_tools::error::ToolError::Other(msg);
 
@@ -9769,6 +9803,7 @@ async fn register_delegate_tool(
                         max_delegates,
                         Arc::clone(&main_topic),
                         child_depth,
+                        Arc::clone(&subagent_usage),
                     )
                     .await
                     .map_err(|e| tool_err(format!("register delegate for '{role_id}': {e}")))?;
@@ -10150,7 +10185,9 @@ async fn register_delegate_tool(
                     // 失败时 sub_sink 中的 trace 在 TurnEnd 前就断了（agent.chat?.await
                     // 提前返回），导致右键「查看日志」看不到失败原因。
                     // 这里写入 TurnEnd 作为 trace 终点事件，让子会话日志有明确结尾。
-                    let usage = specialist_usage.unwrap_or_default();
+                    // 只借用：上面已经 `subagent_usage.add()` 记了账，
+                    // 这里 move 会让后面的回流逻辑拿不到值。
+                    let usage = specialist_usage.clone().unwrap_or_default();
                     sub_sink.emit(crate::trace::TraceEvent::TurnEnd {
                         meta: crate::trace::TraceMeta::now(0, &role_id, &session_id),
                         total_input: usage.input_tokens,
@@ -10177,6 +10214,14 @@ async fn register_delegate_tool(
             }
 
             // 7. Emit DelegateFinished and return result.
+            //
+            // 先把子代理真实用量记进账：manager 的 `total_usage` 看不见子
+            // 会话，不在这里回流，上层（session 预算 / goal token 账本）
+            // 就永远不知道这步花了多少钱。成功/失败都记——失败的调用
+            // 一样烧 token。
+            if let Some(usage) = specialist_usage.as_ref() {
+                subagent_usage.add(usage);
+            }
             match run_result {
                 Ok(response) => {
                     let _ = event_tx.send(ChatEvent::DelegateFinished {
@@ -10228,6 +10273,63 @@ async fn register_delegate_tool(
 /// `latte-agent-core` implements its own tiny engine (see
 /// `crate::workflow`) instead of reusing `latte-agent-orchestrator`,
 /// because the orchestrator depends on core — a dependency cycle.
+/// 子代理（delegate / workflow step）真实 token 消耗的累加器。
+///
+/// # 为什么必须有它
+///
+/// 一个 turn 的 `runner.total_usage()` 只统计**这个 runner 自己**发起的
+/// 模型调用。delegate 与 workflow step 都是独立 subagent（自己的 runner、
+/// 自己的模型链），它们的用量落在各自的 runner 上，manager 的账本一无所知。
+///
+/// 于是所有按 `usage_after - usage_before` 计费的上层账目都系统性偏低：
+/// session token 预算、goal 的 `tokens_used`。实测 jemalloc ui-95227
+/// （2026-11-10）：真实消耗 1,031,144 输入 / 34,247 输出，其中
+/// 1,020,008 输入发生在子会话（programmer 的 investigate 步 758,076 +
+/// manager 自身 261,932 之外的部分），而 `goal.tokens_used` 记的是 **0**
+/// —— 照这样「目标 token 预算」永远不会触发，等于没有。
+///
+/// 设计上刻意做成「只加不减的计数器」而不是逐条 usage 记录：调用方只关心
+/// 增量，重复消费一次也不会算错第二次（每次 take 即清零）。
+#[derive(Debug, Default)]
+pub(crate) struct SubagentUsageMeter {
+    input: std::sync::atomic::AtomicU64,
+    output: std::sync::atomic::AtomicU64,
+    thinking: std::sync::atomic::AtomicU64,
+}
+
+impl SubagentUsageMeter {
+    pub(crate) fn add(&self, usage: &latte_ai::models::TokenUsage) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.input
+            .fetch_add(u64::from(usage.input_tokens), Relaxed);
+        self.output
+            .fetch_add(u64::from(usage.output_tokens), Relaxed);
+        self.thinking
+            .fetch_add(u64::from(usage.thinking_tokens), Relaxed);
+    }
+
+    /// 取走累计值并**清零**。返回 `None` 表示自上次以来没有任何子代理消耗
+    /// （调用方据此跳过记账，避免发一堆零增量）。
+    pub(crate) fn take(&self) -> Option<latte_ai::models::TokenUsage> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let input = self.input.swap(0, Relaxed);
+        let output = self.output.swap(0, Relaxed);
+        let thinking = self.thinking.swap(0, Relaxed);
+        if input == 0 && output == 0 && thinking == 0 {
+            return None;
+        }
+        Some(latte_ai::models::TokenUsage {
+            input_tokens: input.min(u64::from(u32::MAX)) as u32,
+            output_tokens: output.min(u64::from(u32::MAX)) as u32,
+            thinking_tokens: thinking.min(u64::from(u32::MAX)) as u32,
+            // 缓存明细不进账本（记账口径已经扣 cache_read），这里不回填
+            // 以免让「命中缓存 = 更贵」这种反直觉的读法成立。
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        })
+    }
+}
+
 static WORKFLOW_START_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_workflow_start_id(name: &str) -> String {
@@ -12280,6 +12382,7 @@ mod tests {
                 false,
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(SubagentUsageMeter::default()),
             )
             .await
             .expect("build_runner");
@@ -12458,6 +12561,7 @@ mod tests {
                     plan_mode,
                     crate::pause_gate::AgentPauseGate::new("test"),
                     Arc::new(AtomicBool::new(false)),
+                    Arc::new(SubagentUsageMeter::default()),
                 )
                 .await
                 .expect("build_runner")
@@ -13591,6 +13695,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
             // 顶层深度：测试里注册的就是 manager 那一层。
             0,
+            Arc::new(SubagentUsageMeter::default()),
         )
         .await
         .expect("register delegate");
@@ -13828,6 +13933,7 @@ mod tests {
             0,
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
             0,
+            Arc::new(SubagentUsageMeter::default()),
         )
         .await
         .expect("register delegate");
@@ -13893,6 +13999,7 @@ mod tests {
             0,
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
             0,
+            Arc::new(SubagentUsageMeter::default()),
         )
         .await
         .expect("register delegate");
@@ -13988,6 +14095,7 @@ mod tests {
                 false,
                 crate::pause_gate::AgentPauseGate::new("test"),
                 Arc::new(AtomicBool::new(false)),
+                Arc::new(SubagentUsageMeter::default()),
             )
             .await
             .expect("build_runner");
@@ -14699,6 +14807,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
             // 顶层深度：测试里注册的就是 manager 那一层。
             0,
+            Arc::new(SubagentUsageMeter::default()),
         )
         .await
         .expect("register delegate");
@@ -14849,6 +14958,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
             // 顶层深度：测试里注册的就是 manager 那一层。
             0,
+            Arc::new(SubagentUsageMeter::default()),
         )
         .await
         .expect("register delegate");
@@ -18122,6 +18232,63 @@ require = ["永远不可能出现的验收字符串"]
     /// 用真实工具执行验证；delegate 的 handler 闭包要真跑需整套模型
     /// mock，这里用源码钉扎防「漏接/改丢」（与
     /// `cli_registers_every_orchestration_tool_the_ui_does` 同款判据）。
+    /// 子代理用量必须能回流到上层账本。
+    ///
+    /// 实测事故（jemalloc ui-95227）：真实消耗 1,031,144 输入 / 34,247 输出，
+    /// 其中绝大部分发生在 delegate / workflow 的独立 runner 上，而
+    /// `goal.tokens_used` 记的是 **0** —— 上层的 token 账本对子代理完全
+    /// 失明，预算永远不会触发。
+    #[test]
+    fn subagent_usage_meter_accumulates_and_is_drained_once() {
+        let meter = SubagentUsageMeter::default();
+        assert!(meter.take().is_none(), "没有消耗时不该产生零增量记账");
+
+        let usage = |i: u32, o: u32, t: u32| latte_ai::models::TokenUsage {
+            input_tokens: i,
+            output_tokens: o,
+            thinking_tokens: t,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        };
+        meter.add(&usage(100, 10, 2));
+        meter.add(&usage(50, 5, 0));
+
+        let got = meter.take().expect("两次累加后应有一次增量");
+        assert_eq!(got.input_tokens, 150, "多次派发必须累加");
+        assert_eq!(got.output_tokens, 15);
+        assert_eq!(got.thinking_tokens, 2);
+
+        // 取走即清零：否则下一轮会把同一笔消耗重复记进 goal / session 预算。
+        assert!(meter.take().is_none(), "take 之后必须清零");
+    }
+
+    /// delegate 成功与失败都要回流：失败同样烧 token。
+    #[test]
+    fn delegate_path_meters_usage_on_both_outcomes() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/controller.rs"),
+        )
+        .expect("controller.rs");
+        let src = src.split("#[cfg(test)]").next().expect("非测试部分");
+        let body = src
+            .split("async fn register_delegate_tool(")
+            .nth(1)
+            .expect("register_delegate_tool 应存在");
+        let body = body.split("\n/// ").next().unwrap_or(body);
+        assert!(
+            body.contains("subagent_usage.add(usage)"),
+            "delegate 必须在返回前把 specialist 用量记进账"
+        );
+        // 记账点必须在 match run_result 之前——否则失败分支会提前 return，
+        // 那部分 token 就漏了。
+        let add_at = body.find("subagent_usage.add(usage)").expect("记账点");
+        let match_at = body.find("match run_result").expect("return 分支");
+        assert!(
+            add_at < match_at,
+            "记账必须发生在结果分支之前（成功/失败都要记）"
+        );
+    }
+
     #[test]
     fn delegate_path_wires_stateful_todo_for_specialists() {
         let src = std::fs::read_to_string(

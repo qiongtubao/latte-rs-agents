@@ -12539,6 +12539,23 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                         );
                         continue;
                     }
+                    // 会话处于暂停（用户在等人处理鉴权/余额，或按了 ⏸）时
+                    // 不发 TimeoutWarning：那不是「它卡住了」，是「它在等你」。
+                    // 实测事故（jemalloc ui-95227）：programmer 04:41:06 因
+                    // glm-5.3 鉴权 401 暂停，15 分钟后照发 900s 超时提醒，
+                    // 用户被引向「终止任务」，而正确答案是去修 API key。
+                    // 计时器顺延，暂停结束后重新按 timeout_s 起算。
+                    if inp
+                        .agent_pause_gate
+                        .as_ref()
+                        .is_some_and(|g| g.is_paused())
+                    {
+                        timeout.as_mut().reset(
+                            tokio::time::Instant::now()
+                                + std::time::Duration::from_secs(timeout_s),
+                        );
+                        continue;
+                    }
                     // 发 TimeoutWarning，让 UI 弹「继续等待 / 终止当前任务」。
                     // 这条提醒本身不硬杀；真实硬兜底是 step_timeout_s 对应
                     // 的 runner deadline。常规收手优先由请求预算、三元组

@@ -1416,7 +1416,13 @@ pub struct AgentRunner {
     /// 循环内 deadline（对齐 oh-my-pi）：绝对墙钟时刻。每个 model call
     /// 前检查：超时时优雅退出、返回 partial 产出，而不是被外层 tokio
     /// timeout abort（后者会丢失所有未 flush 的 partial 文本）。
-    deadline: Option<std::time::Instant>,
+    ///
+    /// **暂停期间不算时间**：检查点按 start + elapsed − paused 判定，而不是
+    /// 直接比 `Instant::now()`。实测事故（jemalloc ui-95227）：programmer
+    /// 04:41:06 因 glm-5.3 鉴权 401 整会话暂停，人还没处理，15 分钟后
+    /// 照样弹出 `TimeoutWarning`（900s）——用户看到的是「它卡住了」，
+    /// 真相是「它在等你」，而且再等下去会撞 3h 硬上限把整步判死。
+    deadline: Option<Deadline>,
     /// 单个 turn 的模型请求次数预算（软上限）。见 [`AgentRunner::set_request_budget`]。
     request_budget: Option<usize>,
     /// 单个 turn 最多允许启动多少个模型发出的工具调用。检查发生在整批
@@ -1770,6 +1776,64 @@ pub(crate) fn completion_usage(completion: &Completion) -> u64 {
     u64::from(completion.usage.input_tokens)
         .saturating_add(u64::from(completion.usage.output_tokens))
         .saturating_add(u64::from(completion.usage.thinking_tokens))
+}
+
+/// 一个「暂停期间不流逝」的墙钟截止时刻。
+///
+/// 直接比 `Instant::now() >= deadline` 会把用户主动暂停的时间也算成
+/// 干活时间。实测事故（jemalloc ui-95227）：programmer 04:41:06 因鉴权
+/// 401 整会话暂停，15 分钟后照发 `TimeoutWarning`（900s），而未处理的
+/// 暂停再持续下去会撞 3h 硬上限，把一行都没跑过的 step 判死。
+///
+/// 语义：`start + (已流逝 − 已暂停) >= 预算` 才算到期。暂停时长由
+/// [`crate::pause_gate::AgentPauseGate::total_paused`] 提供（它跨多次
+/// pause/resume 累加，且在暂停进行中也能现算出已停多久）。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline {
+    /// 设 deadline 那一刻的墙钟参照点。
+    set_at: std::time::Instant,
+    /// 允许「干活」的时长。
+    budget: std::time::Duration,
+    /// 设 deadline 时 gate 已经累计的暂停量。只扣**此后**新增的部分，
+    /// 否则早先别的 step 停过的时间会平白送本 step 额外额度。
+    paused_baseline: std::time::Duration,
+}
+
+impl Deadline {
+    pub(crate) fn new(absolute: std::time::Instant) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            set_at: now,
+            budget: absolute.saturating_duration_since(now),
+            paused_baseline: std::time::Duration::ZERO,
+        }
+    }
+
+    /// 绑定暂停门的基线。runner 装 gate 之后调用，让「本 step 之前就
+    /// 累积的暂停量」不被算进来。
+    pub(crate) fn with_pause_baseline(mut self, gate: &crate::pause_gate::AgentPauseGate) -> Self {
+        self.paused_baseline = gate.total_paused();
+        self
+    }
+
+    /// 已「真正干活」的时长：墙钟流逝减去暂停。
+    fn worked(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> std::time::Duration {
+        let elapsed = self.set_at.elapsed();
+        let paused = gate
+            .map(|g| g.total_paused().saturating_sub(self.paused_baseline))
+            .unwrap_or_default()
+            .min(elapsed);
+        elapsed.saturating_sub(paused)
+    }
+
+    pub(crate) fn expired(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> bool {
+        self.worked(gate) >= self.budget
+    }
+
+    /// 剩余「干活」时长；已到期返回 0。
+    pub(crate) fn remaining(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> std::time::Duration {
+        self.budget.saturating_sub(self.worked(gate))
+    }
 }
 
 /// 请求预算硬上限：软预算的 1.5 倍（软预算时已提示收尾，再给一半余量收尾）。
@@ -3407,6 +3471,11 @@ impl AgentRunner {
         mut self,
         gate: std::sync::Arc<crate::pause_gate::AgentPauseGate>,
     ) -> Self {
+        // 给已有 deadline 记下「此刻之前累积的暂停量」作为基线：只扣此后
+        // 新增的暂停，早先别的 step 停过的时间不能白送本 step 额度。
+        if let Some(dl) = self.deadline {
+            self.deadline = Some(dl.with_pause_baseline(&gate));
+        }
         self.agent_pause_gate = Some(gate);
         self
     }
@@ -4331,7 +4400,7 @@ impl AgentRunner {
     }
 
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
-        self.deadline = Some(deadline);
+        self.deadline = Some(Deadline::new(deadline));
     }
 
     /// Get a reference to the agent.
@@ -4516,6 +4585,41 @@ impl AgentRunner {
     /// Total token usage accumulated so far.
     pub fn total_usage(&self) -> &TokenUsage {
         &self.total_usage
+    }
+
+    /// 把**别处**产生的用量并进本 runner 的累计值。
+    ///
+    /// 存在的理由：delegate / workflow 的消耗发生在独立 subagent 里，
+    /// 它们的 usage 落到自己的 runner 上，manager 的 `total_usage`
+    /// 一无所知。后果是上层所有按 `usage_after - usage_before` 计费的
+    /// 地方（session 预算、goal 的 token 账本）都**看不见**这部分开销：
+    /// 实测 jemalloc ui-95227 真实烧了 1,031,144 输入 token，其中
+    /// 1,020,008 在子会话里，而 goal 账本记的是 0——照这样「目标 token
+    /// 预算」永远不会触发。
+    ///
+    /// 只叠加不回补 `cache_*` 的语义偏差：这里是纯累加，调用方负责传
+    /// **增量**而不是累计值（同 `Supervisor::observe` 的约定）。
+    pub(crate) fn absorb_usage(&mut self, usage: &TokenUsage) {
+        self.total_usage.input_tokens = self
+            .total_usage
+            .input_tokens
+            .saturating_add(usage.input_tokens);
+        self.total_usage.output_tokens = self
+            .total_usage
+            .output_tokens
+            .saturating_add(usage.output_tokens);
+        self.total_usage.thinking_tokens = self
+            .total_usage
+            .thinking_tokens
+            .saturating_add(usage.thinking_tokens);
+        self.total_usage.cache_read_tokens = self
+            .total_usage
+            .cache_read_tokens
+            .saturating_add(usage.cache_read_tokens);
+        self.total_usage.cache_write_tokens = self
+            .total_usage
+            .cache_write_tokens
+            .saturating_add(usage.cache_write_tokens);
     }
 
     /// Emit a `SessionStart` trace event. Call once at session
@@ -4840,7 +4944,7 @@ impl AgentRunner {
             // Deadline 检查（对齐 oh-my-pi `isDeadlineExceeded`）：
             // 每个 model call 前检查，超时时优雅退出、返回已有 partial。
             if let Some(dl) = self.deadline {
-                if std::time::Instant::now() >= dl {
+                if dl.expired(self.agent_pause_gate.as_deref()) {
                     tracing::info!(
                         round,
                         "deadline exceeded, returning partial output or error"
@@ -9884,6 +9988,65 @@ mod tests {
             "应在 ~5 轮内熔断，实际发了 {n} 次 model call"
         );
     }
+
+    /// 暂停期间 deadline 不流逝。
+    ///
+    /// 实测事故（jemalloc ui-95227）：programmer 04:41:06 因 glm-5.3 鉴权
+    /// 401 整会话暂停，人还没修 key，900s 后照发 TimeoutWarning；再等下去
+    /// 会撞 3h 硬上限，把一行都没跑过的 step 判死。用户看到「它卡住了」，
+    /// 真相是「它在等你」。
+    #[tokio::test]
+    async fn deadline_does_not_consume_paused_time() {
+        let gate = crate::pause_gate::AgentPauseGate::new("test");
+        let mut dl = Deadline::new(std::time::Instant::now() + std::time::Duration::from_millis(120));
+        dl = dl.with_pause_baseline(&gate);
+
+        gate.pause_with_reason("鉴权失败，等用户修 key");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !dl.expired(Some(&gate)),
+            "暂停中不得判定超时：worked={:?}",
+            dl.worked(Some(&gate))
+        );
+        assert!(
+            dl.remaining(Some(&gate)) >= std::time::Duration::from_millis(100),
+            "暂停的时间不该吃掉预算"
+        );
+
+        // 恢复后剩余预算照常流逝：给足 120ms 就必须到期。
+        gate.resume();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(dl.expired(Some(&gate)), "恢复后应正常到期");
+        assert_eq!(dl.remaining(Some(&gate)), std::time::Duration::ZERO);
+    }
+
+    /// 暂停基线只扣**此刻之后**新增的暂停：别的时间线的暂停不能白送额度。
+    #[test]
+    fn deadline_baseline_ignores_pauses_before_it_was_set() {
+        let gate = crate::pause_gate::AgentPauseGate::new("test");
+        gate.pause_with_reason("早先的暂停");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        gate.resume();
+
+        let dl = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(60))
+            .with_pause_baseline(&gate);
+        // 基线已吸收上面那 60ms，worked 应从 ~0 起算。
+        assert!(
+            dl.worked(Some(&gate)) < std::time::Duration::from_millis(30),
+            "历史暂停不该算进本 step 的已用时间：{:?}",
+            dl.worked(Some(&gate))
+        );
+    }
+
+    /// 没装 gate 时退化成纯墙钟——旧行为不能因为新字段而消失。
+    #[test]
+    fn deadline_without_gate_is_plain_wall_clock() {
+        let dl = Deadline::new(std::time::Instant::now());
+        assert!(dl.expired(None), "已过期的 deadline 必须立即到期");
+        let future = Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert!(!future.expired(None));
+    }
+
     #[tokio::test]
     async fn run_turn_returns_deadline_exceeded_when_deadline_hit_with_empty_response() {
         use latte_rs_agent_tools::prelude::create_tool_manager;
