@@ -8,6 +8,15 @@ pub type AgentResult<T> = std::result::Result<T, AgentError>;
 /// `ToolLoopDetected` 的 Display 后缀：只报 partial 的规模，不把
 /// 正文塞进错误串（错误串会被回填给模型/上报给 manager，正文另有降级
 /// 采纳路径，见 `workflow.rs` 的 partial 降级分支）。
+/// 标注 `budget` 是「分派准入线」而不是 workflow 硬上限。
+fn fmt_dispatch_ceiling(dispatch_ceiling: bool) -> String {
+    if dispatch_ceiling {
+        "（首次分派准入线，已为校验返修预留额度；不是 workflow 硬上限）".to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn fmt_partial(partial: &str) -> String {
     if partial.trim().is_empty() {
         return String::new();
@@ -63,13 +72,26 @@ pub enum AgentError {
 
     /// Shared run/session token budget exceeded. All runners attached to the
     /// same meter stop before their next model request.
+    ///
+    /// `used` 是**这一发请求的估算落点**（已用量 + 在途预占 + 本请求估算），
+    /// 不是「已花掉多少」；`budget` 是撞到的那条线——可能是 workflow 硬上限，
+    /// 也可能是首次分派留了返修额度后的准入 ceiling。两者的区别要写进文案：
+    /// 实测 `已用完（764742/800000）` 里 800000 其实是
+    /// `1,000,000 × (1 − 20% 返修预留)` 的分派 ceiling，而用户按它当成
+    /// 「1M 预算还剩 35K」，读不出该调哪个旋钮。
     #[error(
-        "token budget exceeded: used {used}, budget {budget}{}",
+        "token budget exceeded: this request would reach {used}, limit {budget}{}{}",
+        fmt_dispatch_ceiling(*dispatch_ceiling),
         fmt_partial(partial)
     )]
     TokenBudgetExceeded {
         used: u64,
         budget: u64,
+        /// `budget` 是「首次分派准入线」而非 workflow 硬上限。
+        ///
+        /// 两者同形不同源：准入线 = `硬上限 × (1 − 返修预留比例)`。不标出来，
+        /// 用户会把 800000 当成 1M 预算的剩余量（实测事故就是这样）。
+        dispatch_ceiling: bool,
         partial: String,
     },
 
@@ -173,4 +195,63 @@ pub enum AgentError {
     /// `ChatEvent::AdvisorTerminated` 让用户看到原因并继续对话。
     #[error("advisor terminated: {reason} (detector: {detector})")]
     AdvisorTerminated { reason: String, detector: String },
+}
+
+#[cfg(test)]
+mod budget_message_tests {
+    use super::*;
+
+    /// 报错必须让人分得清「撞的是哪条线」。
+    ///
+    /// 实测事故原文是 `已用完（764742/800000）`：800000 其实是
+    /// `1,000,000 × (1 − 20% 返修预留)` 的**首次分派准入线**，而用户按
+    /// 它读成「1M 预算还剩 35K」，既算不出还剩多少，也不知道该调
+    /// `workflow_limit` 还是该缩小取证范围。
+    #[test]
+    fn dispatch_ceiling_is_labelled_distinctly_from_hard_limit() {
+        let ceiling_hit = AgentError::TokenBudgetExceeded {
+            used: 764_742,
+            budget: 800_000,
+            dispatch_ceiling: true,
+            partial: String::new(),
+        };
+        let text = ceiling_hit.to_string();
+        assert!(text.contains("764742"), "{text}");
+        assert!(text.contains("800000"), "{text}");
+        assert!(
+            text.contains("首次分派准入线"),
+            "必须点明这是准入线：{text}"
+        );
+        assert!(
+            text.contains("不是 workflow 硬上限"),
+            "必须排除「这就是总预算」的误读：{text}"
+        );
+
+        let hard_hit = AgentError::TokenBudgetExceeded {
+            used: 1_000_100,
+            budget: 1_000_000,
+            dispatch_ceiling: false,
+            partial: String::new(),
+        };
+        let text = hard_hit.to_string();
+        assert!(
+            !text.contains("准入线"),
+            "撞的是硬上限时不该冒充准入线：{text}"
+        );
+        assert!(text.contains("1000000"), "{text}");
+    }
+
+    /// 有 partial 时仍要带出「可降级采纳」提示——这是整步不被判死的依据。
+    #[test]
+    fn partial_hint_survives_the_ceiling_label() {
+        let err = AgentError::TokenBudgetExceeded {
+            used: 900,
+            budget: 800,
+            dispatch_ceiling: true,
+            partial: "已经写好的结论".into(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("首次分派准入线"), "{text}");
+        assert!(text.contains("可降级采纳"), "partial 提示丢了：{text}");
+    }
 }

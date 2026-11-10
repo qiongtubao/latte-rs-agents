@@ -12360,14 +12360,24 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                             if let crate::error::AgentError::TokenBudgetExceeded {
                                 used,
                                 budget,
+                                dispatch_ceiling,
                                 partial,
                             } = &e
                             {
+                                // 文案必须区分「分派准入线」与「workflow 硬上限」：
+                                // 前者 = 硬上限 × (1 − 返修预留)，把它说成「预算已用完」
+                                // 会让人对着 764742/800000 读不出该调哪个旋钮（实测事故
+                                // 原文就是这么误导的）。
+                                let limit_kind = if *dispatch_ceiling {
+                                    "首次分派准入线（已为校验返修预留额度，不是 workflow 硬上限）"
+                                } else {
+                                    "workflow 硬上限"
+                                };
                                 if let Some((notice, adopted)) = degrade_partial_on_break(
                                     &speaker,
                                     &inp.step_id,
                                     &format!(
-                                        "workflow 共享 token 预算用完（{used}/{budget}）"
+                                        "workflow 共享 token 预算用完（本发请求估算落点 {used}，{limit_kind} {budget}）"
                                     ),
                                     partial,
                                 ) {

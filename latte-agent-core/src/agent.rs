@@ -1591,7 +1591,8 @@ fn short_tool_name(name: &str) -> &str {
 /// 请求发出前的 prompt 估算 + 事后用量。一旦估算偏低或单步取证过重，
 /// 它就会在「模型还在干活、产出尚未落盘」时把整步判死——实测 jemalloc
 /// `wf-learn-1794286593148353`：investigate 步 31 次调用烧掉 764,742 token，
-/// 第 32 次准入被 800,000 的分派上限拒掉，31 次回复全为空（只在调工具），
+/// 第 32 次准入撞上 800,000 的**首次分派准入线**（硬上限 × 0.8，不是总预算），
+/// 31 次回复全为空（只在调工具），
 /// 无 partial 可降级采纳 → 整步失败、62 条工具结果全部作废。结构性失控
 /// 本该由 `max_requests` / `max_tool_calls` 这类**廉价精确**信号先抓，
 /// 用钱当唯一刹车必然既漏又误杀。所以默认关掉拦截，只留账本。
@@ -1681,6 +1682,9 @@ impl SharedTokenBudget {
             // 估算放不进剩余额度」，而 used 往往还明显小于 ceiling。
             // 实测报错 `已用完（764742/800000）` 就自相矛盾——用户按数字
             // 算得出「还剩 35K」，却被告知预算已用完，无从判断该调哪个旋钮。
+            // （800000 本身不是 1M 总上限，而是 attempt_ceiling 留了 20%
+            // 返修额度后的准入线；这层区别由 TokenBudgetExceeded 的
+            // dispatch_ceiling 字段在文案里点明。）
             return Err((projected, ceiling));
         }
         state.reserved = state.reserved.saturating_add(tokens);
@@ -5814,9 +5818,20 @@ impl AgentRunner {
         // 正文多半是工具循环中途的过程旁白，不是结论。也不入 context——
         // 这个 turn 没有收尾，不该留下一条假装收尾的 assistant 消息。
         if let Some((used, budget)) = shared_budget_hit {
+            // 撞的是「首次分派准入线」还是「workflow 硬上限」，用户要能一眼
+            // 分开：准入线 = 硬上限 × (1 − 返修预留)，把前者当后者读就会算成
+            // 「还剩 35K 却说用完」（实测事故原文 `764742/800000`）。
+            let dispatch_ceiling = self
+                .shared_token_budget_ceiling
+                .is_some_and(|ceiling| {
+                    self.shared_token_budget
+                        .as_ref()
+                        .is_some_and(|meter| ceiling < meter.budget())
+                });
             return Err(AgentError::TokenBudgetExceeded {
                 used,
                 budget,
+                dispatch_ceiling,
                 partial: last_substantive_response,
             });
         }
