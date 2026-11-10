@@ -11127,10 +11127,7 @@ mod tests {
     /// workflow 只要写了落点就自动进表。
     #[test]
     fn workflow_hint_builds_landing_index() {
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let guard = crate::test_util::env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("LATTE_HOME");
@@ -11250,10 +11247,7 @@ mod tests {
     fn workflow_hint_empty_dir_degrades_gracefully() {
         // list_workflows 会回退到全局 $LATTE_HOME/workflows.d —— 用
         // ENV_LOCK + 空的 LATTE_HOME 隔离本机全局目录。
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let guard = crate::test_util::env_lock();
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("LATTE_HOME");
@@ -11608,8 +11602,7 @@ mod tests {
 
     /// env 测试串行锁（避免并行 cargo test 污染 env）。
     fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::test_util::env_lock()
     }
     /// 造一个共享阶段门句柄。
     fn fresh_plan_stage() -> SharedPlanStage {
@@ -11756,7 +11749,12 @@ mod tests {
             compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![model],
-                tiers: None,
+                // 显式 tier 映射：candidates_for 只认显式配置，缺了它
+                // build_runner 直接报 ModelResolutionFailed。
+                tiers: Some(std::collections::HashMap::from([
+                    ("standard".to_string(), "stub".to_string()),
+                    ("premium".to_string(), "stub".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [
@@ -11908,7 +11906,12 @@ mod tests {
             compaction: Default::default(),
             models: ModelCatalog {
                 models: vec![model],
-                tiers: None,
+                // 显式 tier 映射：candidates_for 只认显式配置，缺了它
+                // build_runner 直接报 ModelResolutionFailed。
+                tiers: Some(std::collections::HashMap::from([
+                    ("standard".to_string(), "stub".to_string()),
+                    ("premium".to_string(), "stub".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -13053,7 +13056,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub".to_string()),
+                    ("standard".to_string(), "stub".to_string()),
+                    ("budget".to_string(), "stub".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -13220,7 +13227,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub".to_string()),
+                    ("standard".to_string(), "stub".to_string()),
+                    ("budget".to_string(), "stub".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: roles.into_iter().map(|r| (r.id.clone(), r)).collect(),
@@ -14300,7 +14311,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-slow".to_string()),
+                    ("standard".to_string(), "stub-slow".to_string()),
+                    ("budget".to_string(), "stub-slow".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -14447,7 +14462,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -14657,7 +14676,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -15232,7 +15255,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -15384,7 +15411,11 @@ mod tests {
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -15552,7 +15583,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -15757,7 +15792,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -15931,7 +15970,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: Some(1),
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-slow".to_string()),
+                    ("standard".to_string(), "stub-slow".to_string()),
+                    ("budget".to_string(), "stub-slow".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -16069,7 +16112,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -16211,7 +16258,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [stub_role("manager", "👔"), stub_role("programmer", "🧑‍💻")]
@@ -16383,7 +16434,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [stub_role("manager", "👔"), stub_role("programmer", "🧑‍💻")]
@@ -16635,10 +16690,7 @@ require = ["永远不可能出现的验收字符串"]
     #[test]
     fn tool_doc_prefers_project_then_global_then_none() {
         use crate::tool_docs as docs;
-        let _guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = crate::test_util::env_lock();
         let project = tempfile::tempdir().unwrap();
         let global = tempfile::tempdir().unwrap();
         let prev = std::env::var_os("LATTE_HOME");
@@ -16990,10 +17042,7 @@ require = ["永远不可能出现的验收字符串"]
         // 恰好撞上本测试发起 `ast-grep`，子进程继承的是被污染的 cwd，报
         // "No ast-grep project configuration is found" 而不是真实的解析
         // 失败。持锁能确保运行期间没有人在改 cwd（那些测试同样持这把锁）。
-        let _guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         let d = cg_multiline_fixture();
         let mgr = build_tool_manager(&["read".into()]).await.unwrap();
 
@@ -17204,7 +17253,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -17974,10 +18027,7 @@ require = ["永远不可能出现的验收字符串"]
     async fn cg_call(
         args: serde_json::Value,
     ) -> Result<serde_json::Value, latte_rs_agent_tools::error::ToolError> {
-        let _cwd_guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _cwd_guard = crate::test_util::env_lock();
         cg_call_holding_lock(args).await
     }
 
@@ -18814,7 +18864,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -19001,7 +19055,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(
@@ -19150,7 +19208,11 @@ require = ["永远不可能出现的验收字符串"]
                         tier: Some("standard".into()),
                         timeout_secs: None,
                     }],
-                    tiers: None,
+                    tiers: Some(std::collections::HashMap::from([
+                        ("premium".to_string(), "stub-standard".to_string()),
+                        ("standard".to_string(), "stub-standard".to_string()),
+                        ("budget".to_string(), "stub-standard".to_string()),
+                    ])),
                     role_tiers: None,
                 },
                 roles: [(
@@ -19369,7 +19431,11 @@ require = ["永远不可能出现的验收字符串"]
                     tier: Some("standard".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-standard".to_string()),
+                    ("standard".to_string(), "stub-standard".to_string()),
+                    ("budget".to_string(), "stub-standard".to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: [(

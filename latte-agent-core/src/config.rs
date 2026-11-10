@@ -865,10 +865,7 @@ model_tier = "standard"
     /// `LATTE_HOME` (env vars are process-wide, but cargo test runs
     /// each `#[test]` on a separate thread).
     fn with_latte_home<F: FnOnce(&std::path::Path)>(f: F) {
-        let _guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = crate::test_util::env_lock();
 
         let tmp = std::env::temp_dir().join(format!(
             "latte_agent_test_home_{}_{:?}",
@@ -1030,11 +1027,10 @@ icon = "A"
     /// `AdvisorReviewSettings` 上的结构体字段），实际只能改代码常量重编。
     /// advisor 审查参数用例共用的 env 锁：env 是进程级的，而单测并行跑。
     /// 少了它，设过 env 的用例会污染只读配置的用例（实测就是这么挂的）。
-    static ADVISOR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn advisor_review_settings_are_layered_and_clamped() {
-        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         // 本用例只验「配置 → 生效值」，env 必须先清干净。
         unsafe {
             std::env::remove_var("LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS");
@@ -1094,7 +1090,7 @@ icon = "A"
     /// 与并行兄弟用例共享。
     #[test]
     fn advisor_review_timeout_env_overrides_config() {
-        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         let key = "LATTE_AGENT_ADVISOR_REVIEW_TIMEOUT_SECS";
         let configured = AdvisorSection {
             enabled: None,
@@ -1243,10 +1239,7 @@ icon = "G"
         // Serialise on the same env lock `with_latte_home` uses, so
         // our `set_current_dir` + `LATTE_HOME` mutations can't race
         // with the other load_with_global tests.
-        let _env_guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _env_guard = crate::test_util::env_lock();
 
         let project = std::env::temp_dir().join("latte_agent_test_no_d_layout");
         let _ = std::fs::remove_dir_all(&project);
@@ -1297,10 +1290,7 @@ icon = "Q"
     /// return that path so legacy projects keep working.
     #[test]
     fn test_project_agents_dir_falls_back_to_d_layout() {
-        let _env_guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _env_guard = crate::test_util::env_lock();
 
         let project = std::env::temp_dir().join("latte_agent_test_d_layout_only");
         let _ = std::fs::remove_dir_all(&project);
@@ -1351,10 +1341,7 @@ icon = "P"
     /// `quick` role — this is what `latte-agent chat -r quick` relies on.
     #[test]
     fn test_load_with_global_picks_up_no_d_project_layout() {
-        let _env_guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _env_guard = crate::test_util::env_lock();
 
         let project = std::env::temp_dir().join("latte_agent_test_no_d_load");
         let _ = std::fs::remove_dir_all(&project);

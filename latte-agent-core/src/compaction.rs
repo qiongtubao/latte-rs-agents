@@ -436,7 +436,6 @@ mod tests {
     /// `LATTE_AGENT_COMPACT_THRESHOLD_RATIO=0.9`，会让并行的钳位用例读到
     /// 0.9 而不是配置里的值，随机挂（既有缺陷，与本次改动无关）。凡是
     /// 依赖 env 处于已知状态的用例都要持这把锁。
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     use super::*;
 
@@ -475,7 +474,7 @@ mod tests {
 
     #[test]
     fn unset_section_falls_back_to_builtin_defaults() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
         let p = CompactionPolicy::resolve(&Default::default());
         assert_eq!(p, CompactionPolicy::default(), "未配置应等于内置默认");
@@ -488,7 +487,7 @@ mod tests {
 
     #[test]
     fn out_of_range_config_is_clamped_not_honoured() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
         // 配错不该把行为推到极端（阈值 0 每轮都压 / 保留 0 轮丢上下文）。
         let section = crate::config::CompactionSection {
@@ -507,7 +506,7 @@ mod tests {
 
     #[test]
     fn env_overrides_the_config_section() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         // env 留在最高优先级：排查问题时不用改文件就能压测某个参数。
         let section = crate::config::CompactionSection {
             threshold_ratio: Some(0.6),
@@ -719,7 +718,7 @@ mod tests {
     /// 值不可信时，只有「供应商真的拒了」这个信号是可靠的。
     #[test]
     fn pressure_respects_threshold_but_overflow_does_not() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         unsafe { std::env::remove_var("LATTE_AGENT_COMPACT_THRESHOLD_RATIO") };
         let policy = CompactionPolicy::resolve(&crate::config::CompactionSection::default());
         // 1M 窗口下 10K 占用远低于 0.8 阈值

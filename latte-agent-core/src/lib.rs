@@ -122,10 +122,25 @@ pub mod prelude {
 
 #[cfg(test)]
 pub(crate) mod test_util {
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
     /// Process-wide mutex serialising `LATTE_HOME` env-var access
     /// across all unit tests in the crate. `cargo test` runs tests on
     /// multiple threads; env vars are process-wide, so concurrent
     /// test threads setting `LATTE_HOME` clobber each other.
-    pub(crate) static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    pub(crate) static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// 取 `ENV_LOCK`，**忽略中毒**。
+    ///
+    /// 这把锁保护的只是"测试期间临时改 `LATTE_HOME`/cwd"这一个约定，锁内
+    /// 没有需要保持一致的不变量——中毒（某个测试持锁时 panic）之后继续拿
+    /// 是无害的。
+    ///
+    /// 为什么必须统一走这个入口：调用点此前分成两种写法，`.unwrap()`（10 处）
+    /// 与 `.unwrap_or_else(|e| e.into_inner())`（4 处）。某一条测试 panic 之后
+    /// 锁中毒，**所有**用 `.unwrap()` 的测试随即连锁失败，报
+    /// `PoisonError { .. }`——把一条真实失败放大成 9 条假失败
+    /// （实测 `config::tests` / `advisor_monitor::tests`），真实病因被埋掉。
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }

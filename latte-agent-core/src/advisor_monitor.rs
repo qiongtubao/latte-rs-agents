@@ -3724,7 +3724,13 @@ mod tests {
                     tier: Some("premium".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 显式 tier 映射：candidates_for 只认显式配置，缺了它
+                // advisor 的模型链解析不出任何模型，审查请求永远发不出去
+                // （实测表现是 wait_for_advisor_request 10s 超时）。
+                tiers: Some(std::collections::HashMap::from([(
+                    "premium".to_string(),
+                    "Advisor Premium".to_string(),
+                )])),
                 role_tiers: None,
             },
             roles: Default::default(),
@@ -4230,10 +4236,7 @@ mod tests {
     fn set_latte_home(
         dir: &std::path::Path,
     ) -> (std::sync::MutexGuard<'static, ()>, Option<String>) {
-        let guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let guard = crate::test_util::env_lock();
         let prev = std::env::var("LATTE_HOME").ok();
         std::env::set_var("LATTE_HOME", dir);
         (guard, prev)

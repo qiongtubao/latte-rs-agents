@@ -6514,6 +6514,7 @@ mod tests {
     /// 工具结果已被压缩、最近几条仍逐字。
     #[tokio::test]
     async fn stale_tool_results_are_compacted_in_outgoing_requests() {
+        let _env = crate::test_util::env_lock();
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -6650,6 +6651,7 @@ mod tests {
     #[test]
     fn context_compact_env_knobs() {
         // 该测试改进程级环境变量，与其他用例串行跑（同一测试内自己清理）。
+        let _env = crate::test_util::env_lock();
         std::env::remove_var("LATTE_AGENT_CONTEXT_COMPACT");
         assert!(context_compact_enabled(), "缺省应为开");
         for off in ["0", "false", "no", "off", "OFF", " off "] {
@@ -6916,11 +6918,17 @@ mod tests {
         };
         let msgs = [Message::user("hi")];
         mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("回落到 ok-b");
+        // 第一个 Agent 撞 402 时打了几次：流式失败后 latte-ai 会回退到非流式
+        // 重试（401/403 除外），所以同一账户会被请求 2 次。这是传输层行为，
+        // 不是摘除机制的一部分——把基线量出来，下面只断言「第二个 Agent
+        // 一次都没再打」。
+        let after_first = broke.received_requests().await.unwrap().len();
+        assert!(after_first >= 1, "第一个 Agent 必须真的请求过余额不足的账户");
         mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("第二个 Agent 同样成功");
         assert_eq!(
             broke.received_requests().await.unwrap().len(),
-            1,
-            "余额不足的账户只打一次：第二个 Agent 不再请求它"
+            after_first,
+            "第二个 Agent 不得再请求余额不足的账户（进程级摘除没生效）"
         );
         // 同账户（同 base_url + key）的另一个模型也被摘除。
         let err = mk(vec![model_at(&broke, "broke-c")])
@@ -6935,7 +6943,11 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(failures_are_all_billing(&err));
-        assert_eq!(broke.received_requests().await.unwrap().len(), 1, "WaitAndRetry 也不重试它");
+        assert_eq!(
+            broke.received_requests().await.unwrap().len(),
+            after_first,
+            "WaitAndRetry 也不重试被摘除的账户"
+        );
     }
 
     fn model_at(server: &wiremock::MockServer, id: &str) -> Model {
@@ -7089,7 +7101,13 @@ mod tests {
                         tier: None,
                         timeout_secs: None,
                     }],
-                    tiers: None,
+                    // 显式 tier 映射：candidates_for 只认显式配置（558929f 删掉了
+                    // catalog 兜底），缺了它 resolve_chain 解析不出任何模型，
+                    // 热重载会走「保留旧链」的静默降级分支。
+                    tiers: Some(std::collections::HashMap::from([
+                        ("premium".to_string(), id.to_string()),
+                        ("standard".to_string(), id.to_string()),
+                    ])),
                     role_tiers: None,
                 },
                 roles: Default::default(),
@@ -7175,7 +7193,11 @@ mod tests {
                 compaction: Default::default(),
                 models: ModelCatalog {
                     models: vec![model_def(model_id)],
-                    tiers: None,
+                    // 同上：显式 tier 映射，否则 model_id 解析不出来。
+                    tiers: Some(std::collections::HashMap::from([
+                        ("premium".to_string(), model_id.to_string()),
+                        ("standard".to_string(), model_id.to_string()),
+                    ])),
                     role_tiers: None,
                 },
                 roles,
@@ -7468,10 +7490,7 @@ mod tests {
         }
 
         // 阈值缩到 1s（进程级 env，需串行）。
-        let _guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _guard = crate::test_util::env_lock();
         std::env::set_var("LATTE_AGENT_SLOW_CALL_NOTICE_SECS", "1");
 
         let s = wiremock::MockServer::start().await;
@@ -9934,7 +9953,11 @@ mod tests {
                     tier: None,
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 同上：显式 tier 映射。
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), id.to_string()),
+                    ("standard".to_string(), id.to_string()),
+                ])),
                 role_tiers: None,
             },
             roles: Default::default(),
@@ -10422,6 +10445,7 @@ mod tests {
     /// with the round-1 "done" reply. Env is mutated only by this test.
     #[tokio::test]
     async fn delegate_batch_runs_serial_by_default_concurrent_when_enabled() {
+        let _env = crate::test_util::env_lock();
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -10701,6 +10725,7 @@ tools = ["read", "write"]
     /// 逃生口：`LATTE_AGENT_BLOCKING_CALLS_LAST=0` 退回严格按下标串行。
     #[test]
     fn blocking_calls_last_env_escape_hatch() {
+        let _env = crate::test_util::env_lock();
         std::env::remove_var("LATTE_AGENT_BLOCKING_CALLS_LAST");
         assert!(blocking_calls_last_enabled(), "默认开");
         for off in ["0", "false", "no", "off", "OFF"] {
@@ -10720,6 +10745,7 @@ tools = ["read", "write"]
     ///     时才进并行段。
     #[test]
     fn parallel_runs_splits_on_exclusive_barriers() {
+        let _env = crate::test_util::env_lock();
         fn c(name: &str) -> ParsedCall {
             ParsedCall {
                 id: String::new(),
@@ -10790,6 +10816,7 @@ tools = ["read", "write"]
     /// 两种情况都必须回填 3 条 tool_result 并以第 1 轮的 "done" 收尾。
     #[tokio::test]
     async fn readonly_batch_runs_concurrently_by_default_serial_when_disabled() {
+        let _env = crate::test_util::env_lock();
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -10914,6 +10941,7 @@ tools = ["read", "write"]
     /// 记账不变量同时锁定：4 次成功计数、第 2 轮 "done" 收尾。
     #[tokio::test]
     async fn unified_scheduler_runs_mixed_batch_in_one_parallel_pool() {
+        let _env = crate::test_util::env_lock();
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -11307,6 +11335,7 @@ tools = ["read", "write"]
     /// 为了把意图显式化，并给不认这个字段的端点留 `omit` 逃生口。
     #[tokio::test]
     async fn parallel_tool_calls_lands_on_wire_and_can_be_omitted() {
+        let _env = crate::test_util::env_lock();
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -12993,6 +13022,7 @@ tools = ["read", "write"]
     /// 换完消息数是否真的变少。这条从 run_turn 入口打到 context 终态。
     #[tokio::test]
     async fn run_turn_compacts_history_when_over_threshold() {
+        let _env = crate::test_util::env_lock();
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -13062,6 +13092,7 @@ tools = ["read", "write"]
     /// decide whether a workflow-specific fresh subsession is warranted.
     #[tokio::test]
     async fn prompt_budget_exceeded_compacts_before_returning_to_caller() {
+        let _env = crate::test_util::env_lock();
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -13188,6 +13219,7 @@ tools = ["read", "write"]
     /// 关掉开关就一条摘要调用都不发（压缩是可选优化，不是必须路径）。
     #[tokio::test]
     async fn auto_compact_can_be_disabled() {
+        let _env = crate::test_util::env_lock();
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

@@ -749,10 +749,7 @@ mod tests {
         use std::sync::{Mutex, MutexGuard};
         // `MutexGuard` doesn't have a `'static` bound by default, so
         // we coerce via the `static` lifetime explicitly.
-        let lock_guard: MutexGuard<'static, ()> = crate::test_util::ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
+        let lock_guard: MutexGuard<'static, ()> = crate::test_util::env_lock();
 
         let tmp = std::env::temp_dir().join(format!(
             "latte_role_test_home_{}_{:?}",
