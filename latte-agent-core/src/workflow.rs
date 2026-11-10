@@ -16372,36 +16372,68 @@ role = "reviewer"
         assert!(spec.task_text().contains("不要相信实现报告"));
         assert!(spec.output_contract.require.iter().any(|r| r == "VERDICT:"));
         // 质量审查在规格审查之后
-        // 小白试学：学员读之前先替他学一遍。禁读答案、只写自己的报告；
-        // 复查不通过跳回纠正步。
-        let step = |id: &str| wf.steps.iter().find(|s| s.id == id).unwrap();
-        for id in ["novice", "novice_recheck"] {
-            let st = step(id);
-            assert_eq!(st.role.as_deref(), Some("novice"));
-            assert!(
-                st.read_path_allowlist
-                    .iter()
-                    .any(|p| p == "!{{learn_root}}/*/plan.json"),
-                "{id} 不许读答案"
-            );
-            assert_eq!(st.write_path_allowlist.len(), 1, "{id} 只写自己的报告");
-            assert!(!st.tools.iter().any(|t| t == "edit"), "{id} 不改文档");
-        }
-        assert_eq!(
-            step("novice_recheck").loop_until.as_deref(),
-            Some("NOVICE_DONE")
-        );
-        assert_eq!(
-            step("novice_recheck").loop_back_to.as_deref(),
-            Some("novice_fix")
-        );
-        assert_eq!(step("novice_fix").role.as_deref(), Some("tutor"));
 
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(
             ids,
             ["tests_first", "implement", "spec_review", "quality_review"]
         );
+    }
+
+    /// 小白试学三步闭环的机械约束（`learn_loop.toml`）。
+    ///
+    /// 这些断言原本写在 `tdd_development_has_four_state_and_two_stage_review`
+    /// 里（455b782 引入小白试学时插错了位置），而 `tdd_development.toml`
+    /// 从来没有 novice 步——`step("novice")` 返回 `None`，`unwrap()` 必 panic，
+    /// 那条测试从 e6264a8 起一直是红的。挪到正确的 workflow 上，断言一条不少。
+    #[test]
+    fn learn_loop_novice_loop_is_pinned() {
+        let raw = include_str!("../../config/workflows/learn_loop.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        let step = |id: &str| {
+            wf.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("learn_loop 缺少 step {id}"))
+        };
+
+        // 试学者必须是独立角色：tutor 自己学自己的文档等于没学。
+        for id in ["novice", "novice_recheck"] {
+            let st = step(id);
+            assert_eq!(st.role.as_deref(), Some("novice"), "{id} 必须是 novice 角色");
+            // 禁读答案：plan / ledger / feedback / 上一轮 issues 都会把结论直接
+            // 喂给试学者，读到就等于开卷。
+            for banned_path in [
+                "!{{learn_root}}/*/plan.json",
+                "!{{learn_root}}/*/ledger.json",
+                "!{{learn_root}}/*/feedback.md",
+                "!{{learn_root}}/*/novice/issues.json",
+            ] {
+                assert!(
+                    st.read_path_allowlist.iter().any(|p| p == banned_path),
+                    "{id} 不许读答案（缺 {banned_path}）"
+                );
+            }
+            // 只写自己那一份报告，不做任何修改。
+            assert_eq!(
+                st.write_path_allowlist.len(),
+                1,
+                "{id} 只写自己的报告：{:?}",
+                st.write_path_allowlist
+            );
+            assert!(
+                !st.tools.iter().any(|t| t == "edit"),
+                "{id} 不改文档"
+            );
+            // 报告必须真的落盘（否则「小白学了」无从追溯）。
+            assert_eq!(st.require_tools, vec!["write".to_string()], "{id} 必须落盘");
+        }
+
+        // 复查不通过 → 跳回辅导员纠正步；纠正步是 tutor。
+        let recheck = step("novice_recheck");
+        assert_eq!(recheck.loop_until.as_deref(), Some("NOVICE_DONE"));
+        assert_eq!(recheck.loop_back_to.as_deref(), Some("novice_fix"));
+        assert_eq!(step("novice_fix").role.as_deref(), Some("tutor"));
     }
 
     /// `check_required_tools`：查步骤**做了什么**，而不是它说了什么。
@@ -18601,7 +18633,13 @@ mod contract_engine_tests {
                     tier: Some("premium".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 显式 tier 映射：ResolverSnapshot::candidates_for 只认显式配置
+                // （558929f 删掉了 catalog 兜底），缺了它 resolve_chain 直接
+                // 报 `no model for role 'X'`，整条 workflow 一步都跑不起来。
+                tiers: Some(HashMap::from([(
+                    "premium".to_string(),
+                    "Test Premium".to_string(),
+                )])),
                 role_tiers: None,
             },
             roles,
@@ -20549,7 +20587,13 @@ mod resume_tests {
                     tier: Some("premium".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 显式 tier 映射：ResolverSnapshot::candidates_for 只认显式配置
+                // （558929f 删掉了 catalog 兜底），缺了它 resolve_chain 直接
+                // 报 `no model for role 'X'`，整条 workflow 一步都跑不起来。
+                tiers: Some(HashMap::from([(
+                    "premium".to_string(),
+                    "Test Premium".to_string(),
+                )])),
                 role_tiers: None,
             },
             roles,
@@ -21778,9 +21822,6 @@ task = "汇总 {{{{chapters}}}}"
         if let Some(worker) = config.roles.get_mut("worker") {
             worker.tools = vec!["read".into(), "write".into()];
         }
-        // `candidates_for` 只认显式映射（per-role → 全局 tier），不做目录兜底，
-        // 所以这里必须写出 worker 的 premium 档指向哪个模型。
-        config.models.tiers = Some(HashMap::from([("premium".into(), "Test Premium".into())]));
         let config = Arc::new(config);
 
         let wf: WorkflowDef = toml::from_str(
@@ -22738,9 +22779,20 @@ output_key = "user_profile"
         });
 
         let out = run_workflow(&wf, "学某个 C 项目", &ctx).await;
-        let asked = answerer.await.unwrap_or(false);
-        assert!(asked, "speaker 应该真的弹出了选择框（ask 已注册）");
+        // 先断言产出，再等消费者退出。
+        //
+        // 顺序反了会把「run 失败」变成「测试挂死」：run_workflow 一旦提前
+        // 返回 Err（实测 `no model for role 'worker'` 就是这样），没有任何
+        // step 跑起来 → 永远不发 ChoiceRequested → answerer 卡在
+        // `rx.recv().await`；而 event_tx 还活在 ctx 里，发送端不 drop，
+        // `recv()` 永不返回 Err。于是真实错误被一条 60s+ 的 `has been
+        // running for over 60 seconds` 盖住，断言 `out.is_ok()` 都执行不到。
         assert!(out.is_ok(), "run 应成功: {out:?}");
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(10), answerer)
+            .await
+            .expect("answerer 在 run 结束后必须退出（不该继续等 ChoiceRequested）")
+            .unwrap_or(false);
+        assert!(asked, "speaker 应该真的弹出了选择框（ask 已注册）");
 
         // checkpoint 里必须有 Answer 记录 —— 证明六层接线没有断在 None。
         let runs = dir.path().join(".latte").join("workflow-runs");
@@ -23467,7 +23519,13 @@ mod loop_tests {
                     tier: Some("premium".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 显式 tier 映射：ResolverSnapshot::candidates_for 只认显式配置
+                // （558929f 删掉了 catalog 兜底），缺了它 resolve_chain 直接
+                // 报 `no model for role 'X'`，整条 workflow 一步都跑不起来。
+                tiers: Some(HashMap::from([(
+                    "premium".to_string(),
+                    "Test Premium".to_string(),
+                )])),
                 role_tiers: None,
             },
             roles,
@@ -24963,7 +25021,13 @@ mod learn_loop_engine_tests {
                     tier: Some("premium".into()),
                     timeout_secs: None,
                 }],
-                tiers: None,
+                // 显式 tier 映射：ResolverSnapshot::candidates_for 只认显式配置
+                // （558929f 删掉了 catalog 兜底），缺了它 resolve_chain 直接
+                // 报 `no model for role 'X'`，整条 workflow 一步都跑不起来。
+                tiers: Some(HashMap::from([(
+                    "premium".to_string(),
+                    "Test Premium".to_string(),
+                )])),
                 role_tiers: None,
             },
             roles,
