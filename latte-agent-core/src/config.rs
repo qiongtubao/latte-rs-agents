@@ -164,6 +164,65 @@ pub struct AgentConfig {
     /// 自动上下文压缩（`[compaction]` 段）。project 层覆盖 global 层。
     #[serde(default)]
     pub compaction: CompactionSection,
+    /// workflow / session token 预算的行为（`[token_budget]` 段）。
+    /// project 层覆盖 global 层。
+    #[serde(default)]
+    pub token_budget: TokenBudgetSection,
+}
+
+/// `[token_budget]` 配置段：共享 token 计量器**拦不拦**、拦截线在哪。
+///
+/// 任意 agents 配置文件（project `.latte/agents*.toml`、`agents.d/*.toml`
+/// 或 global `~/.latte/agents.d/*.toml`）都可声明：
+///
+/// ```toml
+/// [token_budget]
+/// enforce = false       # 默认：只统计，不拦截
+/// workflow_limit = 1000000
+/// ```
+///
+/// **默认 `enforce = false`。** 计量器每次都照常记录真实用量（UI 与
+/// 收尾报告都靠它），只是不再拿估算值把请求挡在门外。要恢复硬拦截
+/// 得显式打开。
+///
+/// 为什么不默认开：拦截线唯一能看见的信号是「请求发出前的 prompt 估算」，
+/// 它系统性偏低（工具 schema、历史重传、thinking 都不在里面），而超限的
+/// 后果是**就地判死整步**——实测 jemalloc `wf-learn-1794286593148353`：
+/// investigate 步 31 次调用烧 764,742 token，第 32 次准入被拒，31 次
+/// 回复全为空（都在调工具、没有 partial），降级采纳无从下手，整步失败、
+/// 62 条工具结果作废。结构性的失控本该由 `max_requests` / `max_tool_calls`
+/// 这类精确且廉价的计数先抓；用钱当唯一刹车既漏（估算偏低）又误杀
+/// （健康的深取证）。预算作为**账本**永远有用，作为**刹车**要慎用。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TokenBudgetSection {
+    /// 是否按 `workflow_limit` 拦截。`None` = 未配置 = `false`（只统计）。
+    #[serde(default)]
+    pub enforce: Option<bool>,
+    /// workflow 根级上限（含全部嵌套 run 的实际用量）。`None` = 内置默认
+    /// [`crate::workflow::DEFAULT_WORKFLOW_TOKEN_BUDGET`]。拦截关掉时它
+    /// 仍是报告里的分母。
+    #[serde(default)]
+    pub workflow_limit: Option<u64>,
+}
+
+impl TokenBudgetSection {
+    /// 生效的拦截开关：env > 配置 > 内置默认（关）。
+    ///
+    /// env 最高优先级与 `[compaction]` 一致：临时压测不该改文件。
+    pub fn enforce(&self) -> bool {
+        match std::env::var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE") {
+            Ok(v) => !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            ),
+            Err(_) => self.enforce.unwrap_or(false),
+        }
+    }
+
+    /// 是否一个字段都没配（分层合并用的整段判定）。
+    pub fn is_unset(&self) -> bool {
+        self.enforce.is_none() && self.workflow_limit.is_none()
+    }
 }
 
 /// `[compaction]` 配置段：自动上下文压缩的可调参数。
@@ -410,6 +469,9 @@ impl AgentConfig {
                 if !part.compaction.is_unset() {
                     merged.compaction = part.compaction.clone();
                 }
+                if !part.token_budget.is_unset() {
+                    merged.token_budget = part.token_budget.clone();
+                }
                 for m in part.models.models {
                     if !merged
                         .models
@@ -459,6 +521,9 @@ impl AgentConfig {
                     // compaction 同款：project 层整段没配才取全局值。
                     if merged.compaction.is_unset() && !global_part.compaction.is_unset() {
                         merged.compaction = global_part.compaction.clone();
+                    }
+                    if merged.token_budget.is_unset() && !global_part.token_budget.is_unset() {
+                        merged.token_budget = global_part.token_budget.clone();
                     }
                 }
             }
@@ -535,6 +600,9 @@ impl AgentConfig {
             // compaction 独立判断（同上：不能嵌在 advisor 的 if 里）。
             if !part.compaction.is_unset() {
                 merged.compaction = part.compaction.clone();
+            }
+            if !part.token_budget.is_unset() {
+                merged.token_budget = part.token_budget.clone();
             }
 
             // Models: append.
@@ -1381,5 +1449,113 @@ icon = "Q"
         assert_eq!(cfg.roles["quick"].icon, "Q");
 
         let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// `[token_budget]` 必须能被**目录加载**（`.latte/agents/*.toml`）拾取。
+    ///
+    /// 只测 `parse()` 不够：这个项目的 agent 配置走的是目录合并
+    /// （`load_dir` → project 层 → global 层），少接一个 `is_unset` 判断
+    /// 就是「配置写了但不生效」的静默失效——compaction 段踩过这个坑，
+    /// 注释里也点名了。这里真建一个目录走完整条合并路径。
+    #[test]
+    fn token_budget_section_merges_through_directory_load() {
+        let _env_guard = crate::test_util::ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap();
+        unsafe {
+            std::env::remove_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE");
+        }
+
+        let project = std::env::temp_dir().join("latte_agent_test_token_budget_dir");
+        let _ = std::fs::remove_dir_all(&project);
+        let agents = project.join(".latte").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("token_budget.toml"),
+            "[token_budget]\nenforce = true\nworkflow_limit = 4242\n",
+        )
+        .unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        struct CwdGuard(std::path::PathBuf);
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CwdGuard(prev_cwd);
+        std::env::set_current_dir(&project).unwrap();
+
+        let cfg = AgentConfig::load_with_global(Some(agents.to_str().unwrap())).unwrap();
+        assert_eq!(
+            cfg.token_budget.enforce,
+            Some(true),
+            "目录加载必须把 [token_budget] 带进来"
+        );
+        assert_eq!(cfg.token_budget.workflow_limit, Some(4_242));
+        assert!(cfg.token_budget.enforce(), "生效值也必须是开");
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// 拦截开关与分母：默认只统计，env 与配置都能改，且**默认值本身**
+    /// 必须是「不拦」——这条守的是 jemalloc 那次整步判死的修复面。
+    #[test]
+    fn token_budget_section_defaults_to_accounting_only() {
+        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE");
+        }
+        // 未配置 → 不拦（这是默认契约，不是「恰好 false」）
+        let bare = TokenBudgetSection::default();
+        assert!(bare.is_unset());
+        assert!(!bare.enforce(), "默认必须只统计，不拿预算当刹车");
+
+        // 只配分母也必须算「已配置」，否则分层合并会把整段丢掉。
+        let partial = TokenBudgetSection {
+            enforce: None,
+            workflow_limit: Some(2_000_000),
+        };
+        assert!(!partial.is_unset(), "只配 workflow_limit 也是已配置");
+        assert!(!partial.enforce(), "未显式开就等于不拦");
+
+        let on = TokenBudgetSection {
+            enforce: Some(true),
+            workflow_limit: None,
+        };
+        assert!(on.enforce());
+
+        // env 优先级最高：临时压测不改文件。
+        unsafe { std::env::set_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE", "0") };
+        assert!(!on.enforce(), "env 0 必须压过配置里的 true");
+        unsafe { std::env::set_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE", "1") };
+        assert!(bare.enforce(), "env 1 必须压过配置里的未配置");
+        unsafe {
+            std::env::remove_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE");
+        }
+    }
+
+    /// `[token_budget]` 必须能从任意 agents 文件里解析出来，并且不改动
+    /// 其它段的既有语义（`deny_unknown_fields` 类误伤会在这里暴露）。
+    #[test]
+    fn token_budget_section_parses_from_toml_alongside_other_sections() {
+        let raw = r#"
+[token_budget]
+enforce = true
+workflow_limit = 500000
+
+[compaction]
+enabled = false
+"#;
+        let cfg = AgentConfig::parse(raw).unwrap();
+        assert_eq!(cfg.token_budget.enforce, Some(true));
+        assert_eq!(cfg.token_budget.workflow_limit, Some(500_000));
+        assert_eq!(cfg.compaction.enabled, Some(false));
+
+        // 只写 compaction 的文件里，token_budget 必须保持「未配置」，
+        // 这样分层合并才会去取 global 层的值。
+        let only_compaction = AgentConfig::parse("[compaction]\nenabled = false\n").unwrap();
+        assert!(only_compaction.token_budget.is_unset());
     }
 }

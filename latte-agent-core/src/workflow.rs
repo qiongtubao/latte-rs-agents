@@ -4200,13 +4200,17 @@ pub struct WorkflowRunContext {
 }
 
 /// Workflow 根级 token 上限。它统计所有 step 和嵌套 workflow 的实际
-/// input + output + thinking token；并发请求可能产生少量在途超额。
+/// input + output + thinking token。
+///
+/// 这**只是分母**：是否真的据此拦请求由 `[token_budget] enforce` 决定，
+/// 默认不拦（见 [`crate::config::TokenBudgetSection`]）。
 pub const DEFAULT_WORKFLOW_TOKEN_BUDGET: u64 = 1_000_000;
 
-fn workflow_token_budget() -> u64 {
+fn workflow_token_budget(section: &crate::config::TokenBudgetSection) -> u64 {
     std::env::var("LATTE_AGENT_WORKFLOW_TOKEN_BUDGET")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
+        .or(section.workflow_limit)
         .unwrap_or(DEFAULT_WORKFLOW_TOKEN_BUDGET)
 }
 
@@ -10415,8 +10419,10 @@ async fn run_workflow_inner(
         None
     };
     let created_token_budget = if ctx.token_budget.is_none() {
-        Some(Arc::new(crate::agent::SharedTokenBudget::new(
-            workflow_token_budget(),
+        let section = &ctx.merged.token_budget;
+        Some(Arc::new(crate::agent::SharedTokenBudget::with_enforcement(
+            workflow_token_budget(section),
+            section.enforce(),
         )))
     } else {
         None
@@ -10471,13 +10477,21 @@ async fn run_workflow_inner(
     }
     if let Some(budget) = &created_token_budget {
         if budget.budget() > 0 {
-            let _ = ctx.event_tx.send(ChatEvent::Status {
-                message: format!(
+            // 两种模式必须说清是哪一种：只统计时提示「达到上限就停请求」是
+            // 错误承诺，用户会照它规划，然后在越过上限时发现 workflow 照跑。
+            let message = if budget.enforcing() {
+                format!(
                     "🧮 本次 workflow（含全部嵌套流程）共享 {} token 硬上限；每个首次分派动态预留 {:.0}% 剩余额度给校验返修，请求发送前先预占预算，达到后保留 checkpoint 并停止新模型请求",
                     budget.budget(),
                     workflow_repair_reserve_ratio() * 100.0
-                ),
-            });
+                )
+            } else {
+                format!(
+                    "🧮 本次 workflow（含全部嵌套流程）统一记账，参考上限 {} token；当前**只统计不拦截**——用量照常累计到收尾报告，超限也不会中断（要拦截：`[token_budget] enforce = true`）",
+                    budget.budget()
+                )
+            };
+            let _ = ctx.event_tx.send(ChatEvent::Status { message });
         }
     }
     let ckpt = CheckpointLog::new_scoped(
@@ -10622,6 +10636,23 @@ async fn run_workflow_inner(
     // 墙钟已移除：直接跑到引擎自然收尾（正常完成 / 用户取消 /
     // step 失败）。真卡死由下层 idle 超时 + 自动暂停接管，不在此中止。
     let outcome = engine.await;
+
+    // 收尾报账。只统计模式下这是**唯一**能看见真实消耗的地方——没有它，
+    // 「关掉拦截」就等于把用量变成不可见的成本。只由计量器的创建者
+    // （顶层 run）发，嵌套 run 共用同一个计数器，各报一次会重复四倍。
+    if let Some(budget) = &created_token_budget {
+        let used = budget.used();
+        if used > 0 {
+            let mode = if budget.enforcing() {
+                format!("硬上限 {}", budget.budget())
+            } else {
+                format!("参考上限 {}，只统计未拦截", budget.budget())
+            };
+            let _ = ctx.event_tx.send(ChatEvent::Status {
+                message: format!("🧮 workflow '{name}' 收尾：本次共消耗 {used} token（{mode}）"),
+            });
+        }
+    }
 
     match outcome {
         WfOutcome::Ok(last_output, keyed_outputs) => {
@@ -19385,6 +19416,7 @@ mod contract_engine_tests {
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -19463,6 +19495,106 @@ min_chars = 50
 forbid = ["TBD"]
 "#;
         toml::from_str(raw).expect("valid TOML")
+    }
+
+    // ─── 共享 token 计量器：只统计 vs 拦截（端到端） ──────────────
+    //
+    // 这两条守的是实测事故 jemalloc `wf-learn-1794286593148353`：拦截打开时
+    // 第 32 次准入被拒、31 次空回复让整步无可降级的产出，62 条工具结果作废。
+    // 所以「默认不拦」必须是**引擎行为**，不能只在计量器单测里成立。
+
+    /// 与 `test_config_at` 同形，但**带上 tier 映射**。
+    ///
+    /// resolver 已经不认「catalog 里 tier 字段匹配」这条兜底（见
+    /// `ResolverSnapshot::candidates_for`），没有 `[models.tiers]` 的夹具
+    /// 一律解析失败。这里显式给映射，测试的意图（真实的模型请求能不能
+    /// 发出去）才不被解析层挡在前面。
+    fn budget_test_config_at(base_url: &str) -> Arc<AgentConfig> {
+        let base = test_config_at(base_url);
+        let mut cfg = (*base).clone();
+        cfg.models.tiers = Some(HashMap::from([(
+            "premium".to_string(),
+            "Test Premium".to_string(),
+        )]));
+        Arc::new(cfg)
+    }
+
+    fn budget_wf() -> WorkflowDef {
+        toml::from_str(
+            r#"
+name = "budget_demo"
+[[steps]]
+id = "draft"
+role = "worker"
+task = "写一份计划"
+output_key = "draft"
+
+[steps.output_contract]
+min_chars = 10
+"#,
+        )
+        .expect("valid TOML")
+    }
+
+    /// 默认（`[token_budget]` 不配 enforce）：预算给 1 token 也必须跑完、
+    /// 请求真的发出去，并如实记账。
+    ///
+    /// 走**配置注入**而不是宿主直接塞 `ctx.token_budget`：启动/收尾提示只由
+    /// 本 run 自己创建的计量器发出，塞进去的计量器会静默跳过这两条消息
+    /// ——那正是「关掉拦截后用量不可见」的失效模式。
+    #[tokio::test]
+    async fn workflow_default_mode_tracks_tokens_without_blocking() {
+        let server = mock_server_always_ok().await;
+        let base = budget_test_config_at(&server.uri());
+        let mut cfg = (*base).clone();
+        // 1 token 的分母：任何一次真实调用都会越过它。enforce 保持默认（关）。
+        cfg.token_budget.workflow_limit = Some(1);
+        let (mut ctx, mut rx) = test_ctx(Arc::new(cfg));
+        assert!(ctx.token_budget.is_none(), "由 run 自己按配置创建计量器");
+
+        run_workflow(&budget_wf(), "主题", &ctx)
+            .await
+            .expect("只统计模式不得因为预算耗尽而失败");
+
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "请求必须真的发出去——拦截模式的失败点就在这里"
+        );
+
+        let (_, status) = drain_turns_and_status(&mut rx);
+        assert!(
+            status.iter().any(|m| m.contains("只统计不拦截")),
+            "启动提示必须说清当前不拦，否则用户会以为超限会停：{status:?}"
+        );
+        assert!(
+            status.iter().any(|m| m.contains("收尾") && m.contains("token")),
+            "收尾必须报出真实消耗，否则关掉拦截等于把成本变成不可见：{status:?}"
+        );
+    }
+
+    /// 显式打开拦截：同一份预算必须真的把请求挡在门外。
+    #[tokio::test]
+    async fn workflow_enforcing_mode_blocks_before_the_request() {
+        let server = mock_server_always_ok().await;
+        let base = budget_test_config_at(&server.uri());
+        let mut cfg = (*base).clone();
+        cfg.token_budget.enforce = Some(true);
+        cfg.token_budget.workflow_limit = Some(1);
+        let (ctx, _rx) = test_ctx(Arc::new(cfg));
+
+        let err = run_workflow(&budget_wf(), "主题", &ctx)
+            .await
+            .expect_err("拦截模式下 1 token 的预算必须拒绝首个请求");
+        assert!(
+            err.contains("token 预算"),
+            "失败原因要点名预算，而不是别的东西：{err}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "被拒的请求不得产生任何 HTTP 调用"
+        );
     }
 
     /// workflow step 的 runner 必须挂模型热更新源——否则「模型不可用
@@ -19655,6 +19787,7 @@ forbid = ["TBD"]
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: base.models.clone(),
             roles,
         })
@@ -21350,6 +21483,7 @@ mod resume_tests {
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -24299,6 +24433,7 @@ mod loop_tests {
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),
@@ -25803,6 +25938,7 @@ mod learn_loop_engine_tests {
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Test Premium".into(),

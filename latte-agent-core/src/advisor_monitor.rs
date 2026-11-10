@@ -3713,6 +3713,7 @@ mod tests {
         Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "Advisor Premium".into(),

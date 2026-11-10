@@ -11754,6 +11754,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -12232,6 +12233,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![model],
                 // 显式 tier 映射：candidates_for 只认显式配置，缺了它
@@ -12389,6 +12391,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![model],
                 // 显式 tier 映射：candidates_for 只认显式配置，缺了它
@@ -13517,6 +13520,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub".into(),
@@ -13688,6 +13692,7 @@ mod tests {
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+        token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub".into(),
@@ -14654,6 +14659,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![],
                 tiers: None,
@@ -14772,6 +14778,7 @@ mod tests {
         let merged = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-slow".into(),
@@ -14923,6 +14930,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -15137,6 +15145,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -15716,6 +15725,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -15872,6 +15882,7 @@ mod tests {
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -16044,6 +16055,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -16253,6 +16265,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -16431,6 +16444,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-slow".into(),
@@ -16573,6 +16587,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -16719,6 +16734,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -16895,6 +16911,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -17714,6 +17731,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -19326,6 +19344,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -19517,6 +19536,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),
@@ -19670,6 +19690,7 @@ require = ["永远不可能出现的验收字符串"]
             let agent_config = Arc::new(AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
+                token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: "stub-standard".into(),
@@ -19893,6 +19914,7 @@ require = ["永远不可能出现的验收字符串"]
         let agent_config = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub-standard".into(),

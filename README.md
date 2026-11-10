@@ -475,6 +475,40 @@ intentional"*，不假装是资源预算，只承认是失控兜底。
 即续跑，也可以调大预算再来。记账只加**本轮增量**（累加 runner 的累计值会让预算按
 O(N²) 提前打爆——多角色路径踩过这个坑）。
 
+### Workflow 的 token 计量：默认只统计，不拦截
+
+workflow 有一份**整棵嵌套树共享**的 token 计量器（同一 run 里所有 step、delegate、
+advisor 审查、JSON 修复子调用都记进同一个计数器）。它有两种模式：
+
+| 模式 | 开关 | 行为 |
+|---|---|---|
+| 只统计（**默认**） | `[token_budget] enforce = false`（或不配） | 请求照发，用量照记；收尾打一条 `🧮 共消耗 N token` 的 Status |
+| 拦截 | `enforce = true` | 请求发出前按估算预占；放不进 ceiling 就拒绝，报 `TokenBudgetExceeded` |
+
+```toml
+# .latte/agents.d/token_budget.toml（或任意 agents*.toml）
+[token_budget]
+enforce = false          # 默认；true 才拦
+workflow_limit = 1000000 # 只统计时它是报告里的分母
+```
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `LATTE_AGENT_TOKEN_BUDGET_ENFORCE` | 跟随配置（默认关） | 进程级覆盖拦截开关；`0/false/no/off` = 只统计 |
+| `LATTE_AGENT_WORKFLOW_TOKEN_BUDGET` | 1000000 | 分母（拦截开启时即硬上限） |
+| `LATTE_AGENT_WORKFLOW_REPAIR_RESERVE_RATIO` | 0.2 | 首次分派预留的剩余比例给校验返修，钳 `0.05..=0.5`；只统计模式下无效 |
+
+**为什么默认关**：拦截线唯一能看见的信号是「请求发出前的 prompt 估算」，它系统性偏低
+（工具 schema、历史重传、thinking 都不在里面），而拒绝的后果是**就地判死整步**。
+实测 `wf-learn-1794286593148353`：`investigate` 步 31 次调用烧掉 764,742 token，第 32 次
+准入被「800,000 分派上限」拒掉，而 31 次回复**全为空**（模型只在连续调工具取代码），
+没有 partial 可降级采纳 → 整步失败、62 条工具结果全部作废。结构性的失控本该由
+`max_requests` / `max_tool_calls` 这类精确且廉价的计数先抓（它们能直接看出「一直读、
+从不写」），用钱当唯一刹车既漏又误杀：健康的深取证步骤会被当成失控。
+
+计量器作为**账本**永远开着——`/usage`、失败 checkpoint 里的 `tokens_used`、收尾 Status
+都靠它。所以 `enforce = false` 不是「关掉预算」，而是「不拿预算当刹车」。
+
 ### 减少模型往返（read 批量读）
 
 `read` 接受 `paths` 数组，一次调用读多个文件（上限 10 个），内部并发、按输入顺序回传：

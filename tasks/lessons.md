@@ -223,3 +223,44 @@
   3. 引入分级：`prompts/proofreader.md` 明确区分 `BLOCKER` 与 `NIT`，仅存在 BLOCKER 时才标 `NEEDS_FIX`，纯 NIT 允许正文带建议且末行输出 `LOOKS_CLEAR` 放行。
   4. 反驳纪律：`prompts/tutor.md` 引入 Rebuttal 机制，强调源码是唯一事实源，严格验算每一个算式，严禁为迎合审稿员凭空捏造。
   5. 全面同步：同步 `config/workflows/`、`.latte/workflows.d/`、`~/.latte/workflows.d/` 与对应 `prompts/`，更新 `workflow.rs` 单测。
+
+## workflow 共享 token 预算把取证步判死（2026-11-10，jemalloc）
+
+- **现象**：`.latte/workflow-runs/wf-learn-1794286593148353.jsonl` 只有两行：
+  `meta` + `failure`。失败文案 `step 'investigate' speaker 'programmer':
+  subagent 'programmer' 启动前发现 workflow 共享 token 预算已用完
+  （764742/800000），未再发模型请求`。
+- **账本对不上**：`used=764742` 而 `budget=800000`，员工按数字算还差 35K，
+  却被判「已用完」。原因是 `try_reserve` 拒绝时返回的是 `used + reserved`，
+  而真正放不进去的是 **这一发请求的估算**（prompt 估算 + 20% + 输出额度）。
+  报错必须报 projected，用户才知道该调「预算」还是该缩小取证范围。
+- **根因（三层）**：
+  1. **用钱当唯一刹车**。`investigate` 是纯取证步、没有可降级采纳的正文，
+     它烧的每个 token 都是纯成本——31 次调用 758,076 输入 / 6,666 输出，
+     62 条工具结果、**31 次回复全为空**（模型只在连续调工具）。撞线时
+     `partial` 为空，`degrade_partial_on_break` 无从采纳，整步判死，
+     已取到的 62 条证据全部作废（文件没落盘，checkpoint 里只有 failure 行）。
+  2. **闸门放错了层**。上一版修复（`aaf1acf`）给 `learn_loop` 的 `plan` 步
+     加了 `max_requests/max_tool_calls`，但**出事的 `learn` 工作流一个都没有**。
+     `investigate` 的 prompt 里甚至写着「不是次数上限——引擎不查次数，
+     写个数字只是自欺」，等于把唯一的廉价护栏写没了。
+  3. **`800000` 的来源无处可查**。代码默认是 `1,000,000`，日志里出现的
+     `800000` 说明顶层计量器被宿主/测试注入了另一个预算，而这条注入
+     没有留下任何痕迹（启动提示只报 budget，不报「谁注的」）。
+- **修复**：
+  1. **默认只统计不拦截**。`[token_budget] enforce` 默认 `false`；
+     `SharedTokenBudget::new` 即「只记账」、`with_enforcement(false, …)` 显式可选。
+     关掉拦截后 `try_reserve` 恒放行、`exceeded*` 恒 `None`，`used` 照记。
+  2. **把成本变成可见**。workflow 起跑与收尾各打一条 Status
+     （`🧮 共消耗 N token（参考上限 M，只统计未拦截）`）——不拦就必须报账，
+     否则「关掉预算」等于让浪费隐形。
+  3. **精确闸门补到位**。`learn.toml` 的 `investigate` 加
+     `max_requests = 24` / `max_tool_calls = 60`（实测 31 次调用里 20 次 bash、
+     29 次 read、11 次 code_graph——「一直读、从不写」正是计数能抓的信号）。
+  4. 拒绝时改报 projected；`record()` 已无生产调用点，删除以免出现第二条
+     「绕过准入直接记账」的旁路。
+- **教训**：预算该放**能看见钱的那一层**，并且当**账本**常开、当**刹车**要慎用。
+  判据要选**廉价且精确**的信号（次数、工具调用数、「读而不写」），
+  token 估算系统性偏低（工具 schema / 历史重传 / thinking 都不在里面），
+  用它当硬闸门必然既漏又误杀。另：修一处事故时，先扫**同类工作流**有没有
+  同一个洞——这次 `learn_loop` 修了、`learn` 没修，于是同一类事故原样重演。

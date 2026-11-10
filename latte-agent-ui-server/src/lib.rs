@@ -1088,6 +1088,7 @@ mod tests {
         let make_config = || AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "dead-model".into(),
@@ -1261,6 +1262,7 @@ mod tests {
             let agent_config = AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
+                token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: "dead-model".into(),

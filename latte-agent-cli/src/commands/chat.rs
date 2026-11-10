@@ -4245,6 +4245,7 @@ mod tests {
         let cfg = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),
@@ -4404,6 +4405,7 @@ mod tests {
         let cfg = Arc::new(AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),
@@ -4607,6 +4609,7 @@ mod tests {
         let cfg = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: latte_agent_core::config::ModelCatalog {
                 models: vec![latte_agent_core::config::ModelDef {
                     name: "Test".into(),

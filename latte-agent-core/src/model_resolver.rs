@@ -685,6 +685,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium-model", Some("premium")),
@@ -720,6 +721,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 // 只有一个 premium 模型，且无 tiers 映射。
                 models: vec![test_model_def("some-model", Some("premium"))],
@@ -745,6 +747,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 // 这个带 key 的模型既不在 chain 里、也没有任何 tier 映射
                 // 指向它——它就是旧安全网会捞出来的 deepseek 替身。
@@ -775,6 +778,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -794,6 +798,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -817,6 +822,7 @@ mod tests {
         let config = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def],
                 tiers: None,
@@ -854,6 +860,7 @@ mod tests {
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+        token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models,
                 tiers: None,
@@ -1049,6 +1056,7 @@ supports_thinking = false
         let cfg = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def_off],
                 tiers: None,
@@ -1109,6 +1117,7 @@ prompt_cache = true
         let cfg = AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![def_on],
                 tiers: None,
@@ -1128,6 +1137,7 @@ prompt_cache = true
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+        token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium", Some("premium")),

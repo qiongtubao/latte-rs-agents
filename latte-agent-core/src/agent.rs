@@ -1580,10 +1580,26 @@ fn short_tool_name(name: &str) -> &str {
 /// 工具摘要太长会挤占审查上下文（还有 32K 字符的结果预算），
 /// 单条截断即可。返回的字符串以 `…[+N]` 结尾标记丢弃的字符数。
 /// A token meter shared by every runner in one workflow/session scope.
-/// `budget == 0` disables enforcement while retaining usage accounting.
+///
+/// 三态语义（三者互不替代）：
+/// - `enforce == true` 且 `budget > 0`：**拦截**。超限的请求不发出去，
+///   调用方拿到 `TokenBudgetExceeded`（可带 partial 降级采纳）。
+/// - `enforce == false` 或 `budget == 0`：**只统计**。每次模型调用照常
+///   放行，`used` 照常累加，供 UI / 收尾报告展示消耗。
+///
+/// 为什么默认是「只统计」：硬预算判断的是**钱**，但它唯一能看见的信号是
+/// 请求发出前的 prompt 估算 + 事后用量。一旦估算偏低或单步取证过重，
+/// 它就会在「模型还在干活、产出尚未落盘」时把整步判死——实测 jemalloc
+/// `wf-learn-1794286593148353`：investigate 步 31 次调用烧掉 764,742 token，
+/// 第 32 次准入被 800,000 的分派上限拒掉，31 次回复全为空（只在调工具），
+/// 无 partial 可降级采纳 → 整步失败、62 条工具结果全部作废。结构性失控
+/// 本该由 `max_requests` / `max_tool_calls` 这类**廉价精确**信号先抓，
+/// 用钱当唯一刹车必然既漏又误杀。所以默认关掉拦截，只留账本。
 pub struct SharedTokenBudget {
     state: std::sync::Mutex<SharedTokenBudgetState>,
     budget: u64,
+    /// `false` = 只记账不拦截（默认）。
+    enforce: bool,
 }
 
 #[derive(Default)]
@@ -1622,39 +1638,50 @@ impl Drop for SharedTokenReservation {
 }
 
 impl SharedTokenBudget {
+    /// 只统计、不拦截的计量器。
     pub fn new(budget: u64) -> Self {
+        Self::with_enforcement(budget, false)
+    }
+
+    /// 显式选择是否拦截。`enforce == false` 时 `budget` 只作分母/展示用。
+    pub fn with_enforcement(budget: u64, enforce: bool) -> Self {
         Self {
             state: std::sync::Mutex::new(SharedTokenBudgetState::default()),
             budget,
+            enforce,
         }
-    }
-
-    pub fn record(&self, tokens: u64) -> u64 {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.used = state.used.saturating_add(tokens);
-        state.used
     }
 
     /// Reserve the estimated prompt plus bounded completion allowance before
     /// sending a request. The dispatch-local `ceiling` may be lower than the
     /// workflow hard limit to preserve room for a validation repair.
+    ///
+    /// 只统计模式下恒成功：不预占、不拒绝，`used` 仍由 [`Self::settle`]
+    /// 的路径如实累加。
     pub fn try_reserve(
         self: &std::sync::Arc<Self>,
         tokens: u64,
         ceiling: u64,
     ) -> Result<SharedTokenReservation, (u64, u64)> {
-        let ceiling = if self.budget == 0 {
-            0
-        } else {
-            ceiling.min(self.budget)
-        };
+        if !self.enforcing() {
+            return Ok(SharedTokenReservation {
+                budget: self.clone(),
+                reserved: 0,
+                settled: false,
+            });
+        }
+        let ceiling = ceiling.min(self.budget);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let projected = state
             .used
             .saturating_add(state.reserved)
             .saturating_add(tokens);
-        if ceiling > 0 && projected > ceiling {
-            return Err((state.used.saturating_add(state.reserved), ceiling));
+        if projected > ceiling {
+            // 报 projected 而不是 used：拒绝的直接原因是「这一发请求的
+            // 估算放不进剩余额度」，而 used 往往还明显小于 ceiling。
+            // 实测报错 `已用完（764742/800000）` 就自相矛盾——用户按数字
+            // 算得出「还剩 35K」，却被告知预算已用完，无从判断该调哪个旋钮。
+            return Err((projected, ceiling));
         }
         state.reserved = state.reserved.saturating_add(tokens);
         drop(state);
@@ -1665,18 +1692,23 @@ impl SharedTokenBudget {
         })
     }
 
+    /// 当前是否真的会拦住请求。
+    pub fn enforcing(&self) -> bool {
+        self.enforce && self.budget > 0
+    }
+
+    /// 只统计模式下恒为 `None`——调用方据此认为「预算没超」继续干活。
     pub fn exceeded(&self) -> Option<(u64, u64)> {
         self.exceeded_at(self.budget)
     }
 
     pub fn exceeded_at(&self, ceiling: u64) -> Option<(u64, u64)> {
+        if !self.enforcing() {
+            return None;
+        }
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let ceiling = if self.budget == 0 {
-            0
-        } else {
-            ceiling.min(self.budget)
-        };
-        (ceiling > 0 && state.used.saturating_add(state.reserved) >= ceiling)
+        let ceiling = ceiling.min(self.budget);
+        (state.used.saturating_add(state.reserved) >= ceiling)
             .then_some((state.used.saturating_add(state.reserved), ceiling))
     }
 
@@ -1692,7 +1724,7 @@ impl SharedTokenBudget {
     /// budget. A later step recomputes from its new starting point, while a
     /// validation retry can use the full hard limit.
     pub fn attempt_ceiling(&self, repair: bool, reserve_ratio: f64) -> u64 {
-        if self.budget == 0 || repair {
+        if !self.enforcing() || repair {
             return self.budget;
         }
         let used = self.used();
@@ -1701,6 +1733,39 @@ impl SharedTokenBudget {
         let spendable = ((remaining as f64) * (1.0 - reserve_ratio)) as u64;
         used.saturating_add(spendable).min(self.budget)
     }
+}
+
+/// Reserve one direct model call using the same envelope estimator as the
+/// AgentRunner main loop. Callers must settle the returned permit immediately
+/// after receiving a completion; dropping it releases the reservation.
+pub(crate) fn reserve_model_request(
+    budget: Option<&Arc<SharedTokenBudget>>,
+    ceiling: Option<u64>,
+    messages: &[Message],
+    params: &GenerateParams,
+) -> Result<Option<SharedTokenReservation>, (u64, u64)> {
+    let Some(budget) = budget else {
+        return Ok(None);
+    };
+    let message_bytes = serde_json::to_vec(messages)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| messages.iter().map(|message| message.as_text().len()).sum());
+    let tool_schema_bytes = serde_json::to_vec(&params.tools)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0);
+    let input_estimate = message_bytes.saturating_add(tool_schema_bytes).div_ceil(4) as u64;
+    let output_allowance = u64::from(params.max_tokens.unwrap_or(8_192).min(16_384));
+    let projected = input_estimate
+        .saturating_add(input_estimate / 5)
+        .saturating_add(output_allowance);
+    let ceiling = ceiling.unwrap_or_else(|| budget.budget());
+    budget.try_reserve(projected, ceiling).map(Some)
+}
+
+pub(crate) fn completion_usage(completion: &Completion) -> u64 {
+    u64::from(completion.usage.input_tokens)
+        .saturating_add(u64::from(completion.usage.output_tokens))
+        .saturating_add(u64::from(completion.usage.thinking_tokens))
 }
 
 /// 请求预算硬上限：软预算的 1.5 倍（软预算时已提示收尾，再给一半余量收尾）。
@@ -2203,6 +2268,8 @@ pub(crate) fn fast_heuristic_json_repair(raw: &str) -> Option<String> {
 /// 避免污染主模型的上下文，并省去多轮来回重传的历史 token。
 async fn repair_json_via_subsession(
     agent: &Agent,
+    token_budget: Option<&Arc<SharedTokenBudget>>,
+    token_budget_ceiling: Option<u64>,
     tool_name: &str,
     raw_args: &str,
     serde_err: &str,
@@ -2228,12 +2295,31 @@ Do NOT include markdown formatting, backticks, or any explanation.";
 
     let mut params = agent.params.clone();
     params.temperature = Some(0.0);
+    params.tools.clear();
+    params.tool_choice = latte_ai::models::ToolChoice::None;
+    params.max_tokens = Some(params.max_tokens.unwrap_or(2_048).min(2_048));
 
+    let reservation =
+        match reserve_model_request(token_budget, token_budget_ceiling, &messages, &params) {
+            Ok(permit) => permit,
+            Err((used, budget)) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    used,
+                    budget,
+                    "JSON repair skipped: token budget"
+                );
+                return None;
+            }
+        };
     match agent
         .chat(&messages, Some(&params), WaitPolicy::NoWait)
         .await
     {
         Ok(completion) => {
+            if let Some(permit) = reservation {
+                permit.settle(completion_usage(&completion));
+            }
             let raw_out = completion.content;
             let cleaned = clean_json_string(&raw_out);
             if serde_json::from_str::<serde_json::Value>(cleaned).is_ok() {
@@ -2801,6 +2887,8 @@ async fn run_one_tool_call(
     // 与本轮产出是否曾被长度截断（截断时 MalformedArgs 的报错文案
     // 改写成「缩小单次提交量」指引）。两者原来只在串行内联路径有。
     agent: &Agent,
+    token_budget: Option<Arc<SharedTokenBudget>>,
+    token_budget_ceiling: Option<u64>,
     output_truncated: bool,
 ) -> OneCallResult {
     use crate::trace::{ToolStatus, TraceEvent};
@@ -2836,8 +2924,15 @@ async fn run_one_tool_call(
                 // 方案 B：触发一次旁路 JSON 修复（从已删除的串行内联
                 // 路径收口过来）。若修复成功，主上下文不会塞入任何错误
                 // 反馈（避免污染）。
-                let repaired =
-                    repair_json_via_subsession(agent, &tc.name, &tc_args, &e.to_string()).await;
+                let repaired = repair_json_via_subsession(
+                    agent,
+                    token_budget.as_ref(),
+                    token_budget_ceiling,
+                    &tc.name,
+                    &tc_args,
+                    &e.to_string(),
+                )
+                .await;
                 if let Some(new_args) = repaired {
                     tc_args = new_args;
                     match serde_json::from_str(&tc_args) {
@@ -3785,6 +3880,8 @@ impl AgentRunner {
                     let meta_c = meta.clone();
                     let anchor_scope_id_c = self.anchor_scope_id().to_string();
                     let agent_c = self.agent.clone();
+                    let token_budget_c = self.shared_token_budget.clone();
+                    let token_budget_ceiling = self.shared_token_budget_ceiling;
                     let tc_c = tc.clone();
                     let sem_c = sem.clone();
                     set.spawn(async move {
@@ -3800,6 +3897,8 @@ impl AgentRunner {
                             &anchor_scope_id_c,
                             tc_c,
                             &agent_c,
+                            token_budget_c,
+                            token_budget_ceiling,
                             output_truncated,
                         ))
                         .catch_unwind()
@@ -3867,6 +3966,8 @@ impl AgentRunner {
                         self.anchor_scope_id(),
                         ordered[pos].clone(),
                         &self.agent,
+                        self.shared_token_budget.clone(),
+                        self.shared_token_budget_ceiling,
                         output_truncated,
                     )
                     .await,
@@ -4323,15 +4424,36 @@ impl AgentRunner {
             params.tool_choice = latte_ai::models::ToolChoice::None;
             params.max_tokens = Some(policy.summary_max_tokens);
 
+            let reservation = match reserve_model_request(
+                self.shared_token_budget.as_ref(),
+                self.shared_token_budget_ceiling,
+                &req,
+                &params,
+            ) {
+                Ok(permit) => permit,
+                Err((used, budget)) => {
+                    tracing::warn!(
+                        used,
+                        budget,
+                        "auto-compact: shared token budget has no room for summary"
+                    );
+                    break;
+                }
+            };
             let summary = match self
                 .agent
                 .chat(&req, Some(&params), WaitPolicy::NoWait)
                 .await
             {
-                Ok(c) if !c.content.trim().is_empty() => c.content,
-                Ok(_) => {
-                    tracing::warn!("auto-compact: 摘要为空，放弃本次压缩");
-                    break;
+                Ok(c) => {
+                    if let Some(permit) = reservation {
+                        permit.settle(completion_usage(&c));
+                    }
+                    if c.content.trim().is_empty() {
+                        tracing::warn!("auto-compact: 摘要为空，放弃本次压缩");
+                        break;
+                    }
+                    c.content
                 }
                 Err(e) => {
                     tracing::warn!("auto-compact: 摘要调用失败，放弃本次压缩: {e}");
@@ -4887,34 +5009,17 @@ impl AgentRunner {
             // Reserve the estimated prompt plus a bounded completion allowance;
             // otherwise one large call (or several concurrent DAG calls) can
             // all observe the same remaining budget and overshoot it together.
-            let shared_reservation = if let Some(budget) = &self.shared_token_budget {
-                let input_estimate = messages
-                    .iter()
-                    .map(|m| m.as_text().len())
-                    .sum::<usize>()
-                    .div_ceil(4) as u64;
-                let output_allowance = u64::from(
-                    chat_params
-                        .as_ref()
-                        .and_then(|p| p.max_tokens)
-                        .unwrap_or(8_192)
-                        .min(16_384),
-                );
-                let projected = input_estimate
-                    .saturating_add(input_estimate / 5)
-                    .saturating_add(output_allowance);
-                let ceiling = self
-                    .shared_token_budget_ceiling
-                    .unwrap_or_else(|| budget.budget());
-                match budget.try_reserve(projected, ceiling) {
-                    Ok(permit) => Some(permit),
-                    Err(hit) => {
-                        shared_budget_hit = Some(hit);
-                        break;
-                    }
+            let shared_reservation = match reserve_model_request(
+                self.shared_token_budget.as_ref(),
+                self.shared_token_budget_ceiling,
+                &messages,
+                chat_params.as_ref().expect("chat params are always built"),
+            ) {
+                Ok(permit) => permit,
+                Err(hit) => {
+                    shared_budget_hit = Some(hit);
+                    break;
                 }
-            } else {
-                None
             };
             let completion = if self.is_stream_mode() {
                 // Stream 模式：逐 Delta 消费，发 ModelDelta trace 让 UI 逐 token 渲染。
@@ -5187,9 +5292,7 @@ impl AgentRunner {
             };
             let latency_ms = chat_start.elapsed().as_millis() as u64;
 
-            let actual_usage = u64::from(completion.usage.input_tokens)
-                .saturating_add(u64::from(completion.usage.output_tokens))
-                .saturating_add(u64::from(completion.usage.thinking_tokens));
+            let actual_usage = completion_usage(&completion);
             if let Some(reservation) = shared_reservation {
                 reservation.settle(actual_usage);
             }
@@ -6320,6 +6423,73 @@ mod tests {
             allowed_tools: vec![],
             icon: "🧪".into(),
         }
+    }
+
+    /// 只统计是**默认**语义：预算给得再小，请求也必须放出去，账必须照记。
+    ///
+    /// 这条守的是实测事故的修复面：jemalloc `wf-learn-1794286593148353`
+    /// 第 32 次准入被拒时 31 次回复全为空（只在调工具），没有 partial 可
+    /// 降级采纳，整步判死、62 条工具结果作废。拦截是可选行为，
+    /// 「默认开」会让任何深取证步骤重演同一现场。
+    #[test]
+    fn shared_budget_defaults_to_accounting_only() {
+        let budget = std::sync::Arc::new(SharedTokenBudget::new(1_000));
+        assert!(!budget.enforcing(), "默认不拦截");
+        // 远超上限的估算也必须放行。
+        let permit = budget
+            .try_reserve(50_000, 1_000)
+            .expect("只统计模式不得拒绝请求");
+        assert!(budget.exceeded().is_none(), "只统计模式不得报预算超限");
+        assert!(budget.exceeded_at(1).is_none());
+        permit.settle(50_000);
+        assert_eq!(budget.used(), 50_000, "放行不等于不记账");
+    }
+
+    /// 显式打开才拦，且拒绝时报的是**这一发请求**的估算用量，不是 used。
+    #[test]
+    fn enforcing_budget_rejects_and_reports_projected_usage() {
+        let budget = std::sync::Arc::new(SharedTokenBudget::with_enforcement(1_000, true));
+        assert!(budget.enforcing());
+        // 就位：900 已花（走真实准入路径，不另开后门）。
+        budget.try_reserve(900, 1_000).expect("900 应放行").settle(900);
+        let err = match budget.try_reserve(500, 1_000) {
+            Ok(_) => panic!("900 + 500 超过 1000 必须拒绝"),
+            Err(hit) => hit,
+        };
+        assert_eq!(err, (1_400, 1_000), "应为 projected 而不是 used(900)");
+        // 刚好放得下的仍要放行。
+        let permit = budget.try_reserve(100, 1_000).expect("1000 以内应放行");
+        permit.settle(100);
+        assert_eq!(budget.used(), 1_000);
+        assert_eq!(budget.exceeded(), Some((1_000, 1_000)));
+    }
+
+    /// `budget == 0` 与「只统计」等价：分母缺失时没有拦的余地。
+    #[test]
+    fn zero_budget_never_enforces_even_when_flagged() {
+        let budget = std::sync::Arc::new(SharedTokenBudget::with_enforcement(0, true));
+        assert!(!budget.enforcing());
+        assert!(budget.try_reserve(10_000, 0).is_ok());
+        assert!(budget.exceeded().is_none());
+        assert_eq!(budget.attempt_ceiling(false, 0.2), 0, "无分母即无可用额度概念");
+    }
+
+    /// 首次分派的 ceiling 必须严格小于硬上限（留返修空间），返修则用满。
+    #[test]
+    fn attempt_ceiling_reserves_room_for_repair_only_when_enforcing() {
+        let budget = std::sync::Arc::new(SharedTokenBudget::with_enforcement(1_000, true));
+        budget.try_reserve(200, 1_000).expect("200 应放行").settle(200);
+        let first = budget.attempt_ceiling(false, 0.2);
+        assert_eq!(first, 200 + 640, "剩余 800 预留 20% → 首次可用到 840");
+        assert_eq!(
+            budget.attempt_ceiling(true, 0.2),
+            1_000,
+            "返修可用满硬上限"
+        );
+
+        // 只统计模式：ceiling 不设限，等于分母本身。
+        let counting = std::sync::Arc::new(SharedTokenBudget::new(1_000));
+        assert_eq!(counting.attempt_ceiling(false, 0.2), 1_000);
     }
 
     #[test]
@@ -7730,6 +7900,7 @@ mod tests {
             AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
+            token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: id.into(),
@@ -7841,6 +8012,7 @@ mod tests {
             AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
+            token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![model_def(model_id)],
                     // 同上：显式 tier 映射，否则 model_id 解析不出来。
@@ -10632,6 +10804,7 @@ mod tests {
         let cfg_with = |id: &str| AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: id.into(),
