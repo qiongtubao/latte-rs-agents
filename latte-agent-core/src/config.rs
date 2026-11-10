@@ -1459,10 +1459,7 @@ icon = "Q"
     /// 注释里也点名了。这里真建一个目录走完整条合并路径。
     #[test]
     fn token_budget_section_merges_through_directory_load() {
-        let _env_guard = crate::test_util::ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap();
+        let _env_guard = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE");
         }
@@ -1503,7 +1500,7 @@ icon = "Q"
     /// 必须是「不拦」——这条守的是 jemalloc 那次整步判死的修复面。
     #[test]
     fn token_budget_section_defaults_to_accounting_only() {
-        let _guard = ADVISOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_util::env_lock();
         unsafe {
             std::env::remove_var("LATTE_AGENT_TOKEN_BUDGET_ENFORCE");
         }
