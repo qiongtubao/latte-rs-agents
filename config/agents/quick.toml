@@ -14,6 +14,12 @@ id = "quick"
 name = "Quick Assistant"
 category = "execution"
 model_tier = "budget"
+# 必须写 model_chain：`budget` 档在 [models.tiers] 里指向 `deepseek-chat`，
+# 而本机模型目录（~/.latte/models.d）只留了 glm/MiniMax/kimi —— 那条 tier
+# 映射解析不出来。实测 ui-1339475：manager 两次向 quick 派发都报
+# `no model for role 'quick'`，拆分路径被迫改道，最终整单零交付。
+# 显式 chain 让这个角色不依赖任何 tier 映射。
+model_chain = ["glm-5.3", "MiniMax-M3"]
 prompt_file = "prompts/quick.md"
 temperature = 0.2
 tools = ["bash"]

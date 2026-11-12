@@ -9864,14 +9864,20 @@ async fn register_delegate_tool(
             // Fan-out：子会话 JSONL 日志 + ChatEventTraceSink——专家的
             // 工具错误由此广播到 session channel，advisor monitor 的
             // specialist-error 检测（连续出错 → 提示修正分派）依赖它。
+            //
+            // 最外层再套一个活性探针：每流过一条事件就记一次心跳，供外层
+            // 看门狗判断「它还在动吗」。实测 ui-1339475 的第二个 tech_writer
+            // 停在 pause gate 上、零事件零调用，却照样被记满 3h 墙钟——墙钟
+            // 分不清「任务重」和「已经死了」，只有心跳分得清。
+            let activity = Arc::new(crate::activity::ActivityProbe::new());
             let specialist_sink: Arc<dyn crate::trace::TraceSink> =
-                Arc::new(crate::trace::FanOutSink::new(vec![
+                activity.wrap(Arc::new(crate::trace::FanOutSink::new(vec![
                     sub_sink.clone(),
                     Arc::new(ChatEventTraceSink {
                         event_tx: event_tx.clone(),
                         sub_id: Some(sub_id.clone()),
                     }),
-                ]));
+                ])));
             runner = runner
                 .with_role(role_id.clone())
                 .with_cwd(cwd.clone())
@@ -9930,6 +9936,21 @@ async fn register_delegate_tool(
                 std::time::Instant::now() + std::time::Duration::from_secs(graceful_timeout_s),
             );
             runner.set_request_budget(crate::workflow::delegate_request_budget());
+            // 外层兜底也必须按「干活时间」判定，不能按墙钟。
+            //
+            // 实测 ui-1339475：会话 02:51 起模型全链不可用 → pause gate 挂住，
+            // specialist 一行输出都没有，人也没处理；gate 一直 engaged，而外层
+            // 的 `tokio::time::sleep(timeout_s)` 照走。结果两轮 delegate 各判
+            // 「超过 10800s 未返回」——第二轮甚至是入口就 park、零次模型调用的
+            // 空转。6 小时里 97% 是「它在等你」被记成「它卡住了」。
+            //
+            // 复用 runner 里同一套 `Deadline` 语义（墙钟 − 已暂停），并且在
+            // deadline 到期时先把「暂停中的部分」顺延掉再判，避免 park 结束时
+            // 立刻误杀。
+            let mut deadline = crate::agent::Deadline::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(graceful_timeout_s),
+            )
+            .with_pause_baseline(&agent_pause_gate);
             let delegate_started = std::time::Instant::now();
             let mut run_handle = tokio::spawn(async move {
                 // gated 版：装了 gate_config 时产出先过 D5/D6；
@@ -9951,10 +9972,9 @@ async fn register_delegate_tool(
             // 而 SubCancelGuard 已析构 → 用户再也取消不了它。
             // 两个 500ms 轮询谁先赢是竞态，不能靠"通常是 select 先赢"。
             let _abort_on_drop = crate::sub_cancel::AbortOnDrop(run_handle.abort_handle());
-            // 超时被 500ms cancel 轮询每次 select! 重建会永远不响，
-            // 必须在循环外 pin 住。
-            let timeout = tokio::time::sleep(std::time::Duration::from_secs(timeout_s));
-            tokio::pin!(timeout);
+            // 墙钟兜底不再单独 pin 一个 sleep：它与 500ms 取消轮询共用同一个
+            // 心跳，到点时先按「墙钟 − 已暂停」判一次 `deadline`。这样暂停期间
+            // 不会累积，恢复后也不会因为「暂停前已经过了 3 小时」被立刻误杀。
             let result: Result<String, latte_rs_agent_tools::error::ToolError>;
             let mut specialist_usage: Option<latte_ai::models::TokenUsage> = None;
             loop {
@@ -10038,29 +10058,94 @@ async fn register_delegate_tool(
                             }
                         }
                     }
-                    _ = &mut timeout => {
-                        run_handle.abort();
-                        let _ = event_tx.send(ChatEvent::RoleFinished {
-                            role_id: role_id.clone(),
-                            detail: format!("timed out after {timeout_s}s"),
-                            status: "timeout".into(),
-                            sub_id: Some(sub_id.clone()),
-                        });
-                        let summary = format!(
-                            "delegate '{role_id}' 超过 {timeout_s}s 未返回，已中止；\
-                             请缩小任务范围或拆步后重派（env LATTE_AGENT_DELEGATE_TIMEOUT_SECS 可调）"
-                        );
-                        let _ = event_tx.send(ChatEvent::DelegateFinished {
-                            from_role: "manager".into(),
-                            to_role: role_id.clone(),
-                            status: "timeout".into(),
-                            summary: summary.clone(),
-                            sub_id: sub_id.clone(),
-                            wf_id: None,
-                        });
-                        return Err(tool_err(summary));
-                    }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                        // 「它到底还在动吗」——墙钟答不了，心跳能。
+                        //
+                        // 实测 ui-1339475：第二轮的 tech_writer 在入口就 park，
+                        // 零模型调用、零 trace 事件，却照样把 3h 墙钟走满，最后
+                        // 报「超过 10800s 未返回」。用户在 UI 上看到气泡转了 3
+                        // 小时，实际它一次都没动。
+                        //
+                        // 暂停（用户在等你处理鉴权/余额）与「等用户答题」都不算
+                        // 停滞：那段时间没有事件是正常的，心跳直接推后，恢复后
+                        // 重新给满一份额度。
+                        let waiting = agent_pause_gate.is_paused()
+                            || crate::choice::has_pending_for(&role_id);
+                        if waiting {
+                            activity.touch();
+                        } else if let Some(limit) = crate::activity::stall_timeout() {
+                            let idle = activity.idle();
+                            if idle >= limit {
+                                run_handle.abort();
+                                let report = activity.stall_report(idle);
+                                let _ = event_tx.send(ChatEvent::RoleFinished {
+                                    role_id: role_id.clone(),
+                                    detail: format!("stalled for {}s", idle.as_secs()),
+                                    status: "stalled".into(),
+                                    sub_id: Some(sub_id.clone()),
+                                });
+                                let summary = format!(
+                                    "delegate '{role_id}' 停滞：{report}。已中止并交回——\
+                                     请缩小任务范围、拆步重派，或先排查它卡在哪一步\
+                                     （env LATTE_AGENT_STALL_TIMEOUT_SECS 可调，0 = 关闭）"
+                                );
+                                let _ = event_tx.send(ChatEvent::DelegateFinished {
+                                    from_role: "manager".into(),
+                                    to_role: role_id.clone(),
+                                    status: "stalled".into(),
+                                    summary: summary.clone(),
+                                    sub_id: sub_id.clone(),
+                                    wf_id: None,
+                                });
+                                return Err(tool_err(summary));
+                            }
+                        }
+                        // 墙钟兜底：只有「真正干活」的时间才算数。暂停（模型
+                        // 不可用自动暂停 / 用户 ⏸）期间 gate 一直 engaged，
+                        // `deadline.worked()` 不增长；恢复后继续按剩余额度跑。
+                        // 暂停中到期不判死，顺延到恢复——否则 gate 一解除就
+                        // 立刻杀掉一个一行都没跑过的 specialist。
+                        if deadline.expired(Some(&agent_pause_gate)) {
+                            if agent_pause_gate.is_paused() {
+                                // 暂时无活可干：把 tick 推后，等 gate 恢复后再判
+                                // （暂停期间 worked 本来就不涨，这里只是不再空转检查）。
+                                continue;
+                            }
+                            // 「等用户答题」不是卡死：specialist 正阻塞在 ask
+                            // 弹窗上时把预算整体顺延一个周期，与 workflow step
+                            // 的处理一致（见 workflow.rs 的 `has_pending_for` 分支）。
+                            if crate::choice::has_pending_for(&role_id) {
+                                deadline.reset(
+                                    std::time::Instant::now()
+                                        + std::time::Duration::from_secs(graceful_timeout_s),
+                                );
+                                continue;
+                            }
+                            run_handle.abort();
+                            let worked = deadline.worked(Some(&agent_pause_gate));
+                            let _ = event_tx.send(ChatEvent::RoleFinished {
+                                role_id: role_id.clone(),
+                                detail: format!("timed out after {timeout_s}s"),
+                                status: "timeout".into(),
+                                sub_id: Some(sub_id.clone()),
+                            });
+                            let summary = format!(
+                                "delegate '{role_id}' 超过 {timeout_s}s 未返回（有效工作时长 {}s，已扣除 \
+                                 {}s 暂停），已中止；请缩小任务范围或拆步后重派\
+                                 （env LATTE_AGENT_DELEGATE_TIMEOUT_SECS 可调）",
+                                worked.as_secs(),
+                                agent_pause_gate.total_paused().as_secs()
+                            );
+                            let _ = event_tx.send(ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "timeout".into(),
+                                summary: summary.clone(),
+                                sub_id: sub_id.clone(),
+                                wf_id: None,
+                            });
+                            return Err(tool_err(summary));
+                        }
                         if cancel_flag.load(Ordering::SeqCst) {
                             run_handle.abort();
                             let _ = event_tx.send(ChatEvent::RoleFinished {
@@ -10300,8 +10385,7 @@ pub(crate) struct SubagentUsageMeter {
 impl SubagentUsageMeter {
     pub(crate) fn add(&self, usage: &latte_ai::models::TokenUsage) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.input
-            .fetch_add(u64::from(usage.input_tokens), Relaxed);
+        self.input.fetch_add(u64::from(usage.input_tokens), Relaxed);
         self.output
             .fetch_add(u64::from(usage.output_tokens), Relaxed);
         self.thinking
@@ -10664,10 +10748,15 @@ fn role_icon(role_id: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     tokio::task_local! {
         /// 单测用：在当前 task 内覆盖墙钟兜底，避免改全局 env 与并行测试互相干扰。
         pub(crate) static TEST_SPECIALIST_TIMEOUT: u64;
+    }
+    tokio::task_local! {
+        /// 单测用：在当前 task 内覆盖「无进展」阈值（见 `crate::activity`）。
+        /// `0` = 关闭看门狗。
+        pub(crate) static TEST_STALL_TIMEOUT: u64;
     }
 
     use super::*;
@@ -13797,7 +13886,7 @@ mod tests {
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
-        token_budget: Default::default(),
+            token_budget: Default::default(),
             models: ModelCatalog {
                 models: vec![ModelDef {
                     name: "stub".into(),
@@ -14995,6 +15084,288 @@ mod tests {
         .await
         .expect("DelegateFinished timeout 事件");
         assert_eq!(status, "timeout");
+    }
+
+    /// 回归（ui-1339475，2026-11-11）：暂停期间 delegate 不得被判超时。
+    ///
+    /// 实测：会话 02:51 起模型全链不可用 → session pause gate 挂住，
+    /// specialist 一行输出都没有，人也还没处理。外层墙钟照走，两轮
+    /// delegate 各判「超过 10800s 未返回」——第二轮甚至是入口就 park、
+    /// 零次模型调用的空转。6h10m 里 97% 是「它在等你」被记成「它卡住了」。
+    ///
+    /// 契约：暂停时长从墙钟里扣除；暂停中到期不判死，恢复后才按剩余
+    /// 额度继续判。
+    #[tokio::test]
+    async fn delegate_timeout_ignores_paused_time() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        // 模型端永不返回，兜底墙钟 1s；gate 一上来就 engaged。
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(std::time::Duration::from_secs(30))
+                            .set_body_string("{}"),
+                    ),
+            )
+            .await;
+
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            token_budget: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-slow".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-slow".to_string()),
+                    ("standard".to_string(), "stub-slow".to_string()),
+                    ("budget".to_string(), "stub-slow".to_string()),
+                ])),
+                role_tiers: None,
+            },
+            roles: [(
+                "programmer".to_string(),
+                RoleTemplate {
+                    id: "programmer".into(),
+                    name: "programmer".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, _rx) = broadcast::channel(16);
+        let gate = crate::pause_gate::AgentPauseGate::new("test");
+        gate.pause_with_reason("模型不可用（测试）");
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "ui-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            gate.clone(),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            0,
+            Arc::new(SubagentUsageMeter::default()),
+        )
+        .await
+        .expect("register delegate");
+
+        let call = TEST_SPECIALIST_TIMEOUT.scope(
+            1,
+            tm.execute(
+                "delegate",
+                serde_json::json!({ "role": "programmer", "task": "写一份永远写不完的文档" }),
+                None,
+            ),
+        );
+        tokio::pin!(call);
+        // 墙钟已经越过 1s 兜底：只要 gate 还 engaged，就绝不能返回超时。
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let early = tokio::time::timeout(std::time::Duration::from_millis(50), &mut call).await;
+        assert!(early.is_err(), "暂停期间 delegate 必须仍在等待，不能判超时");
+
+        // 恢复后剩余额度照常流逝，正常判超时并把「已暂停」写进摘要。
+        gate.resume();
+        let err = tokio::time::timeout(std::time::Duration::from_secs(15), call)
+            .await
+            .expect("恢复后 delegate 必须按剩余额度熔断返回")
+            .expect_err("超时熔断应返回 tool error");
+        let msg = err.to_string();
+        assert!(msg.contains("未返回"), "错误应说明超时中止: {msg}");
+        assert!(msg.contains("已扣除"), "错误应交代扣除了暂停时间: {msg}");
+    }
+
+    /// 回归（ui-1339475）：一个「不再产出任何事件」的 specialist 不该把
+    /// 3h 墙钟走满才被发现。
+    ///
+    /// 实测：第二轮 tech_writer 在入口就 park，零模型调用、零 trace 事件，
+    /// 外层仍按墙钟记满 10800s 报「未返回」。墙钟分不清「任务重」和「已经
+    /// 不动了」；心跳分得清——这里用 1s 的停滞阈值 + 永不返回的模型端复现。
+    #[tokio::test]
+    async fn delegate_aborts_stalled_specialist_without_progress() {
+        use crate::config::{ModelCatalog, ModelDef};
+        use crate::role::RoleTemplate;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        server
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_delay(std::time::Duration::from_secs(60))
+                            .set_body_string("{}"),
+                    ),
+            )
+            .await;
+
+        let merged = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            token_budget: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "stub-hang".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: server.uri(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("standard".into()),
+                    timeout_secs: None,
+                }],
+                tiers: Some(std::collections::HashMap::from([
+                    ("premium".to_string(), "stub-hang".to_string()),
+                    ("standard".to_string(), "stub-hang".to_string()),
+                    ("budget".to_string(), "stub-hang".to_string()),
+                ])),
+                role_tiers: None,
+            },
+            roles: [(
+                "programmer".to_string(),
+                RoleTemplate {
+                    id: "programmer".into(),
+                    name: "programmer".into(),
+                    category: "execution".into(),
+                    model_tier: "standard".into(),
+                    model_chain: vec![],
+                    prompt_file: None,
+                    temperature: None,
+                    tools: vec![],
+                    icon: String::new(),
+                    skills: vec![],
+                    code_paths: vec![],
+                    description: String::new(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&merged).expect("resolver");
+        // 探针阈值走 task-local（`TEST_STALL_TIMEOUT`），但**墙钟兜底 60s**
+        // 走的是进程级 env：本用例故意把它放宽，避免并行跑的邻例把 1s 的
+        // 覆盖串进来（`env_lock` 只保护"设/清"，不保护它跨 await 的整个
+        // 生命周期，所以这里只在自己确实要改全局时才取锁）。
+        let tm = build_tool_manager(&[]).await.expect("tool manager");
+        let (event_tx, mut rx) = broadcast::channel(32);
+        register_delegate_tool(
+            &tm,
+            &merged,
+            &resolver,
+            GenerateParams::default(),
+            event_tx,
+            std::path::PathBuf::from("/tmp"),
+            Arc::new(crate::subsession::SubsessionStore::new()),
+            "ui-test".into(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            None,
+            fresh_plan_stage(),
+            crate::pause_gate::AgentPauseGate::new("test"),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            0,
+            Arc::new(parking_lot::Mutex::new("测试主诉求".to_string())),
+            0,
+            Arc::new(SubagentUsageMeter::default()),
+        )
+        .await
+        .expect("register delegate");
+
+        // 墙钟兜底放宽到 60s（本用例不该走到它），停滞阈值 1s。
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            TEST_STALL_TIMEOUT.scope(
+                1,
+                TEST_SPECIALIST_TIMEOUT.scope(
+                    60,
+                    tm.execute(
+                        "delegate",
+                        serde_json::json!({ "role": "programmer", "task": "挂住不动" }),
+                        None,
+                    ),
+                ),
+            ),
+        )
+        .await
+        .expect("停滞必须在墙钟兜底之前判出来")
+        .expect_err("停滞应返回 tool error");
+        let msg = err.to_string();
+        assert!(msg.contains("停滞"), "错误应说明是停滞而非超时: {msg}");
+        assert!(
+            msg.contains("没有任何事件"),
+            "错误应带上心跳报告（多久没动）: {msg}"
+        );
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(ChatEvent::DelegateFinished { status, .. }) => break status,
+                    Ok(_) => continue,
+                    Err(e) => panic!("event stream ended before DelegateFinished: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("DelegateFinished stalled 事件");
+        assert_eq!(status, "stalled", "UI 据此收尾气泡");
     }
 
     #[test]

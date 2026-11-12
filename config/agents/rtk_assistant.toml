@@ -16,6 +16,9 @@ id = "rtk_assistant"
 name = "RTK Assistant"
 category = "execution"
 model_tier = "budget"
+# 同 quick：`budget` 档的 tier 映射（[models.tiers].budget → deepseek-chat）
+# 在本机模型目录里不存在，显式 chain 让它不依赖 tier 映射。
+model_chain = ["glm-5.3", "MiniMax-M3"]
 prompt_file = "prompts/rtk_assistant.md"
 temperature = 0.2
 tools = ["bash"]

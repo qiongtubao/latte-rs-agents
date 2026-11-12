@@ -3037,11 +3037,18 @@ async fn register_delegate_tool(
                     Arc::clone(&sink),
                     role_id.clone(),
                 ));
-                let specialist_sink: Arc<dyn latte_agent_core::trace::TraceSink> =
+                let specialist_sink_inner: Arc<dyn latte_agent_core::trace::TraceSink> =
                     Arc::new(latte_agent_core::trace::FanOutSink::new(vec![
                         scoped_sink.clone(),
                         sub_sink,
                     ]));
+                // 活性探针（与 UI 的 delegate 路径同一套）：CLI 的 delegate 是
+                // 一次性 `tokio_timeout(timeout_s)`，同样分不清「任务重」和
+                // 「停着不动」。包一层心跳后，超时分支能把「多久没产出」
+                // 写进错误，人不用靠猜。
+                let activity = Arc::new(latte_agent_core::activity::ActivityProbe::new());
+                let specialist_sink: Arc<dyn latte_agent_core::trace::TraceSink> =
+                    activity.wrap(specialist_sink_inner);
                 // 子会话 todo 对齐 UI（controller 的 delegate 路径）：
                 // specialist 声明了 todo 工具时注册有状态包装版——独立
                 // 子会话状态，广播带 sub_id 的 TodoUpdated；同时留给
@@ -3075,6 +3082,9 @@ async fn register_delegate_tool(
                 if let Some(state) = specialist_todo {
                     runner = runner.with_todo_state(state);
                 }
+                // Session 暂停门：CLI 的 `/pause` 也要能冻住 specialist，
+                // 且 `set_deadline` 会据此取暂停基线（暂停期间不算超时）。
+                runner = runner.with_agent_pause_gate(cli_pause_gate());
                 let graceful_timeout_s = timeout_s.saturating_sub(timeout_s.min(5)).max(1);
                 runner.set_deadline(
                     std::time::Instant::now() + Duration::from_secs(graceful_timeout_s),
@@ -3091,15 +3101,57 @@ async fn register_delegate_tool(
                     .acquire()
                     .await
                     .map_err(|_| tool_err("delegate pool shut down".into()))?;
-                // Run the specialist with a wall-clock timeout.
-                let response = match tokio_timeout(
-                    Duration::from_secs(timeout_s),
-                    runner.run_turn(&msgs, None),
-                )
-                .await
-                {
-                    Ok(Ok(resp)) => resp,
-                    Ok(Err(e)) => {
+                // Run the specialist with a wall-clock timeout + stall watchdog.
+                //
+                // 只挂一个 `tokio_timeout` 分不清「任务重」和「停着不动」：实测
+                // ui-1339475，UI 侧的分派在入口 park 了 3 小时才被判超时。CLI 这
+                // 边用同一个活性探针，两条判据并行——
+                //   - 墙钟：总量兜底（暂停期间由 runner 内部 deadline 扣除）；
+                //   - 心跳：超过 `LATTE_AGENT_STALL_TIMEOUT_SECS` 没有任何 trace
+                //     事件就判 stall，暂停中 / 等答题不算（`stalled` 分支）。
+                let run_fut = async {
+                    let turn = runner.run_turn(&msgs, None);
+                    tokio::pin!(turn);
+                    loop {
+                        tokio::select! {
+                            r = &mut turn => break Ok(r),
+                            _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                                let waiting = cli_pause_gate().is_paused()
+                                    || latte_agent_core::choice::has_pending_for(&role_id);
+                                if waiting {
+                                    activity.touch();
+                                    continue;
+                                }
+                                let Some(limit) = latte_agent_core::activity::stall_timeout() else {
+                                    continue;
+                                };
+                                if activity.idle() >= limit {
+                                    break Err(activity.stall_report(activity.idle()));
+                                }
+                            }
+                        }
+                    }
+                };
+                let response = match tokio_timeout(Duration::from_secs(timeout_s), run_fut).await {
+                    Ok(Ok(Ok(resp))) => resp,
+                    Ok(Err(report)) => {
+                        eprintln!("  ← {} stalled（{}）", role_id, report);
+                        let _ = cli_session_event_tx().send(
+                            latte_agent_core::controller::ChatEvent::DelegateFinished {
+                                from_role: "manager".into(),
+                                to_role: role_id.clone(),
+                                status: "stalled".into(),
+                                summary: report.clone(),
+                                sub_id: sub_id.clone(),
+                                wf_id: None,
+                            },
+                        );
+                        return Err(tool_err(format!(
+                            "delegate to '{}' 停滞：{}",
+                            role_id, report
+                        )));
+                    }
+                    Ok(Ok(Err(e))) => {
                         eprintln!("  ← {} failed: {}", role_id, e);
                         // 失败路径也要补 DelegateFinished——否则消费端的
                         // 分派记录永远停在「执行中」（UI 侧同样约定）。
@@ -3116,20 +3168,25 @@ async fn register_delegate_tool(
                         return Err(tool_err(format!("delegate to '{}' failed: {}", role_id, e)));
                     }
                     Err(_) => {
-                        eprintln!("  ← {} timed out after {}s", role_id, timeout_s);
+                        let idle = activity.idle();
+                        let report = activity.stall_report(idle);
+                        eprintln!(
+                            "  ← {} timed out after {}s（{}）",
+                            role_id, timeout_s, report
+                        );
                         let _ = cli_session_event_tx().send(
                             latte_agent_core::controller::ChatEvent::DelegateFinished {
                                 from_role: "manager".into(),
                                 to_role: role_id.clone(),
                                 status: "timeout".into(),
-                                summary: format!("{timeout_s}s wall-clock timeout"),
+                                summary: format!("{timeout_s}s wall-clock timeout（{report}）"),
                                 sub_id: sub_id.clone(),
                                 wf_id: None,
                             },
                         );
                         return Err(tool_err(format!(
-                            "delegate to '{}' timed out after {}s",
-                            role_id, timeout_s
+                            "delegate to '{}' timed out after {}s：{}",
+                            role_id, timeout_s, report
                         )));
                     }
                 };
@@ -4489,19 +4546,32 @@ mod tests {
             body.contains("ChatEvent::DelegateStarted"),
             "delegate 必须发 DelegateStarted"
         );
-        // 三条出口（ok / failed / timeout）都要销账，否则消费端的分派
-        // 记录永远停在「执行中」。
+        // 四条出口（ok / failed / stalled / timeout）都要销账，否则消费端
+        // 的分派记录永远停在「执行中」。`stalled` 是「多久没有产出」的心跳
+        // 判据，与墙钟 `timeout` 分开报——两者对用户的含义完全不同。
         assert_eq!(
             body.matches("ChatEvent::DelegateFinished").count(),
-            3,
-            "ok / failed / timeout 三条出口都必须发 DelegateFinished"
+            4,
+            "ok / failed / stalled / timeout 四条出口都必须发 DelegateFinished"
         );
-        for status in ["\"ok\"", "\"failed\"", "\"timeout\""] {
+        for status in ["\"ok\"", "\"failed\"", "\"stalled\"", "\"timeout\""] {
             assert!(
                 body.contains(status),
                 "DelegateFinished 缺少 status={status} 的出口"
             );
         }
+        // 与 UI 的 delegate 路径对齐：CLI 的 specialist 也要装 session 暂停门
+        // （否则 `/pause` 冻不住它，`set_deadline` 也拿不到暂停基线——暂停
+        // 期间照算超时，正是 ui-1339475 那 6 小时的同类问题），并且时间预算
+        // 到期时能把「多久没有产出」讲清楚。
+        assert!(
+            body.contains("with_agent_pause_gate(cli_pause_gate())"),
+            "CLI specialist 必须共享 session 暂停门"
+        );
+        assert!(
+            body.contains("stall_report"),
+            "CLI delegate 超时文案必须带上心跳报告（多久没产出）"
+        );
     }
 
     #[test]

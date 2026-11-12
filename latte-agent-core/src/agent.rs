@@ -1004,7 +1004,12 @@ const REQUIRED_TOOL_MAX_NUDGES: u8 = 2;
 /// 确认端点支持时设 `LATTE_AGENT_FORCE_REQUIRED_TOOL=1` 打开。
 fn force_required_tool_from_env() -> bool {
     std::env::var("LATTE_AGENT_FORCE_REQUIRED_TOOL")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -1041,10 +1046,7 @@ fn required_tool_nudge(gap: &RequiredToolGap, attempt: u8) -> String {
     };
     let mut demand = String::new();
     if !gap.all_of.is_empty() {
-        demand.push_str(&format!(
-            "本步要求必须实际调用 [{}]",
-            gap.all_of.join(", ")
-        ));
+        demand.push_str(&format!("本步要求必须实际调用 [{}]", gap.all_of.join(", ")));
     }
     if !gap.any_of.is_empty() {
         if !demand.is_empty() {
@@ -1817,7 +1819,10 @@ impl Deadline {
     }
 
     /// 已「真正干活」的时长：墙钟流逝减去暂停。
-    fn worked(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> std::time::Duration {
+    pub(crate) fn worked(
+        &self,
+        gate: Option<&crate::pause_gate::AgentPauseGate>,
+    ) -> std::time::Duration {
         let elapsed = self.set_at.elapsed();
         let paused = gate
             .map(|g| g.total_paused().saturating_sub(self.paused_baseline))
@@ -1826,12 +1831,24 @@ impl Deadline {
         elapsed.saturating_sub(paused)
     }
 
+    /// 重设截止时刻，等价于「从现在起重新给满一整份预算」。
+    ///
+    /// 用于「等用户」类暂停的顺延：delegate 的 specialist 正阻塞在 `ask`
+    /// 弹窗上时，那段时间既不是干活也不是暂停门 park（弹窗不 engage
+    /// session 门），若照旧计时，用户还在读题就被判超时。
+    pub(crate) fn reset(&mut self, absolute: std::time::Instant) {
+        *self = Self::new(absolute);
+    }
+
     pub(crate) fn expired(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> bool {
         self.worked(gate) >= self.budget
     }
 
     /// 剩余「干活」时长；已到期返回 0。
-    pub(crate) fn remaining(&self, gate: Option<&crate::pause_gate::AgentPauseGate>) -> std::time::Duration {
+    pub(crate) fn remaining(
+        &self,
+        gate: Option<&crate::pause_gate::AgentPauseGate>,
+    ) -> std::time::Duration {
         self.budget.saturating_sub(self.worked(gate))
     }
 }
@@ -4399,8 +4416,19 @@ impl AgentRunner {
         self
     }
 
+    /// 设置本 turn 的墙钟截止时刻（暂停期间不计时）。
+    ///
+    /// 若 gate 已挂上，这里就取暂停基线——两个调用方（delegate / workflow
+    /// step）都是「先 `with_agent_pause_gate` 建好 runner，再 set_deadline」，
+    /// 反过来的话基线是 0，`total_paused()` 会把**本分派开始之前**就累积的
+    /// 暂停量一并扣掉，等于白送预算（实测 ui-1339475：会话 02:51 起就挂着
+    /// 暂停，05:31 才起的第二个 delegate 一开始就握着一整小时的额度）。
     pub fn set_deadline(&mut self, deadline: std::time::Instant) {
-        self.deadline = Some(Deadline::new(deadline));
+        let mut dl = Deadline::new(deadline);
+        if let Some(gate) = self.agent_pause_gate.as_deref() {
+            dl = dl.with_pause_baseline(gate);
+        }
+        self.deadline = Some(dl);
     }
 
     /// Get a reference to the agent.
@@ -5925,13 +5953,11 @@ impl AgentRunner {
             // 撞的是「首次分派准入线」还是「workflow 硬上限」，用户要能一眼
             // 分开：准入线 = 硬上限 × (1 − 返修预留)，把前者当后者读就会算成
             // 「还剩 35K 却说用完」（实测事故原文 `764742/800000`）。
-            let dispatch_ceiling = self
-                .shared_token_budget_ceiling
-                .is_some_and(|ceiling| {
-                    self.shared_token_budget
-                        .as_ref()
-                        .is_some_and(|meter| ceiling < meter.budget())
-                });
+            let dispatch_ceiling = self.shared_token_budget_ceiling.is_some_and(|ceiling| {
+                self.shared_token_budget
+                    .as_ref()
+                    .is_some_and(|meter| ceiling < meter.budget())
+            });
             return Err(AgentError::TokenBudgetExceeded {
                 used,
                 budget,
@@ -6570,7 +6596,10 @@ mod tests {
         let budget = std::sync::Arc::new(SharedTokenBudget::with_enforcement(1_000, true));
         assert!(budget.enforcing());
         // 就位：900 已花（走真实准入路径，不另开后门）。
-        budget.try_reserve(900, 1_000).expect("900 应放行").settle(900);
+        budget
+            .try_reserve(900, 1_000)
+            .expect("900 应放行")
+            .settle(900);
         let err = match budget.try_reserve(500, 1_000) {
             Ok(_) => panic!("900 + 500 超过 1000 必须拒绝"),
             Err(hit) => hit,
@@ -6590,21 +6619,24 @@ mod tests {
         assert!(!budget.enforcing());
         assert!(budget.try_reserve(10_000, 0).is_ok());
         assert!(budget.exceeded().is_none());
-        assert_eq!(budget.attempt_ceiling(false, 0.2), 0, "无分母即无可用额度概念");
+        assert_eq!(
+            budget.attempt_ceiling(false, 0.2),
+            0,
+            "无分母即无可用额度概念"
+        );
     }
 
     /// 首次分派的 ceiling 必须严格小于硬上限（留返修空间），返修则用满。
     #[test]
     fn attempt_ceiling_reserves_room_for_repair_only_when_enforcing() {
         let budget = std::sync::Arc::new(SharedTokenBudget::with_enforcement(1_000, true));
-        budget.try_reserve(200, 1_000).expect("200 应放行").settle(200);
+        budget
+            .try_reserve(200, 1_000)
+            .expect("200 应放行")
+            .settle(200);
         let first = budget.attempt_ceiling(false, 0.2);
         assert_eq!(first, 200 + 640, "剩余 800 预留 20% → 首次可用到 840");
-        assert_eq!(
-            budget.attempt_ceiling(true, 0.2),
-            1_000,
-            "返修可用满硬上限"
-        );
+        assert_eq!(budget.attempt_ceiling(true, 0.2), 1_000, "返修可用满硬上限");
 
         // 只统计模式：ceiling 不设限，等于分母本身。
         let counting = std::sync::Arc::new(SharedTokenBudget::new(1_000));
@@ -7850,14 +7882,23 @@ mod tests {
                 .unwrap()
         };
         let msgs = [Message::user("hi")];
-        mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("回落到 ok-b");
+        mk(chain())
+            .chat(&msgs, None, WaitPolicy::NoWait)
+            .await
+            .expect("回落到 ok-b");
         // 第一个 Agent 撞 402 时打了几次：流式失败后 latte-ai 会回退到非流式
         // 重试（401/403 除外），所以同一账户会被请求 2 次。这是传输层行为，
         // 不是摘除机制的一部分——把基线量出来，下面只断言「第二个 Agent
         // 一次都没再打」。
         let after_first = broke.received_requests().await.unwrap().len();
-        assert!(after_first >= 1, "第一个 Agent 必须真的请求过余额不足的账户");
-        mk(chain()).chat(&msgs, None, WaitPolicy::NoWait).await.expect("第二个 Agent 同样成功");
+        assert!(
+            after_first >= 1,
+            "第一个 Agent 必须真的请求过余额不足的账户"
+        );
+        mk(chain())
+            .chat(&msgs, None, WaitPolicy::NoWait)
+            .await
+            .expect("第二个 Agent 同样成功");
         assert_eq!(
             broke.received_requests().await.unwrap().len(),
             after_first,
@@ -8019,7 +8060,7 @@ mod tests {
             AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
-            token_budget: Default::default(),
+                token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![ModelDef {
                         name: id.into(),
@@ -8131,7 +8172,7 @@ mod tests {
             AgentConfig {
                 advisor: Default::default(),
                 compaction: Default::default(),
-            token_budget: Default::default(),
+                token_budget: Default::default(),
                 models: ModelCatalog {
                     models: vec![model_def(model_id)],
                     // 同上：显式 tier 映射，否则 model_id 解析不出来。
@@ -9998,7 +10039,8 @@ mod tests {
     #[tokio::test]
     async fn deadline_does_not_consume_paused_time() {
         let gate = crate::pause_gate::AgentPauseGate::new("test");
-        let mut dl = Deadline::new(std::time::Instant::now() + std::time::Duration::from_millis(120));
+        let mut dl =
+            Deadline::new(std::time::Instant::now() + std::time::Duration::from_millis(120));
         dl = dl.with_pause_baseline(&gate);
 
         gate.pause_with_reason("鉴权失败，等用户修 key");
@@ -13005,9 +13047,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("完成", "stop"),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body_with_finish("完成", "stop")),
+                    ),
             )
             .await;
 
@@ -13018,9 +13061,8 @@ tools = ["read", "write"]
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner =
-            AgentRunner::new_with_tools(agent, noop_tool_manager(&["read", "write"]))
-                .with_required_tools(vec!["write".into()]);
+        let mut runner = AgentRunner::new_with_tools(agent, noop_tool_manager(&["read", "write"]))
+            .with_required_tools(vec!["write".into()]);
         let out = runner
             .run_turn(&[Message::user("细化 ch08")], None)
             .await
@@ -13087,9 +13129,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("完成", "stop"),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body_with_finish("完成", "stop")),
+                    ),
             )
             .await;
 
@@ -13102,7 +13145,10 @@ tools = ["read", "write"]
         .unwrap();
         let mut runner = AgentRunner::new_with_tools(agent, noop_tool_manager(&["write"]))
             .with_required_tools(vec!["write".into()]);
-        let out = runner.run_turn(&[Message::user("写计划")], None).await.unwrap();
+        let out = runner
+            .run_turn(&[Message::user("写计划")], None)
+            .await
+            .unwrap();
         assert_eq!(out, "完成");
         let reqs = server.received_requests().await.expect("mock 应记录请求");
         assert_eq!(reqs.len(), 2, "正常路径不得多花请求: {}", reqs.len());
@@ -13134,9 +13180,13 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_tool_call_body("call_g", "code_graph", "{}"),
-                    ))
+                    .respond_with(
+                        ResponseTemplate::new(200).set_body_string(openai_tool_call_body(
+                            "call_g",
+                            "code_graph",
+                            "{}",
+                        )),
+                    )
                     .up_to_n_times(1),
             )
             .await;
@@ -13145,9 +13195,10 @@ tools = ["read", "write"]
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(ResponseTemplate::new(200).set_body_string(
-                        openai_completion_body_with_finish("完成", "stop"),
-                    )),
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body_with_finish("完成", "stop")),
+                    ),
             )
             .await;
 
@@ -13162,11 +13213,7 @@ tools = ["read", "write"]
             agent,
             noop_tool_manager(&["read", "search", "code_graph"]),
         )
-        .with_required_tools_any(vec![
-            "read".into(),
-            "code_graph".into(),
-            "search".into(),
-        ]);
+        .with_required_tools_any(vec!["read".into(), "code_graph".into(), "search".into()]);
         let out = runner
             .run_turn(&[Message::user("出骨架")], None)
             .await
@@ -13208,8 +13255,11 @@ tools = ["read", "write"]
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new(agent)
-            .with_required_tools(vec!["write".into(), "absent".into(), "read".into()]);
+        let mut runner = AgentRunner::new(agent).with_required_tools(vec![
+            "write".into(),
+            "absent".into(),
+            "read".into(),
+        ]);
 
         // 什么都没有：只催「拿得到且没调过」的两个；absent 不在 schema 里，不催。
         runner.last_turn_tool_summaries = vec!["search {\"pattern\":\"x\"} → ok".to_string()];

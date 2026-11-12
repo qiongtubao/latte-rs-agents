@@ -261,6 +261,7 @@ pub fn load(
     let merged = global.merge_into_project(&project_cfg);
 
     let resolver = ModelResolver::from_config(&merged)?;
+    warn_unresolvable_roles(&resolver);
 
     // Load project discussion config
     let discussion = load_discussion_config(
@@ -279,6 +280,29 @@ pub fn load(
         sources,
         discussion,
     })
+}
+
+/// 启动期配置自检：把「角色声明的模型在本机解析不出来」直接打出来。
+///
+/// 此前这类配置问题只会在**真的派到那个角色**时才暴露——实测 ui-1339475
+/// 的 `quick` 指向早已停用的 `deepseek-chat`，manager 连撞两次失败才发现，
+/// 而此时它已经把拆分路径改成另一条（那条又撞上 3h 超时）。第一分钟能修
+/// 的配置错误，不该等到第六小时考古。
+///
+/// 只提示、不中止：缺失的角色可能整场都用不到，硬失败反而挡住用户先把
+/// 能用的活干完。
+fn warn_unresolvable_roles(resolver: &ModelResolver) {
+    let broken = resolver.audit_role_resolution();
+    if broken.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[config] {} 个角色的模型配置在本机解析不出来（只提示，不中止）：",
+        broken.len()
+    );
+    for (role, why) in &broken {
+        eprintln!("[config]   - {role}: {why}");
+    }
 }
 
 /// Append `src`'s models, roles, and tier maps into `dst`.

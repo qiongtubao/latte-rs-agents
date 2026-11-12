@@ -81,6 +81,16 @@ standard = "deepseek-v4-flash"
 budget   = "deepseek-chat"
 ```
 
+> **启动期自检**：加载配置时会把每个角色按「与分派同一套规则」解析一遍，解析不出来的
+> 角色直接打到 stderr（`[config] N 个角色的模型配置在本机解析不出来…`，逐条点名是
+> 「模型 id 不存在」还是「缺哪个环境变量」）。只提示、不中止。这类错误此前只在**真的
+> 派到那个角色**时才暴露——实测 ui-1339475 的 `quick` 指向已停用的 `deepseek-chat`，
+> manager 连撞两次失败才发现，拆分路径被迫改道。
+>
+> 一个常见坑：角色的 `model_tier = "budget"` 依赖 `[models.tiers].budget`，而本机
+> `~/.latte/models.d/` 未必有那个模型。要么改 tier 映射，要么给角色直接写
+> `model_chain = [...]`（显式 chain 优先于 tier，且不依赖任何映射）。
+
 #### Google Gemini（OpenAI-compatible）
 
 `latte-ai` 当前没有独立的 Google wire protocol。Gemini 必须通过 Google 官方
@@ -129,7 +139,8 @@ programmer、architect、reviewer、tester、security、devops、designer、tech
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | 10800（3h） | specialist（delegate / workflow step）的墙钟**兜底**，只防真正的失控。常规的「这一步该收手了」由下面的**请求次数预算**判定；后端挂死由流式首 token / 空闲超时秒级发现。此前它是 900s 且是唯一判据：慢模型（glm-5.3 单次调用 455s）两三轮就撞线，正在干活的 step 被砍、重试、再被砍（实测 LAT-110 annotate 三次全部超时）。模型目录里的 per-model `timeout_secs` 是**流式超时**，不参与这条——此前 delegate 路径把它复用成总时长，已拆开 |
+| `LATTE_AGENT_DELEGATE_TIMEOUT_SECS` | 10800（3h） | specialist（delegate / workflow step）的墙钟**兜底**，只防真正的失控。常规的「这一步该收手了」由下面的**请求次数预算**判定；后端挂死由流式首 token / 空闲超时秒级发现。**暂停期间不计时**（模型全链不可用自动暂停 / 用户 ⏸），暂停中到期顺延到恢复——实测 ui-1339475 两轮委派各被判「10800s 未返回」而实际 97% 的时间是在等人。此前它是 900s 且是唯一判据：慢模型（glm-5.3 单次调用 455s）两三轮就撞线，正在干活的 step 被砍、重试、再被砍（实测 LAT-110 annotate 三次全部超时）。模型目录里的 per-model `timeout_secs` 是**流式超时**，不参与这条——此前 delegate 路径把它复用成总时长，已拆开 |
+| `LATTE_AGENT_STALL_TIMEOUT_SECS` | 1800（30min） | **无进展**看门狗：specialist（delegate / workflow step）超过该时长没有产生任何 trace 事件（模型调用、工具执行、慢调用提示……）就判 stall 并中止交回 manager，而不是让 3h 墙钟独自兜着一个已经不动了的分派。暂停中、`ask` 弹窗等待中不算停滞（心跳顺延）。`0` = 关闭。实测 ui-1339475：第二轮 tech_writer 在入口就 park、零模型调用，仍被记满 3h |
 | `LATTE_AGENT_STEP_WARN_SECS` | 900 | workflow step 的 `TimeoutWarning` 复发周期：只提醒「这一步跑了很久」，不杀，不超过上面的兜底 |
 | `LATTE_AGENT_REQUEST_BUDGET_SCALE` | 1.0 | **请求次数预算**的全局缩放（钳 `0..=10`，`0` = 关闭）。workflow step 按档位给软预算：`small` 30 / `default` 80（缺省）/ `large` 200，step 上写 `budget = "small"` 或精确的 `max_requests = N`（`0` = 不设）；delegate 按 `large`。到软预算时引擎注入「立即落盘收尾」，到 1.5 倍仍未收尾就强停并降级采纳已有产出。按次数而不是墙钟（对齐 oh-my-pi 的 `SOFT_REQUEST_BUDGET`）：慢但在干活的不误杀，「一直读、从不写」的原地打转被次数抓住 |
 | `LATTE_AGENT_SLOW_CALL_NOTICE_SECS` | 120 | 单次模型调用慢提示阈值（仅提示，不中断） |
@@ -556,7 +567,10 @@ workflow_limit = 1000000 # 只统计时它是报告里的分母
 1. 模型返回不带 tool_calls 的回复 —— 正常收尾；
 2. `deadline` —— 仅 delegate 与 workflow step 会设置（见
    `LATTE_AGENT_DELEGATE_TIMEOUT_SECS`）。**交互式 `chat` 不设**，超时按设计
-   交给人工 ⏸ 或 advisor 角色叫停；
+   交给人工 ⏸ 或 advisor 角色叫停。计时按「墙钟 − 暂停」算，暂停中到期不判死；
+   另有一条**无进展**看门狗（`LATTE_AGENT_STALL_TIMEOUT_SECS`，默认 30min 无任何
+   trace 事件即中止），专门抓「墙钟还在走、它其实一动不动」的分派——3h 兜底
+   分不清「任务重」和「停在入口 park」；
 3. **死循环熔断** —— 唯一始终生效的自动刹车，两条规则并行。熔断前先**提醒一次**：同一工具 + 逐字节
    相同的参数连续第 3 次时，提醒（"你在重复，再来 2 次本次任务就会被中止，换个做法"）附在这次调用的
    tool_result 末尾，模型多半只是没意识到自己在原地打转，提醒后能自己跳出来；第 5 次才真正熔断：

@@ -36,6 +36,7 @@
 //! # }
 //! ```
 
+pub mod activity;
 pub mod advisor_monitor;
 pub mod agent;
 pub mod bg_jobs;

@@ -12121,6 +12121,10 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
     // step 起跑时刻：失败补写的 TurnEnd 据此报真实耗时。
     let speaker_turn_started = std::time::Instant::now();
     let mut role_responsibilities = String::new();
+    // 活性探针：step sink 建好后填进来（`held_runner` 续作复用旧 runner，
+    // 探针随旧 sink 一起留着，心跳继续累计）。用于「无进展」判定——
+    // 3h 墙钟只知道跑了多久，不知道它还在不在动。
+    let mut step_probe: Option<Arc<crate::activity::ActivityProbe>> = None;
     let result: Result<SpeakerOut, StepFail> = loop {
         // 2. Runner：patch 续作复用 held_runner；首发与 restart 重建
         //    （全新 subagent，无跨次记忆）+ sink + gate。
@@ -12174,14 +12178,22 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     // Fan-out：子会话日志 + ChatEventTraceSink——专家的工具错误
                     // 由此广播到 session channel，advisor monitor 的
                     // specialist-error 检测依赖它（与 delegate 路径一致）。
+                    //
+                    // 外面套活性探针：workflow step 的 3h 墙钟同样是「只防失控」
+                    // 的兜底，分不清「任务重」和「停在入口不动」。实测
+                    // ui-1339475 的 learn_book_pages/breakdown 就是单次调用慢生成
+                    // + 反复空转 read，全程有事件但没有任何产出落盘；探针让
+                    // 「彻底不动」这一类先被判出来。
+                    let step_activity = Arc::new(crate::activity::ActivityProbe::new());
+                    step_probe = Some(Arc::clone(&step_activity));
                     let specialist_sink: Arc<dyn crate::trace::TraceSink> =
-                        Arc::new(crate::trace::FanOutSink::new(vec![
+                        step_activity.wrap(Arc::new(crate::trace::FanOutSink::new(vec![
                             sink.clone(),
                             Arc::new(crate::controller::ChatEventTraceSink {
                                 event_tx: inp.event_tx.clone(),
                                 sub_id: sub_id.clone(),
                             }),
-                        ]));
+                        ])));
                     r = r.with_sink(specialist_sink);
                 }
                 if let Some(gate) = inp.advisor_gate.clone() {
@@ -12579,6 +12591,50 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                     );
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    // 无进展判定：暂停中 / 等用户答题都不算停滞（那段时间
+                    // 本来就没有事件），心跳推后、恢复后重新给满一份额度。
+                    // 其余情况下超过阈值没有任何 trace 事件 → 判失败交回引擎，
+                    // 由它按 max_retries 重试或失败冒泡，而不是让 3h 墙钟
+                    // 独自兜着一个已经不动了的 step。
+                    if let Some(probe) = step_probe.as_ref() {
+                        let waiting = crate::choice::has_pending_for(&speaker)
+                            || inp
+                                .agent_pause_gate
+                                .as_ref()
+                                .is_some_and(|g| g.is_paused());
+                        if waiting {
+                            probe.touch();
+                        } else if let Some(limit) = crate::activity::stall_timeout() {
+                            let idle = probe.idle();
+                            if idle >= limit {
+                                run_handle.abort();
+                                let report = probe.stall_report(idle);
+                                let summary = format!(
+                                    "workflow step '{}' speaker '{}' 停滞：{report}。\
+                                     已中止；请缩小任务范围、拆步重派，或先排查卡点\
+                                     （env LATTE_AGENT_STALL_TIMEOUT_SECS 可调，0 = 关闭）",
+                                    inp.step_id, speaker
+                                );
+                                let _ = inp.event_tx.send(ChatEvent::RoleFinished {
+                                    role_id: speaker.clone(),
+                                    detail: format!("stalled for {}s", idle.as_secs()),
+                                    status: "stalled".into(),
+                                    sub_id: sub_id.clone(),
+                                });
+                                if let Some(id) = &sub_id {
+                                    let _ = inp.event_tx.send(ChatEvent::DelegateFinished {
+                                        from_role: "manager".into(),
+                                        to_role: speaker.clone(),
+                                        status: "stalled".into(),
+                                        summary: summary.clone(),
+                                        sub_id: id.clone(),
+                                        wf_id: Some(inp.wf_id.clone()),
+                                    });
+                                }
+                                return Err(StepFail::Failed(summary));
+                            }
+                        }
+                    }
                     if cancel.load(Ordering::SeqCst) {
                         run_handle.abort();
                         let _ = inp.event_tx.send(ChatEvent::RoleFinished {
@@ -17231,7 +17287,11 @@ role = "reviewer"
         // 试学者必须是独立角色：tutor 自己学自己的文档等于没学。
         for id in ["novice", "novice_recheck"] {
             let st = step(id);
-            assert_eq!(st.role.as_deref(), Some("novice"), "{id} 必须是 novice 角色");
+            assert_eq!(
+                st.role.as_deref(),
+                Some("novice"),
+                "{id} 必须是 novice 角色"
+            );
             // 禁读答案：plan / ledger / feedback / 上一轮 issues 都会把结论直接
             // 喂给试学者，读到就等于开卷。
             for banned_path in [
@@ -17252,10 +17312,7 @@ role = "reviewer"
                 "{id} 只写自己的报告：{:?}",
                 st.write_path_allowlist
             );
-            assert!(
-                !st.tools.iter().any(|t| t == "edit"),
-                "{id} 不改文档"
-            );
+            assert!(!st.tools.iter().any(|t| t == "edit"), "{id} 不改文档");
             // 报告必须真的落盘（否则「小白学了」无从追溯）。
             assert_eq!(st.require_tools, vec!["write".to_string()], "{id} 必须落盘");
         }
@@ -19595,7 +19652,9 @@ min_chars = 10
             "启动提示必须说清当前不拦，否则用户会以为超限会停：{status:?}"
         );
         assert!(
-            status.iter().any(|m| m.contains("收尾") && m.contains("token")),
+            status
+                .iter()
+                .any(|m| m.contains("收尾") && m.contains("token")),
             "收尾必须报出真实消耗，否则关掉拦截等于把成本变成不可见：{status:?}"
         );
     }
@@ -22805,10 +22864,7 @@ task = "核实锚点并落盘"
             .await
             .expect("nudge 补上 write 后本步应当成功（不需要步骤级重试）");
 
-        assert!(
-            dir.path().join("out.json").exists(),
-            "write 必须真的落盘"
-        );
+        assert!(dir.path().join("out.json").exists(), "write 必须真的落盘");
         let bodies: Vec<String> = server
             .received_requests()
             .await

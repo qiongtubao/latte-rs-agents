@@ -289,6 +289,42 @@ impl ModelResolver {
             .get(role_id)
             .map(|chain| (chain.clone(), snap.role_model_tiers.get(role_id).copied()))
     }
+
+    /// **启动期自检**：逐个角色按「与分派同一套规则」解析模型，返回解析
+    /// 失败的角色及其病名。
+    ///
+    /// 为什么要有这一步：此前「角色配的模型在本机不存在」只有在**真的派到
+    /// 它**时才暴露。实测 ui-1339475 就是 `quick` 的 budget 档指向早已停用的
+    /// `deepseek-chat`，manager 连着两次 delegate 失败才发现，期间已经把
+    /// 拆分路径改走另一条（那条又撞上 3h 超时）。启动时就点名，人可以在
+    /// 第一分钟修配置，而不是在第六小时考古。
+    ///
+    /// 只报**不可解析**的角色；能解析但模型在冷却/余额不足不算——那些是会
+    /// 自愈的运行期状态。返回 `(role_id, 病名)`，按 role_id 排序。
+    pub fn audit_role_resolution(&self) -> Vec<(String, String)> {
+        let snap = self.snapshot();
+        let mut roles: Vec<&String> = snap.role_model_chains.keys().collect();
+        roles.sort();
+        roles
+            .into_iter()
+            .filter_map(|role| {
+                let chain = snap
+                    .role_model_chains
+                    .get(role)
+                    .cloned()
+                    .unwrap_or_default();
+                let tier = snap
+                    .role_model_tiers
+                    .get(role)
+                    .copied()
+                    .unwrap_or(ModelTier::Standard);
+                match snap.resolve_chain(role, tier, &chain) {
+                    Ok(_) => None,
+                    Err(e) => Some((role.clone(), e.to_string())),
+                }
+            })
+            .collect()
+    }
 }
 
 impl ResolverSnapshot {
@@ -320,17 +356,39 @@ impl ResolverSnapshot {
             }
         }
 
-        let reason = if missing_env.is_empty() {
+        // 逐候选点名病灶，而不是只说「candidates 全都不行」。
+        //
+        // 实测 ui-1339475：`quick` 角色没写 model_chain，落到 budget tier →
+        // `deepseek-chat`，而本机模型目录里根本没有这个 id（deepseek.toml
+        // 已被改名停用）。错误只有一句 `chain_ids=[]`，看不出到底是
+        // 「模型不存在」还是「缺 key」，于是 manager 换个角色重试——又撞同一
+        // 个缺口。这里把每条候选的真实原因（id 不在目录 / api_key 为空且缺
+        // 哪个环境变量）逐条列出来。
+        let reason = if candidates.is_empty() {
             format!(
-                "no api_key configured for candidates: {}. Set an api_key in config or via --api-key",
-                candidates.join(", ")
+                "角色没有任何解析到模型的配置：`[models.role_tiers.{role_id}]` 与 \
+                 `[models.tiers]` 都没有给 `{tier}` 档配置模型（也不做 catalog 推测兜底）。\
+                 请在模型配置里补上这一档，或给该角色写 model_chain",
+                tier = tier.label()
             )
         } else {
-            format!(
-                "no api_key configured for candidates: {}. Set environment variable(s): {}",
-                candidates.join(", "),
-                missing_env.join(" ")
-            )
+            let detail: Vec<String> = candidates
+                .iter()
+                .map(|id| self.candidate_diagnosis(id))
+                .collect();
+            let mut reason = format!(
+                "{} 档的候选模型全部不可用：{}",
+                tier.label(),
+                detail.join("；")
+            );
+            if !missing_env.is_empty() {
+                reason.push_str(&format!("。需要设置环境变量：{}", missing_env.join(" ")));
+            }
+            reason.push_str(&format!(
+                "。修法：给角色写 model_chain，或把 `[models.tiers]`/`[models.role_tiers.{role_id}]` 里 \
+                 这一档改成模型目录里真实存在（且填了 api_key）的模型"
+            ));
+            reason
         };
 
         Err(AgentError::ModelResolutionFailed {
@@ -338,6 +396,25 @@ impl ResolverSnapshot {
             tier: tier.label().into(),
             reason,
         })
+    }
+
+    /// 单个候选为什么用不了：不存在 / api_key 为空（点名缺的环境变量）/ 其它。
+    ///
+    /// 只用于拼装错误文案——诊断必须能让人直接知道「去改哪一行配置」。
+    fn candidate_diagnosis(&self, model_id: &str) -> String {
+        let Some(def) = self.models.get(model_id) else {
+            return format!(
+                "`{model_id}`（模型目录里没有这个 id：配置指向的模型不存在或已被停用）"
+            );
+        };
+        match self.build_model(model_id) {
+            Ok(m) if m.api_key.trim().is_empty() => match extract_env_var(&def.api_key) {
+                Some(var) => format!("`{model_id}`（api_key 为空：环境变量 {var} 未设置）"),
+                None => format!("`{model_id}`（api_key 为空，且配置文件里没填）"),
+            },
+            Ok(_) => format!("`{model_id}`（可用）"),
+            Err(e) => format!("`{model_id}`（无法构建：{e}）"),
+        }
     }
 
     /// Returns every model id that could satisfy this (role, tier) in
@@ -446,14 +523,34 @@ impl ResolverSnapshot {
         // 失败善后、顶层 chat 自动暂停等人工。要彻底不用某个模型，把它从
         // 角色 chain / tier 映射里去掉即可——不必再去模型目录里删它。
         if out.is_empty() {
+            // 逐条点名：chain 里每个模型各自为什么不可用，tier 那一档又是
+            // 什么情况。`chain_ids={:?}` 只告诉人「配置里写了这些」，不告诉
+            // 人「它们为什么都不行」——实测 ui-1339475 的 `quick` 就是拿一句
+            // `chain_ids=[]` 糊过去，manager 只能换角色重试。
+            let mut parts: Vec<String> = Vec::new();
+            if chain_ids.is_empty() {
+                parts.push("model_chain 为空".to_string());
+            } else {
+                let detail: Vec<String> = chain_ids
+                    .iter()
+                    .map(|id| self.candidate_diagnosis(id))
+                    .collect();
+                parts.push(format!("model_chain 候选：[{}]", detail.join("；")));
+            }
+            match self.resolve(role_id, tier) {
+                Err(AgentError::ModelResolutionFailed { reason, .. }) => {
+                    parts.push(format!("tier 回退：{reason}"));
+                }
+                Err(e) => parts.push(format!("tier 回退：{e}")),
+                Ok(m) => parts.push(format!("tier 回退可用（`{}`）", m.name)),
+            }
             return Err(AgentError::ModelResolutionFailed {
                 role: role_id.into(),
                 tier: tier.label().into(),
                 reason: format!(
-                    "角色配置的模型全部不可用（chain + tier 候选均无法构建或缺 api_key）；\
-                     不启用 catalog 兜底，直接中止。请检查角色 model_chain / tier 映射里的模型是否可用。\
-                     chain_ids={:?}",
-                    chain_ids
+                    "角色配置的模型全部不可用（不启用 catalog 兜底，直接中止）：{}。\
+                     请按上面的点名项检查角色 model_chain / [models.tiers] 映射",
+                    parts.join("；")
                 ),
             });
         }
@@ -766,9 +863,135 @@ mod tests {
             )
             .expect_err("chain 全不可用必须中止，不得兜底到 catalog 里的 unwanted-deepseek");
         match err {
-            AgentError::ModelResolutionFailed { role, .. } => assert_eq!(role, "advisor"),
+            AgentError::ModelResolutionFailed { role, reason, .. } => {
+                assert_eq!(role, "advisor");
+                // 逐条点名：chain 里两个模型各自「目录里没有这个 id」。
+                assert!(reason.contains("glm-5.3"), "应点名缺失的模型: {reason}");
+                assert!(reason.contains("MiniMax-M3"), "应点名缺失的模型: {reason}");
+                assert!(
+                    reason.contains("模型目录里没有这个 id"),
+                    "应说明是「不存在」而不是笼统的「不可用」: {reason}"
+                );
+                // 绝不提 unwanted-deepseek：兜底网已删，它的名字不该出现在
+                // 任何提示里（否则又会把人引向「换成它试试」）。
+                assert!(!reason.contains("unwanted-deepseek"), "{reason}");
+            }
             other => panic!("期望 ModelResolutionFailed，实际 {other:?}"),
         }
+    }
+
+    /// 回归（ui-1339475）：tier 映射指向本地不存在的模型时，错误必须点名
+    /// 那个模型的 id，而不是只说「候选全不可用」。
+    ///
+    /// 实测：`quick` 没有 model_chain → 落 budget tier → `deepseek-chat`，
+    /// 而本机的 deepseek 配置早已停用（`deepseek.toml.disabled`）。原错误是
+    /// `no model for role 'quick': ... chain_ids=[]`，看的人无从判断到底是
+    /// 缺 key 还是模型不存在，manager 于是换个角色重试、撞同一个洞。
+    #[test]
+    fn tier_pointing_at_missing_model_names_the_model_in_error() {
+        let config = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            token_budget: Default::default(),
+            models: crate::config::ModelCatalog {
+                models: vec![test_model_def("glm-5.3", Some("budget"))],
+                tiers: Some(
+                    [("budget".to_string(), "deepseek-chat".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                role_tiers: None,
+            },
+            roles: Default::default(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let err = resolver
+            .resolve("quick", ModelTier::Budget)
+            .expect_err("tier 指向不存在的模型必须失败");
+        let AgentError::ModelResolutionFailed { role, tier, reason } = err else {
+            panic!("期望 ModelResolutionFailed");
+        };
+        assert_eq!(role, "quick");
+        assert_eq!(tier, "budget");
+        assert!(
+            reason.contains("deepseek-chat"),
+            "必须点名缺失的模型 id: {reason}"
+        );
+        assert!(
+            reason.contains("模型目录里没有这个 id"),
+            "必须说明它不存在（而不是缺 key）: {reason}"
+        );
+        // 提示可操作性：指明去哪个配置段补。
+        assert!(reason.contains("model_chain"), "应给出修法: {reason}");
+    }
+
+    /// 启动期自检：只报**解析不出来**的角色，能解析的不报。
+    ///
+    /// 这是「第一分钟就能修」与「第六小时考古」的区别——实测 ui-1339475
+    /// 的 `quick` 缺模型，直到 manager 连撞两次失败才被发现。
+    #[test]
+    fn audit_role_resolution_reports_only_broken_roles() {
+        let config = AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            token_budget: Default::default(),
+            models: crate::config::ModelCatalog {
+                models: vec![test_model_def("glm-5.3", Some("budget"))],
+                tiers: Some(
+                    [("budget".to_string(), "deepseek-chat".to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                role_tiers: None,
+            },
+            roles: [
+                (
+                    "good".to_string(),
+                    crate::role::RoleTemplate {
+                        id: "good".into(),
+                        name: "good".into(),
+                        category: "execution".into(),
+                        model_tier: "budget".into(),
+                        model_chain: vec!["glm-5.3".into()],
+                        prompt_file: None,
+                        temperature: None,
+                        tools: vec![],
+                        icon: String::new(),
+                        skills: vec![],
+                        code_paths: vec![],
+                        description: String::new(),
+                    },
+                ),
+                (
+                    "broken".to_string(),
+                    crate::role::RoleTemplate {
+                        id: "broken".into(),
+                        name: "broken".into(),
+                        category: "execution".into(),
+                        model_tier: "budget".into(),
+                        model_chain: vec![],
+                        prompt_file: None,
+                        temperature: None,
+                        tools: vec![],
+                        icon: String::new(),
+                        skills: vec![],
+                        code_paths: vec![],
+                        description: String::new(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let resolver = ModelResolver::from_config(&config).unwrap();
+        let broken = resolver.audit_role_resolution();
+        assert_eq!(broken.len(), 1, "只应报解析不出来的角色: {broken:?}");
+        assert_eq!(broken[0].0, "broken");
+        assert!(
+            broken[0].1.contains("deepseek-chat"),
+            "病名要点名缺失的模型: {}",
+            broken[0].1
+        );
     }
 
     #[test]
@@ -860,7 +1083,7 @@ mod tests {
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
-        token_budget: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models,
                 tiers: None,
@@ -1137,7 +1360,7 @@ prompt_cache = true
         AgentConfig {
             advisor: Default::default(),
             compaction: Default::default(),
-        token_budget: Default::default(),
+            token_budget: Default::default(),
             models: crate::config::ModelCatalog {
                 models: vec![
                     test_model_def("premium", Some("premium")),
