@@ -6568,7 +6568,7 @@ pub fn workflow_tool_hint(cwd: &std::path::Path) -> String {
          \nHow to pick (the only rule — match by deliverable landing, not by topic word):\n\
          1. Write down where the user's deliverable finally lands — task board entry / a specific file / a conclusion in the conversation / a code change.\n\
          2. 先在「落点速查」表里对号——表是按各流程自声明的落点自动汇聚的；只有表里对不上时，才通读上方完整描述按「落点：」逐字比对。\n\
-         3. Topic words (\"learn\" / \"design\" / \"refactor\" / \"research\") describe content, not the landing. Two requests with the same topic can need different workflows because they have different landing points.\n\
+         3. Topic words (\"learn\" / \"design\" / \"refactor\" / \"research\") describe content, not the landing. Two requests with the same topic can need different workflows because they have different landing points. For a curriculum or beginner-to-advanced learning task list, choose `learn_plan` (not generic `implementation_plan`); the engine enforces chapter order, prerequisites, and source-path checks.\n\
          4. Several different landing points in one user request → several workflow calls in the same round. Never let one workflow \"also cover\" another deliverable. Write out each deliverable's landing before claiming one workflow is enough.\n\
          \n**调研要收口（不是限制轮数）**。Research stops on deliverables (not on a round count). Research workflows (e.g. explore / design_brainstorm) can run as many rounds as needed — but every round must ask one concrete new question, and each round you should ask yourself: 「this round later, is the user's named deliverable closer, or do I only understand more?」 Two rounds in a row of \"only understand more\" means stop and switch to the workflow that actually produces the deliverable. **不要重复探索同一范围** — Do NOT re-explore the same scope by rewording the topic — if you can't say what concrete new question this round answers, it's time to switch to the deliverable-producing workflow. When the user named a deliverable, the research workflow's return will include a **交付物提醒** listing what's still owed and which workflow produces it — non-blocking, but don't ignore it.\n\
          \nIf the user picks 「先不锁方向 / 以后再定」, do NOT retreat to research. The answer usually implies a stage skeleton (e.g.「read whole → deep-read X → decide the change point」 is 3 stage tasks). Split the list by that skeleton and put「定改动点」 as the last task. Direction unlocked ≠ can't split.\n\
@@ -10558,6 +10558,13 @@ async fn register_workflow_tool(
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            if resume.is_none() {
+                if let Some(reason) =
+                    crate::workflow::learning_plan_route_error(&name, &topic, &cwd)
+                {
+                    return Err(tool_err(reason));
+                }
+            }
             if resume.is_none() && topic.trim().is_empty() {
                 return Err(tool_err(
                     "missing 'topic' field (required unless 'resume' is given)".into(),
@@ -11852,6 +11859,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let hint = workflow_tool_hint(dir.path());
         assert!(hint.contains("按交付物落点，不按话题词"), "hint: {hint}");
+        assert!(
+            hint.contains("choose `learn_plan`"),
+            "学习课程要路由到专用流程: {hint}"
+        );
         assert!(
             hint.contains("落点："),
             "hint 必须指向清单里的落点标注: {hint}"

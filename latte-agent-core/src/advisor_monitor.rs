@@ -1719,6 +1719,9 @@ struct MonitorState {
     /// 恒返回 `None`——欠着的任务清单再没有任何机制会提起它，看板至今
     /// 0 个任务。逐标签记账后，关掉一个只关一个。
     deliverables_done: std::collections::BTreeSet<&'static str>,
+    /// Planning workflow outputs are only deliverables after the workflow
+    /// finishes successfully; a failed start must remain an outstanding gap.
+    pending_workflow_deliverables: std::collections::HashMap<String, Vec<&'static str>>,
     /// D10 状态（跨 turn）：连续多少轮「有实质输出，却零推进」——
     /// 零工具调用（含 `ask`：该问就问会计入 tool_use，不算空转）、
     /// 零 delegate、非空产出。一轮命中 +1，任一轮有推进动作（任何工具
@@ -1751,6 +1754,7 @@ impl MonitorState {
             research_rounds: 0,
             deliverable_rounds: 0,
             deliverables_done: std::collections::BTreeSet::new(),
+            pending_workflow_deliverables: std::collections::HashMap::new(),
             reasoning_stall_streak: 0,
             delegated_this_turn: false,
         }
@@ -1961,12 +1965,8 @@ impl MonitorState {
                 ..
             } if role_id == &self.watched_role => {
                 findings.extend(self.detectors.observe_tool_use(tool_name, args));
-                // 提交任务清单即产出交付物：任务清单 / 计划两个标签就此关闭
-                // （只关这两个——学习材料、文档不因提交清单而交付）。
-                if tool_name == "plan" {
-                    let closes = crate::workflow::deliverables_produced_by_plan_submit();
-                    self.tally_dispatch(false, &closes);
-                }
+                // Plan is only a proposal if the tool succeeds. Record completion
+                // from PlanProposed below, not from the attempted ToolUse event.
                 // 这里**不**触发路由审查。曾经在 `ToolUse{workflow}` 上
                 // 置 `review_requested`，但那一刻摘要里还没有任何关于这次
                 // 分派的行——描述这次分派的 `[workflow started]` 行是在
@@ -2112,7 +2112,11 @@ impl MonitorState {
                     turn_ended = true;
                 }
             }
-            ChatEvent::WorkflowStarted { name, topic, .. } => {
+            ChatEvent::PlanProposed { role_id, .. } if role_id == &self.watched_role => {
+                let closes = crate::workflow::deliverables_produced_by_plan_submit();
+                self.tally_dispatch(false, &closes);
+            }
+            ChatEvent::WorkflowStarted { name, topic, wf_id } => {
                 // 嵌套标注：栈非空说明这是外层 workflow 的步骤里拉起的
                 // 子 workflow，不是又一次独立派发。
                 let nesting = match self.workflow_stack.last() {
@@ -2136,17 +2140,28 @@ impl MonitorState {
                     // 关不掉「任务清单」。旧实现是个布尔（planning 流程或
                     // learn/write_doc/update_docs → true），于是跑一个 learn
                     // 就把同一句诉求里点名的任务清单也一起"交付"了。
+                    self.tally_dispatch(research, &[]);
+                }
+                if !crate::workflow::is_research_workflow(name) {
                     let closes = crate::workflow::deliverables_produced_by(name);
-                    self.tally_dispatch(research, &closes);
+                    if !closes.is_empty() {
+                        self.pending_workflow_deliverables
+                            .insert(wf_id.clone(), closes);
+                    }
                 }
                 self.workflow_stack.push(name.clone());
             }
             ChatEvent::WorkflowFinished {
                 name,
+                wf_id,
                 status,
                 summary,
-                ..
             } => {
+                if let Some(closes) = self.pending_workflow_deliverables.remove(wf_id) {
+                    if status == "ok" {
+                        self.tally_dispatch(false, &closes);
+                    }
+                }
                 self.digest.push(format!(
                     "[workflow {name} {status}] {}",
                     truncate_chars(summary, 1_000)
@@ -2494,6 +2509,14 @@ mod tests {
             tool_name: name.into(),
             args: args.into(),
             sub_id: None,
+        }
+    }
+
+    fn plan_proposed() -> ChatEvent {
+        ChatEvent::PlanProposed {
+            role_id: "manager".into(),
+            plan_id: "plan-test".into(),
+            tasks: Vec::new(),
         }
     }
 
@@ -3157,6 +3180,7 @@ mod tests {
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
         s.observe(&wf_started("implementation_plan"));
+        s.observe(&wf_finished("implementation_plan"));
         let facts = s.session_facts().expect("教程还欠着，缺口不该整体关闭");
         assert!(facts.contains("已经往产出走的"), "{facts}");
         assert!(facts.contains("任务清单"), "{facts}");
@@ -3167,9 +3191,11 @@ mod tests {
         // 流程（流程内部步骤不是 manager 的又一次分派，不记账）。
         s.observe(&wf_finished("implementation_plan"));
         s.observe(&wf_started("learn"));
+        assert!(s.session_facts().is_some(), "启动不代表学习材料已交付");
+        s.observe(&wf_finished("learn"));
         assert!(
             s.session_facts().is_none(),
-            "三个标签全部产出后不该再报缺口"
+            "三个标签全部成功产出后不该再报缺口"
         );
     }
 
@@ -3196,13 +3222,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_plan_workflow_does_not_close_task_list_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        s.observe(&wf_started("implementation_plan"));
+        s.observe(&ChatEvent::WorkflowFinished {
+            name: "implementation_plan".into(),
+            wf_id: "wf-implementation_plan".into(),
+            status: "failed".into(),
+            summary: "VERDICT: REJECT".into(),
+        });
+        assert!(s
+            .session_facts()
+            .expect("failed plan remains owed")
+            .contains("任务清单"));
+    }
+
+    #[test]
+    fn attempted_plan_tool_call_does_not_close_task_list_gap() {
+        let mut s = state();
+        s.observe(&user_msg(JEMALLOC_ASK));
+        s.observe(&wf_started("explore"));
+        s.observe(&wf_finished("explore"));
+        s.observe(&tool_use("plan", "{\"tasks\":[]}"));
+        assert!(s
+            .session_facts()
+            .expect("failed tool attempt remains owed")
+            .contains("任务清单"));
+    }
+
+    #[test]
     fn plan_submission_closes_the_task_list_gap_only() {
         let mut s = state();
         s.observe(&user_msg(JEMALLOC_ASK));
         s.observe(&wf_started("explore"));
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some());
-        s.observe(&tool_use("plan", "{\"tasks\":[]}"));
+        s.observe(&plan_proposed());
         let facts = s.session_facts().expect("提交清单关不掉「教程」这一样");
         assert!(facts.contains("任务清单"), "{facts}");
         assert!(facts.contains("教程 / 学习材料"), "{facts}");
@@ -3217,9 +3275,11 @@ mod tests {
         s.observe(&wf_finished("explore"));
         assert!(s.session_facts().is_some(), "任务清单欠着时要报");
         s.observe(&wf_started("implementation_plan"));
+        assert!(s.session_facts().is_some(), "启动不代表计划交付");
+        s.observe(&wf_finished("implementation_plan"));
         assert!(
             s.session_facts().is_none(),
-            "只点名了任务清单，跑了规划流程就该彻底关闭"
+            "成功完成规划流程后才关闭任务清单"
         );
     }
 

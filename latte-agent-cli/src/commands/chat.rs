@@ -2796,6 +2796,11 @@ async fn register_workflow_tool(
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| tool_err("missing 'topic' field".into()))?
                     .to_string();
+                if let Some(reason) =
+                    latte_agent_core::workflow::learning_plan_route_error(&name, &topic, &cwd)
+                {
+                    return Err(tool_err(reason));
+                }
                 let wf = latte_agent_core::workflow::load_workflow(&name, &cwd).map_err(|e| {
                     let available = latte_agent_core::workflow::list_workflows(&cwd)
                         .iter()

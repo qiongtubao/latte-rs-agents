@@ -3829,6 +3829,32 @@ pub fn is_planning_workflow(name: &str) -> bool {
     )
 }
 
+/// Learning curricula have a dedicated workflow with stricter chapter, path,
+/// and prerequisite checks. Reject routing those requests through the generic
+/// planning workflow, which only validates the import-task shape.
+pub fn learning_plan_route_error(name: &str, topic: &str, cwd: &Path) -> Option<String> {
+    if name != "implementation_plan" || !load_workflow("learn_plan", cwd).is_ok() {
+        return None;
+    }
+    let topic = topic.to_lowercase();
+    let curriculum = [
+        "学习计划",
+        "学习路径",
+        "学习任务",
+        "从浅到深学习",
+        "课程",
+        "教材",
+    ]
+    .iter()
+    .any(|needle| topic.contains(needle));
+    let task_breakdown = ["拆分", "拆任务", "任务清单", "任务列表", "学习计划"]
+        .iter()
+        .any(|needle| topic.contains(needle));
+    (curriculum && task_breakdown).then(|| {
+        "该主题是学习课程/学习任务拆分；请改用专用 workflow `learn_plan`（/learn-plan）。它会机械校验章节顺序、先修关系、阅读路径并在审查拒绝时定向返工。通用 implementation_plan 不具备这些学习目录门禁。".to_string()
+    })
+}
+
 /// 交付物表：`(标签, 诉求里的关键词, 产出它该跑的流程, 能产出它的流程名)`。
 ///
 /// 单一真源——`named_deliverables` / `deliverable_route` /
@@ -16165,6 +16191,37 @@ mod tests {
     ///
     /// 两处各写一份名单必然漂移：加了新的规划流程只改一处，另一处就静默
     /// 失效（记账那侧漂移的后果是交付物缺口永远关不掉或永远不响）。
+    #[test]
+    fn generic_plan_rejects_curriculum_requests_when_learn_plan_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflows = dir.path().join(".latte/workflows.d");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("learn_plan.toml"),
+            r#"name = "learn_plan"
+description = "学习计划"
+[[steps]]
+id = "a"
+speakers = ["tutor"]
+prompt = "{{topic}}"
+"#,
+        )
+        .unwrap();
+        assert!(learning_plan_route_error(
+            "implementation_plan",
+            "把代码拆成小白从浅到深的学习计划和学习任务清单",
+            dir.path(),
+        )
+        .is_some());
+        assert!(learning_plan_route_error(
+            "implementation_plan",
+            "给初学者拆分代码实现任务",
+            dir.path(),
+        )
+        .is_none());
+        assert!(learning_plan_route_error("learn_plan", "从浅到深学习计划", dir.path(),).is_none());
+    }
+
     #[test]
     fn planning_workflows_agree_between_predicate_and_table() {
         let from_table = deliverables_produced_by("implementation_plan");
