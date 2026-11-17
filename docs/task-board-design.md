@@ -143,6 +143,10 @@ Phase 2 起，**隔离类任务**（按 `task_type` 的 `isolated` 或任务自�
   "parent_id": "LAT-100",
   "sub_order": 0,
 
+  "needs_split": true,
+  "outline_path": "docs/outlines/root.md",
+  "doc_path": null,
+
   "scheduled_at": null,
   "workflow": null,
 
@@ -164,6 +168,9 @@ Phase 2 起，**隔离类任务**（按 `task_type` 的 `isolated` 或任务自�
 }
 ```
 
+- **`needs_split`**：规划标记，是否需要继续拆分（旧文件缺省 `false` 兼容）；见 §3.4
+- **`outline_path`**：大纲文档路径（项目相对），**只在根任务上写**；旧文件缺省 `null`
+- **`doc_path`**：已发布的学习文档路径（项目相对），发布时由引擎回写；缺省 `null`
 - **`task_type`**：业务类型，可空（旧文件缺省 `null` 兼容）；派发时按注册表推导 `effective_workflow`
 - **`workflow`**：显式绑定；空表示未绑定（可被类型默认覆盖）
 - **`effective_workflow`**：仅视图字段（`TaskView`），不落盘
@@ -182,3 +189,68 @@ Phase 2 起，**隔离类任务**（按 `task_type` 的 `isolated` 或任务自�
 - 直接子任务全部 done → 父任务自动 done，并向上冒泡直到根
   （`maybe_complete_parent`）；父卡片显示**全部后代**的聚合进度
 - 派发父任务时把直接子任务清单拼进发给 manager 的消息（见 §5）
+
+### 3.4 规划标记：needs_split / outline_path / doc_path
+
+**`needs_split` 是规划标记，不是"有没有子任务"的推论。** `true` = 这个大任务还得
+继续拆；它和当前是否已经有子任务**解耦**——把拆出来的子任务删掉不会把意图一起
+丢掉，反过来叶子任务也可以临时挂子任务。`needs_split=false` 的任务就是叶子：
+`POST /api/tasks/:id/refine` 直接回 409（"叶子任务不可再拆"），要拆先在看板把它
+置回 `true`。拆分类 workflow（`outline_split` / `task_refine`）的产物必须**显式**
+写这个字段（`require_needs_split`），漏写整单打回——"没写"和"写了 false"在
+类型化之后分不开，所以这道门查的是原始 JSON 键。
+
+**`outline_path` 只写在根任务上。** 它指向项目相对的大纲文档
+`docs/outlines/<slug>.md`；子孙任务一律靠视图字段 `effective_outline_path`
+（自身优先，否则沿 `parent_id` 祖先链找最近的一份，带防环上限）解析。
+这样一份大纲只有一个"主人"，不会在多个任务上各存一份副本、改一处漏一处；
+祖先链上没有 = 这个任务不属于任何大纲（`POST /api/outlines/:id/sync` 此时回 409）。
+
+大纲是任务树的第二权威：看板管"谁在做、做到哪"，大纲管"为什么这么拆"加上
+人手写的叙述。机器只碰受控区块，区块外的前言/正文一个字不动：
+
+```markdown
+<!-- node:LAT-100 -->
+<!-- section:body:start -->
+## 概述
+人手维护的叙述，任何同步都不碰这一段。
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-101 needs_split -->
+### 模块一
+<!-- learn-links:start -->
+- [模块一笔记](../learn/module-one.md)（task LAT-101）
+<!-- learn-links:end -->
+<!-- children:end -->
+```
+
+手改大纲之后用 `POST /api/outlines/:task_id/sync` 推回看板：只同步**结构**
+（id / title / parent_id / needs_split），执行状态、依赖、调度、runs 一律不动——
+那些是看板的权威。缺项默认只报不删（误删一行锚点不该等于删掉整棵子树），
+真要删得显式 `?prune=true`。
+
+**`doc_path` 指向该任务发布过的学习文档。** 学习 workflow 定稿
+`docs/learn/<name>.md` 时由引擎回写这个字段（写不进去只警告，不影响已经落盘的
+定稿）；子任务发布时靠它把文档 frontmatter 的 `parent_doc` 指到父文档，学习文档
+因此长成一棵镜像任务树的文档树。
+
+### 3.5 大任务怎么拆：outline_split → 导入定稿
+
+一条大任务走 `outline_split` workflow：`breakdown`（task_planner 出任务树 JSON，
+每个节点显式带 `needs_split`）→ `outline_draft`（`outline_writer` 写大纲草案，
+锚点用 `tmp:<标题>` 临时键，并过 `require_outline_against_plan`：锚点标题集合与
+清单逐字一致、`needs_split` 一致、无孤儿锚点）→ `gate`（reviewer 评审，退回
+`breakdown`）→ `submit`（零模型，只提出 plan）。
+
+草案落在 `.latte/outline-drafts/<plan_id>.md`；真实 task id 要到用户在看板弹窗里
+导入才分配，所以**定稿发生在导入时**：`POST /api/tasks/import` 建完任务后，用
+"标题 → 真实 id"映射跑 `outline::rebind_tmp_ids`，把所有 `tmp:` 锚换成 `LAT-*`，
+写 `docs/outlines/<slug>.md`，再把 `outline_path` 挂到根任务上（根锚是
+`LAT-ROOT` 或本项目里不存在的 id 时，挂到每个顶层新任务，否则整份大纲没人指向）。
+任何一个 `tmp:` 锚绑不上就整单失败——绝不把临时锚发布出去；回滚会把大纲文件
+（连同导入前已有的同名文件）和各任务的 `outline_path` 一起还原。
+
+子任务拆分（`task_refine`）同理，只是插入在导入时机械完成：建完子任务后解析父
+任务的 `effective_outline_path`，按真实 id 把每个直接子任务插到父节点下（已有则
+更新，不重复插）；父节点锚点找不到就整单失败，父任务本来就没有大纲则跳过
+（这次拆分不维护大纲，不是错误）。

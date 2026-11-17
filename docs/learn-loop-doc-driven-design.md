@@ -168,6 +168,36 @@ v2 把教学载体从"chat 消息"改为"**持续演化的 markdown 文档**"：
 `docs/learn/<slug>.md`：merge 步把 draft.md 定稿（重排章节、合并补充内容、
 生成目录、去掉轮次痕迹），这是学习流程的交付物。
 
+**归属 frontmatter（2026-11-17 增补）**：定稿落盘**之前**就在文件头拼上归属信息，
+归属靠字段而不是 slug 前缀（slug 发布时会被剥），读者拿到的这一份自带身份：
+
+```yaml
+---
+task_id: LAT-101
+outline_node_id: LAT-101
+parent_doc: docs/learn/mem-layout.md
+order: 2
+outline: docs/outlines/mem-layout.md
+---
+```
+
+- `task_id` 从 slug 的 `lat-<id>-` 前缀解析，`outline_node_id` 与它同值——大纲节点
+  和看板任务按 id 一一对应，不另建映射表；没有该前缀的手写文档写裸 `null`。
+- `parent_doc` / `order` 从看板 `parent_id` + `sub_order` 读。父任务**没发布过**
+  文档时 `parent_doc` 为 `null`——绝不从 id 伪造成 `docs/learn/<id>.md`。
+- `outline` 是该任务生效的大纲（沿祖先链找最近的 `outline_path`），项目相对路径。
+- **回写大纲**：发布成功后，由该任务在大纲里的节点（owning node）的
+  `learn-links` 区块追加一行 `- [标题](../learn/<name>.md)（task LAT-101）`；
+  同一文档路径重复发布时**替换**那一行而不是再追加（幂等），手写的其它链接原样保留。
+- **文档树**：子任务文档靠 `parent_doc` 挂在父任务文档之下，形成一棵镜像任务树的
+  文档树，大纲里的 `learn-links` 给出同一棵树的反向入口。
+- **宁缺不毁**：大纲读不到、解析失败、找不到对应节点、写盘失败——一律只在 merge
+  结果里给出警告（"定稿本身已发布"），绝不删掉或回滚一份**已经写好的**文档；
+  回写看板 `doc_path` 失败同样只是警告。
+- 全流程（`finalize_learn_doc` + `link_outline`）见
+  [`docs/superpowers/specs/2026-11-17-outline-driven-workflows-design.md`](superpowers/specs/2026-11-17-outline-driven-workflows-design.md)
+  §7.4。
+
 ### 4.5 注释版代码副本（2026-09-15 增补，2026-09-16 改为默认生成）
 
 annotate 步（默认必跑）为每个知识点的 `evidence` 生成
@@ -183,6 +213,12 @@ supplement 新增知识点时由 doc 步补生成对应副本。
 代码**，建议该任务开 isolated worktree（看板编辑弹窗可覆盖）。
 
 ## 5. Step 定义（workflow 层）
+
+> **§5 已过期**（2026-09-16 起）：下面的步骤表与 §5.2（`doc` 单步、
+> `loop_back_routes = doc`）已被 `doc_review` 嵌套 workflow 取代，原文保留备查；
+> 现行步骤见 `docs/learn-loop-doc-writing-logic.md` §8 的差异说明。
+> 定稿的归属 frontmatter、大纲 `learn-links` 回写与文档树见 §4.4 的
+> 2026-11-17 增补（规格全文见 outline-driven-workflows 设计 §7.4）。
 
 ```
 plan → annotate → doc → read_confirm → quiz → supplement → merge → [sync_code?] → report
