@@ -55,16 +55,19 @@ pub struct OutlineNode {
     ///
     /// 保留原文是为了排版信息不丢：标题的 `#` 层级、奇怪的空白都按原样写回。
     ///
-    /// **外部只读；改标题请走 [`OutlineNode::set_title`]**。直接改它会让
-    /// [`OutlineNode::heading_level`] 与标题行脱节，重新渲染就换了层级。
-    pub heading_raw: Option<String>,
+    /// 私有不变式：这一行的 `#` 个数**永远等于** [`OutlineNode::heading_level()`]
+    /// （没有标题行时两者一起为 `None` / 0）。能同时维护两者的只有
+    /// [`OutlineNode::new_child`] 和 [`OutlineNode::set_title`]，读走
+    /// [`OutlineNode::heading_raw()`]。字段一旦公开，外部就能写出"层级 3 + 行文
+    /// `##### old`"这种自相矛盾的状态，下次改标题会静默掉级。
+    heading_raw: Option<String>,
     /// 标题层级（`#` 的个数）：`### 标题` → 3；没有标题行时为 0。
     ///
-    /// 为什么显式存一份而不是每次从 [`OutlineNode::heading_raw`] 数：
+    /// 为什么显式存一份而不是每次从 [`OutlineNode::heading_raw()`] 数：
     /// 之后要在大纲里插入子节点（Task 7）时需要"父层级 + 1"这种算术，
     /// 让调用方去解析标题文本既脆又容易数错。
     ///
-    /// 私有：读走 [`OutlineNode::heading_level`]，改标题走
+    /// 私有：读走 [`OutlineNode::heading_level()`]，改标题走
     /// [`OutlineNode::set_title`]——层级与标题行只能由这一处一起维护，
     /// 外部能写的话两者迟早会互相矛盾。
     heading_level: u8,
@@ -110,6 +113,13 @@ impl OutlineNode {
         }
     }
 
+    /// 标题行原文；没有标题行时为 `None`。
+    ///
+    /// 只读：改标题走 [`OutlineNode::set_title`]，它会连同层级一起维护。
+    pub fn heading_raw(&self) -> Option<&str> {
+        self.heading_raw.as_deref()
+    }
+
     /// 标题层级（`#` 的个数）；没有标题行时是 0。
     pub fn heading_level(&self) -> u8 {
         self.heading_level
@@ -117,7 +127,7 @@ impl OutlineNode {
 
     /// 改标题文字：`title` 与标题行一起更新，**层级保持不变**。
     ///
-    /// 这是"改标题"的唯一入口。为什么不让调用方直接写 [`OutlineNode::heading_raw`]：
+    /// 这是"改标题"的唯一入口（`heading_raw` / `heading_level` 都是私有的）：
     /// 层级是排版信息、文字是内容，两者必须一起动，否则渲染出来的标题会掉级
     /// （`### 标题` 变成 `标题`），下次解析又是另一个层级。
     ///
@@ -144,7 +154,7 @@ pub struct OutlineDoc {
     ///
     /// **文档里展示的标题不归它管**：那是 [`OutlineDoc::preamble`] 里人手写的
     /// `# 总纲` 一级标题，机器从不改写。根节点没有自己的标题行
-    /// （[`OutlineNode::heading_raw`] 为 `None`）时，[`OutlineNode::title`] 也只是
+    /// （[`OutlineNode::heading_raw()`] 为 `None`）时，[`OutlineNode::title`] 也只是
     /// 结构元数据——大纲 → 看板的同步靠它，但文件里没有它对应的那一行文字。
     pub title: String,
     /// 第一个 `<!-- node: -->` 之前的全部原文（frontmatter、文档标题、人手写的前言）。
@@ -889,7 +899,7 @@ title: 总纲
 
         assert_eq!(doc.root.id, "LAT-100");
         assert_eq!(doc.root.title, "");
-        assert_eq!(doc.root.heading_raw, None, "根节点不该有标题行");
+        assert_eq!(doc.root.heading_raw(), None, "根节点不该有标题行");
         assert_eq!(doc.root.heading_level(), 0);
         assert!(doc.root.has_body_block);
         assert_eq!(doc.root.body, "## 概述\n正文一段。\n");
@@ -903,7 +913,7 @@ title: 总纲
         assert_eq!(child.id, "tmp:模块一");
         assert_eq!(child.title, "模块一");
         assert!(child.needs_split);
-        assert_eq!(child.heading_raw.as_deref(), Some("### 模块一"));
+        assert_eq!(child.heading_raw(), Some("### 模块一"));
         assert_eq!(child.heading_level(), 3);
         assert_eq!(child.body, "子正文。\n");
         assert!(child.has_learn_links_block);
@@ -957,7 +967,7 @@ title: T
 <!-- section:body:end -->
 ";
         let doc = parse_outline(md).expect("解析失败");
-        assert_eq!(doc.root.heading_raw, None);
+        assert_eq!(doc.root.heading_raw(), None);
         assert_eq!(doc.root.title, "");
         assert_eq!(doc.root.body, "正文\n");
         assert_eq!(render_outline(&doc), md);
@@ -1136,7 +1146,7 @@ title: T
         assert_eq!(doc.root.title, "新标题");
         assert!(doc.root.needs_split);
         assert_eq!(
-            doc.root.heading_raw.as_deref(),
+            doc.root.heading_raw(),
             Some("### 新标题"),
             "文件里的标题行也要跟着看板走（保留原有 # 层级）"
         );
@@ -1318,7 +1328,7 @@ title: 深层
 ";
         let doc = parse_outline(md).expect("解析失败");
 
-        assert_eq!(doc.root.heading_raw, None);
+        assert_eq!(doc.root.heading_raw(), None);
         assert_eq!(doc.root.heading_level(), 0, "没有标题行就没有层级");
         assert_eq!(doc.root.body, "根正文\n");
 
@@ -1404,14 +1414,14 @@ title: 总纲
         assert_eq!(doc.title, "总纲");
         assert!(doc.preamble.contains("# 总纲"));
 
-        assert_eq!(doc.root.heading_raw, None, "根节点不该被塞上标题行");
+        assert_eq!(doc.root.heading_raw(), None, "根节点不该被塞上标题行");
         assert_eq!(doc.root.title, "新总纲");
 
         let l1 = &doc.root.children[0];
-        assert_eq!(l1.heading_raw.as_deref(), Some("### 新一"));
+        assert_eq!(l1.heading_raw(), Some("### 新一"));
         assert_eq!(l1.heading_level(), 3);
         let l2 = &l1.children[0];
-        assert_eq!(l2.heading_raw.as_deref(), Some("##### 新二"));
+        assert_eq!(l2.heading_raw(), Some("##### 新二"));
         assert_eq!(l2.heading_level(), 5);
 
         // 正文一个字都不许动。
@@ -1431,13 +1441,13 @@ title: 总纲
 
         assert_eq!(node.title, "新");
         assert_eq!(node.heading_level(), 3, "改标题不许动层级");
-        assert_eq!(node.heading_raw.as_deref(), Some("### 新"));
+        assert_eq!(node.heading_raw(), Some("### 新"));
 
         let reparsed =
             parse_outline(&render_outline(&doc_with_root(node))).expect("渲染结果必须还能解析");
         assert_eq!(reparsed.root.title, "新");
         assert_eq!(reparsed.root.heading_level(), 3);
-        assert_eq!(reparsed.root.heading_raw.as_deref(), Some("### 新"));
+        assert_eq!(reparsed.root.heading_raw(), Some("### 新"));
     }
 
     #[test]
