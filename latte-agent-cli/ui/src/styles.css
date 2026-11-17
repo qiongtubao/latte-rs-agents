@@ -4487,6 +4487,8 @@ select {
 .tb-chip-session:hover { text-decoration: underline; }
 .tb-chip-rounds { background: #f1f5f9; color: #64748b; }
 .tb-chip-workflow { background: #fef3c7; color: #92400e; }
+/* 待拆：规划层标记（还需继续拆），与执行状态色系分开，避免被当成状态。 */
+.tb-chip-split { background: #ffe4e6; color: #be123c; }
 
 /* 执行流水（任务抽屉里列 workflow run 的卡片） */
 .tb-wfrun-card {
