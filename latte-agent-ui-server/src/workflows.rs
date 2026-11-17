@@ -337,6 +337,11 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 // 可配；表单编辑器的试运行给零值（不校验、不 patch、不
                 // 机械提交 = 现状行为）。
                 require_plan_tasks: false,
+                // 拆分类清单的形状校验（needs_split 必须显式且为布尔、标题唯一）
+                // 与「大纲 vs 清单」对账同样只在 TOML 权威版可配；表单编辑器的
+                // 试运行给零值（不校验 = 现状行为）。
+                require_needs_split: false,
+                require_outline_against_plan: false,
                 // 学习书目录结构校验同样只在 TOML 权威版可配。
                 require_learn_book: false,
                 // 符号可解析性校验同样只在 TOML 权威版可配（false = 现状行为）。
