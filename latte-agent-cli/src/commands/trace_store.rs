@@ -450,6 +450,9 @@ mod tests {
                 args_json: "{}".into(),
                 latency_ms: 1,
                 status: ToolStatus::Ok("ok".into()),
+                output_complete: true,
+                output_bytes: 0,
+                artifact: None,
             },
             TraceEvent::TurnEnd {
                 meta: TraceMeta {

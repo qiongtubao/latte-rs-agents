@@ -200,6 +200,9 @@ mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: crate::trace::ToolStatus::Ok("{}".into()),
+            output_complete: true,
+            output_bytes: 0,
+            artifact: None,
         }
     }
 
