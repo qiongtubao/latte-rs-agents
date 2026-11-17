@@ -1473,11 +1473,12 @@ export interface TaskView {
   effective_workflow: string | null;
   /** 规划判定：是否仍需继续拆分（false=叶子，禁止再拆）。 */
   needs_split: boolean;
-  /** 大纲文档路径（仅根任务，项目相对）；子孙用 effective_outline_path。 */
-  outline_path: string | null;
-  /** 学习任务发布后的文档路径。 */
-  doc_path: string | null;
-  /** 生效的大纲路径（服务端沿祖先链解析）。 */
+  /** 大纲文档路径（仅根任务，项目相对）。服务端带 `skip_serializing_if`，
+   *  非根任务上该字段**不出现**（undefined），不是 null。 */
+  outline_path?: string | null;
+  /** 学习任务发布后的文档路径。同样的 optional 语义（未发布时不出现）。 */
+  doc_path?: string | null;
+  /** 生效的大纲路径（服务端沿祖先链解析；无大纲时是 null）。 */
   effective_outline_path: string | null;
   /** 子任务聚合（父任务用）：总数 / 终态数 / 各状态计数。 */
   sub_total: number;
