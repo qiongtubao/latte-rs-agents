@@ -535,43 +535,78 @@ fn check_plan_tasks_output(
     Ok(())
 }
 
-/// 清单里一个任务在**原始 JSON** 里的样子——只留对账要用的三样东西。
+/// 清单里一个任务在**原始 JSON** 里的样子——只留对账要用的几样东西。
 ///
 /// 为什么不复用 `controller::PlanTask`：`PlanTask.needs_split` 带
 /// `#[serde(default)]`，「没写」和「写了 false」解析后一模一样，而
 /// [`check_plan_task_shape`] 要区分它们（缺字段 = 规划意图不明，绝不能
-/// 默默当叶子）。所以要另留一个 `has_needs_split_key`。
+/// 默默当叶子）。所以要另留原始 JSON 值，顺便能查出「写了但不是布尔」。
 struct RawPlanTask {
-    title: String,
-    /// JSON 里有没有 `needs_split` 这个键。
-    has_needs_split_key: bool,
-    /// 键存在时的布尔值；不存在或不是布尔 → `None`。
-    needs_split: Option<bool>,
+    /// 报错里指认「哪一个」任务：`第 2 个任务`、`第 1 个任务的第 3 个子任务`。
+    ///
+    /// 为什么不用标题当指认：模型漏写 title 时标题根本不存在，一个占位串
+    /// （`<无标题>`）指不出是哪一个节点——而缺标题正是最需要点名的那类错误。
+    label: String,
+    /// 标题原文；缺字段或全是空白 → `None`。
+    title: Option<String>,
+    /// `needs_split` 的**原值**：`None` = JSON 里没有这个键。
+    needs_split: Option<serde_json::Value>,
+}
+
+impl RawPlanTask {
+    /// 报错里的人类可读指认：`第 2 个任务「甲」` / `第 2 个任务（无标题）`。
+    fn describe(&self) -> String {
+        match &self.title {
+            Some(title) => format!("{}「{title}」", self.label),
+            None => format!("{}（无标题）", self.label),
+        }
+    }
+
+    /// 这个任务声明了「要再拆」吗（非布尔值按未声明处理，另有门禁报类型错）。
+    fn needs_split_flag(&self) -> bool {
+        self.needs_split
+            .as_ref()
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+/// JSON 值的类型名（报错用）：模型写了 `"needs_split": "true"` 这种字符串时，
+/// 要能一眼看出「是字符串而不是布尔」，否则它会照着同一句话再写一遍。
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "布尔值",
+        serde_json::Value::Number(_) => "数字",
+        serde_json::Value::String(_) => "字符串",
+        serde_json::Value::Array(_) => "数组",
+        serde_json::Value::Object(_) => "对象",
+    }
 }
 
 /// 按 `tasks` + 任意深度 `subtasks` 收集所有任务（原始 JSON 视角）。
 fn collect_raw_plan_tasks(plan: &serde_json::Value) -> Vec<RawPlanTask> {
-    fn walk(v: &serde_json::Value, out: &mut Vec<RawPlanTask>) {
+    fn walk(v: &serde_json::Value, label: String, out: &mut Vec<RawPlanTask>) {
         let Some(obj) = v.as_object() else { return };
         out.push(RawPlanTask {
             title: obj
                 .get("title")
                 .and_then(|t| t.as_str())
-                .unwrap_or("<无标题>")
-                .to_string(),
-            has_needs_split_key: obj.contains_key("needs_split"),
-            needs_split: obj.get("needs_split").and_then(serde_json::Value::as_bool),
+                .filter(|t| !t.trim().is_empty())
+                .map(str::to_string),
+            needs_split: obj.get("needs_split").cloned(),
+            label: label.clone(),
         });
         if let Some(subs) = obj.get("subtasks").and_then(|s| s.as_array()) {
-            for sub in subs {
-                walk(sub, out);
+            for (j, sub) in subs.iter().enumerate() {
+                walk(sub, format!("{label}的第 {} 个子任务", j + 1), out);
             }
         }
     }
     let mut out = Vec::new();
     if let Some(arr) = plan.get("tasks").and_then(|t| t.as_array()) {
-        for task in arr {
-            walk(task, &mut out);
+        for (i, task) in arr.iter().enumerate() {
+            walk(task, format!("第 {} 个任务", i + 1), &mut out);
         }
     }
     out
@@ -582,7 +617,11 @@ fn collect_raw_plan_tasks(plan: &serde_json::Value) -> Vec<RawPlanTask> {
 ///
 /// 为什么要两个入口：单元测试直接喂 JSON，而 runner 手里是整份模型产出。
 /// 判据各写一份迟早会漂开，所以两个门禁共用这一个入口。
-fn extract_plan_tasks(text: &str) -> Result<serde_json::Value, String> {
+///
+/// 与 `controller::extract_plan_tasks` 不是一回事（名字相近但别合并）：那个
+/// 从**工具调用参数**里抽清单并返回解析后的 `PlanTask` 树；这个只看文本，
+/// 返回原始 JSON——因为「needs_split 键在不在」这件事在类型化之后就丢了。
+fn plan_json_from_output(text: &str) -> Result<serde_json::Value, String> {
     let trimmed = text.trim();
     if !trimmed.is_empty() {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
@@ -596,24 +635,28 @@ fn extract_plan_tasks(text: &str) -> Result<serde_json::Value, String> {
 }
 
 /// 拆分类清单的**形状**校验：每个任务（含任意深度 `subtasks`）都必须显式
-/// 带 `needs_split`，且标题唯一。
+/// 带 `needs_split`（且必须是布尔），并且标题唯一。
 ///
 /// 为什么缺字段要硬拒：`needs_split` 决定这份清单能不能继续往下拆。模型漏写
 /// 时 serde 默认成 `false`，读起来与「已经拆到叶子」一模一样——「没想清楚」
 /// 于是被当成「确定不用再拆」放行。
+///
+/// 为什么还要查类型（`"needs_split": "true"` 这种）：键在、值不是布尔时
+/// `as_bool()` 是 `None`，后面按「未声明」或「false」处理都是猜。LLM 写字符串
+/// 布尔的频率很高，让它重写一个真正的布尔比猜它想说什么便宜得多。
 ///
 /// 为什么标题必须唯一（实测动因）：大纲锚点是 `tmp:<标题>`，重名两个任务会
 /// 撞同一个锚点（解析器拒），而标题对账又会把其中一个判成缺项（本文件的
 /// [`check_outline_against_plan`] 拒）；更糟的是 patch/对账都按标题定位，模型
 /// 根本改不动清单——refine ↔ gate 会死循环。所以在清单阶段就拒，并点名要改的标题。
 fn check_plan_task_shape(plan_json: &str) -> Result<(), String> {
-    let plan = extract_plan_tasks(plan_json)?;
+    let plan = plan_json_from_output(plan_json)?;
     let tasks = collect_raw_plan_tasks(&plan);
 
-    let missing: Vec<&str> = tasks
+    let missing: Vec<String> = tasks
         .iter()
-        .filter(|t| !t.has_needs_split_key)
-        .map(|t| t.title.as_str())
+        .filter(|t| t.needs_split.is_none())
+        .map(RawPlanTask::describe)
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -622,9 +665,26 @@ fn check_plan_task_shape(plan_json: &str) -> Result<(), String> {
         ));
     }
 
+    let not_bool: Vec<String> = tasks
+        .iter()
+        .filter_map(|t| {
+            let raw = t.needs_split.as_ref()?;
+            (!raw.is_boolean())
+                .then(|| format!("{}（实际是 {}）", t.describe(), json_type_name(raw)))
+        })
+        .collect();
+    if !not_bool.is_empty() {
+        return Err(format!(
+            "以下任务的 needs_split 不是布尔值：{}",
+            not_bool.join("、")
+        ));
+    }
+
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for task in &tasks {
-        *counts.entry(task.title.as_str()).or_insert(0) += 1;
+        if let Some(title) = &task.title {
+            *counts.entry(title.as_str()).or_insert(0) += 1;
+        }
     }
     let dup: Vec<&str> = counts
         .iter()
@@ -641,19 +701,43 @@ fn check_plan_task_shape(plan_json: &str) -> Result<(), String> {
 }
 
 /// 大纲侧的解析：模型产出是「一句话 + 一个 ```markdown fence」，而
-/// `parse_outline` 只认文件本体。先按原文试（模型可能只吐裸文档），失败再
-/// 逐个 fence 试——报错沿用原文那一次，因为它最可能是真原因（没有 frontmatter）。
+/// `parse_outline` 只认文件本体。先按原文试（模型可能只吐裸文档）；原文不通
+/// 时逐个 fence 试，**要求恰好一个可解析**——与 [`find_tasks_fence`] 同一条
+/// 严格性：两份都长得像正式稿时，「哪份是 canonical」无从判断，猜错了就是把
+/// 另一份大纲绑给清单，而且没人会发现。
+///
+/// 报错取 **fence 那一次**的：模型把正文放进 fence 时，真正的缺陷（缺
+/// frontmatter、区块不配对）就在 fence 内的错误里；沿用原文那条「第 1 行必须
+/// 是 `---`」会让模型去改围栏外那句话，改完还是错。一个 fence 都没有时才用
+/// 原文错误。
 fn parse_outline_from_output(md: &str) -> Result<crate::outline::OutlineDoc, String> {
-    let first_err = match crate::outline::parse_outline(md) {
+    let raw_err = match crate::outline::parse_outline(md) {
         Ok(doc) => return Ok(doc),
         Err(e) => e,
     };
+    let mut hits: Vec<crate::outline::OutlineDoc> = Vec::new();
+    let mut fence_err: Option<String> = None;
     for (_, _info, content) in fenced_code_blocks(md) {
-        if let Ok(doc) = crate::outline::parse_outline(&content) {
-            return Ok(doc);
+        match crate::outline::parse_outline(&content) {
+            Ok(doc) => hits.push(doc),
+            Err(e) => {
+                if fence_err.is_none() {
+                    fence_err = Some(e);
+                }
+            }
         }
     }
-    Err(format!("大纲文档无法解析：{first_err}"))
+    match hits.len() {
+        0 => Err(format!(
+            "大纲文档无法解析：{}",
+            fence_err.unwrap_or(raw_err)
+        )),
+        1 => Ok(hits.pop().expect("len == 1")),
+        n => Err(format!(
+            "产出里有 {n} 个可解析的大纲块，无法判断哪份是正式稿；\
+             请只保留一个 ```markdown 块（示例/草稿删掉或改成非大纲结构）"
+        )),
+    }
 }
 
 /// 收集大纲里**除根节点外**所有节点的 `(标题, needs_split)`。
@@ -685,7 +769,7 @@ fn collect_outline_titles(node: &crate::outline::OutlineNode, out: &mut Vec<(Str
 /// 无从比较 needs_split。
 fn check_outline_against_plan(plan_json: &str, outline_md: &str) -> Result<(), String> {
     check_plan_task_shape(plan_json)?;
-    let plan = extract_plan_tasks(plan_json)?;
+    let plan = plan_json_from_output(plan_json)?;
     let plan_tasks = collect_raw_plan_tasks(&plan);
     let doc = parse_outline_from_output(outline_md)?;
 
@@ -694,25 +778,30 @@ fn check_outline_against_plan(plan_json: &str, outline_md: &str) -> Result<(), S
 
     // 标题按多重集比：清单侧唯一（形状门禁保证），大纲侧可以重复——两个锚点
     // 标同一个标题就是多出来的一项，同样会把 `tmp:` 回填搞乱。
-    let mut plan_counts: std::collections::BTreeMap<&str, usize> =
+    //
+    // 缺标题的任务用**位置标签**参与对账：它没有可匹配的标题，必须报成「缺少」，
+    // 否则一个漏了 title 的任务会静默从对账里消失（形状门禁只查 needs_split，
+    // 不查 title）。
+    let mut plan_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for task in &plan_tasks {
-        *plan_counts.entry(task.title.as_str()).or_insert(0) += 1;
+        let key = task.title.clone().unwrap_or_else(|| task.describe());
+        *plan_counts.entry(key).or_insert(0) += 1;
     }
-    let mut outline_counts: std::collections::BTreeMap<&str, usize> =
+    let mut outline_counts: std::collections::BTreeMap<String, usize> =
         std::collections::BTreeMap::new();
     for (title, _) in &outline_titles {
-        *outline_counts.entry(title.as_str()).or_insert(0) += 1;
+        *outline_counts.entry(title.clone()).or_insert(0) += 1;
     }
     let missing: Vec<&str> = plan_counts
         .iter()
         .filter(|(title, n)| outline_counts.get(*title).copied().unwrap_or(0) < **n)
-        .map(|(title, _)| *title)
+        .map(|(title, _)| title.as_str())
         .collect();
     let extra: Vec<&str> = outline_counts
         .iter()
         .filter(|(title, n)| plan_counts.get(*title).copied().unwrap_or(0) < **n)
-        .map(|(title, _)| *title)
+        .map(|(title, _)| title.as_str())
         .collect();
     if !missing.is_empty() || !extra.is_empty() {
         let mut parts = Vec::new();
@@ -733,7 +822,7 @@ fn check_outline_against_plan(plan_json: &str, outline_md: &str) -> Result<(), S
     // 「大纲里标了要再拆」，两处不一致就等于大纲在骗读者。
     let plan_flags: std::collections::BTreeMap<&str, bool> = plan_tasks
         .iter()
-        .map(|t| (t.title.as_str(), t.needs_split.unwrap_or(false)))
+        .filter_map(|t| t.title.as_deref().map(|title| (title, t.needs_split_flag())))
         .collect();
     let mismatched: Vec<String> = outline_titles
         .iter()
@@ -3314,6 +3403,16 @@ impl WorkflowStepDef {
         out
     }
 
+    /// 本步是否开着拆分类的两条机械门禁（`require_needs_split` /
+    /// `require_outline_against_plan`）。
+    ///
+    /// 抽成谓词是为了把「两条门禁默认关」这件事钉进测试：runner 的完整回路
+    /// 要 mock provider，代价太大，而真正决定「有没有这道门」的就是这一个
+    /// 布尔。runner 的 guard 也只认它，别处另写一份判据就会漂开。
+    pub fn plan_shape_gates_enabled(&self) -> bool {
+        self.require_needs_split || self.require_outline_against_plan
+    }
+
     /// 本次真正要派的角色 + 被跳过的可选角色（含原因）。
     ///
     /// `topic` 取 workflow 入口写入 vars 的 `topic`（嵌套 step 取当前层
@@ -3864,6 +3963,13 @@ impl WorkflowDef {
             // `require_outline_against_plan` 分支）：配置里必须真有更早的 step
             // 绑了这个 output_key，否则运行时永远拿到空串，这条门禁就只剩
             // 「变量为空」一个报错——配置错误被拖到执行期才暴露。
+            //
+            // 为什么不做成 `outline_from = "<变量名>"` 这种具名源字段（评审
+            // 提出过，决定不做）：目前只有 outline_split 一份 workflow 用它，
+            // 而下面这条校验已经保证 `draft` 一定存在；多一个字段只会把
+            // 「哪两个变量在对账」从一条显式约束变成一种可配置组合，而组合
+            // 错了没有任何测试覆盖。真出现第二个来源时再抽，届时连同比对逻辑
+            // 一起改。
             if step.require_outline_against_plan {
                 let own_idx = self.steps.iter().position(|s| s.id == step.id);
                 let ok = own_idx.is_some_and(|i| {
@@ -14548,7 +14654,7 @@ async fn run_workflow_serial(
                     // 只有判据不同，所以合成一个块、共用一次 attempt 计数。
                     // 顺序有意：先查清单形状（needs_split 显式、标题唯一），再拿
                     // 清单去对大纲——标题不唯一时按标题对账根本无从谈起。
-                    if step.require_needs_split || step.require_outline_against_plan {
+                    if step.plan_shape_gates_enabled() {
                         let checked = (|| -> Result<(), String> {
                             if step.require_needs_split {
                                 check_plan_task_shape(&response)?;
@@ -26385,6 +26491,106 @@ output_key = "design"
         // 同标题无处安放：tmp 锚点会撞，标题对账会缺项，且模型改不动清单。
         let plan = r#"{"tasks":[{"title":"甲","needs_split":false},{"title":"甲","needs_split":false}]}"#;
         assert!(check_plan_task_shape(plan).unwrap_err().contains("甲"));
+    }
+
+    /// `"needs_split": "true"`（字符串布尔）也算不合格：键在、类型不对时
+    /// `as_bool()` 是 `None`，按「未声明」或「false」处理都是猜。
+    #[test]
+    fn plan_shape_gate_rejects_non_boolean_needs_split() {
+        let plan = r#"{"tasks":[{"title":"甲","needs_split":"true"}]}"#;
+        let err = check_plan_task_shape(plan).unwrap_err();
+        assert!(err.contains("甲"), "要点名任务: {err}");
+        assert!(err.contains("不是布尔值"), "要说是类型问题: {err}");
+    }
+
+    /// 漏写 title 的任务必须按**位置**点名：`<无标题>` 这种占位串指不出是
+    /// 第几个，而缺标题正是最需要指认的错误。
+    #[test]
+    fn plan_shape_gate_identifies_untitled_task() {
+        // 空白标题也算「没写」：模型常留一个空串占位。
+        let flat = r#"{"tasks":[{"title":"甲","needs_split":false},{"title":"  "}]}"#;
+        let err = check_plan_task_shape(flat).unwrap_err();
+        assert!(err.contains("第 2 个任务（无标题）"), "{err}");
+
+        // 嵌套层同样指到具体子任务（而不是笼统的「某个子任务」）。
+        let nested = r#"{"tasks":[{"title":"甲","needs_split":true,"subtasks":[{"title":"子一","needs_split":false},{}]}]}"#;
+        let err = check_plan_task_shape(nested).unwrap_err();
+        assert!(
+            err.contains("第 1 个任务的第 2 个子任务（无标题）"),
+            "{err}"
+        );
+    }
+
+    /// 清单说「甲要再拆」，大纲的锚点却没带 ` needs_split` → 必须点名甲。
+    #[test]
+    fn outline_gate_rejects_needs_split_mismatch() {
+        let plan = r#"{"tasks":[{"title":"甲","needs_split":true}]}"#;
+        let outline = "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: 大任务\n---\n<!-- node:LAT-ROOT -->\n<!-- children:start -->\n<!-- node:tmp:甲 -->\n### 甲\n<!-- children:end -->";
+        let err = check_outline_against_plan(plan, outline).unwrap_err();
+        assert!(err.contains("甲"), "要点名对不上的标题: {err}");
+        assert!(err.contains("needs_split"), "要说是哪一项不一致: {err}");
+    }
+
+    /// 两份都能解析的大纲块 = 「哪份是正式稿」无从判断，猜错就是把另一份
+    /// 绑给清单。与 `find_tasks_fence` 的「恰好一个」同一条严格性。
+    #[test]
+    fn outline_gate_rejects_multiple_valid_fences() {
+        fn doc(title: &str) -> String {
+            format!(
+                "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: 大任务\n---\n\
+                 <!-- node:LAT-ROOT -->\n<!-- children:start -->\n\
+                 <!-- node:tmp:{title} -->\n### {title}\n<!-- children:end -->\n"
+            )
+        }
+        let plan = r#"{"tasks":[{"title":"模块一","needs_split":false}]}"#;
+        let outline = format!(
+            "正式稿：\n```markdown\n{}```\n\n（另一份草稿）\n```markdown\n{}```\n",
+            doc("模块一"),
+            doc("模块二")
+        );
+        let err = check_outline_against_plan(plan, &outline).unwrap_err();
+        assert!(err.contains("2 个可解析的大纲块"), "{err}");
+    }
+
+    /// 两条门禁是 **opt-in**：不写这两个字段的 step 不许被加门——否则所有
+    /// 既有清单步骤一夜之间都在对 `needs_split` 报警。
+    ///
+    /// runner 完整回路要 mock provider（代价太大），这里直接钉 runner 用的
+    /// 那个 guard 谓词 `plan_shape_gates_enabled`：它为假时 runner 根本不会
+    /// 调 `check_plan_task_shape`（同一份缺 needs_split 的清单手动调判据则
+    /// 会被拒——判据本身没关）。
+    #[test]
+    fn gates_are_off_when_flags_absent() {
+        let bare: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+speakers = ["task_planner"]
+prompt = "p"
+"#,
+        )
+        .expect("最小 step 应能反序列化");
+        assert!(
+            !bare.require_needs_split && !bare.require_outline_against_plan,
+            "两个字段未声明时必须是 false"
+        );
+        assert!(
+            !bare.plan_shape_gates_enabled(),
+            "未声明时 runner 的 guard 必须为假"
+        );
+
+        let on: WorkflowStepDef = toml::from_str(
+            r#"
+id = "s"
+speakers = ["task_planner"]
+prompt = "p"
+require_needs_split = true
+"#,
+        )
+        .expect("显式开应能反序列化");
+        assert!(on.plan_shape_gates_enabled(), "显式开时 guard 必须为真");
+
+        // 对照：判据本身对手动调用是严格的（缺 needs_split 就拒）。
+        assert!(check_plan_task_shape(r#"{"tasks":[{"title":"甲"}]}"#).is_err());
     }
 
     /// `require_symbols_resolvable` 的引擎侧接线：产出里查不到的符号要被
