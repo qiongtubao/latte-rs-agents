@@ -2311,7 +2311,7 @@ pub doc_path: Option&lt;String&gt;,
 <ul>
 <li><code>TaskView</code>（<code>tasks.rs:261-280</code>）新增 <code>effective_outline_path: Option&lt;String&gt;</code>（由祖先链解析后填入）。</li>
 <li>TS 镜像 <code>TaskView</code>（<code>latte-agent-cli/ui/src/api.ts:1437-1478</code>）新增 <code>needs_split: boolean</code>、<code>outline_path: string | null</code>、<code>doc_path: string | null</code>、<code>effective_outline_path: string | null</code>。</li>
-<li><code>CreateTaskBody</code> / <code>TaskPatchBody</code> / <code>ImportTask</code>（<code>tasks.rs:1129-1206</code>）支持这三个字段；<code>needs_split</code> 对拆分产物为<strong>必填</strong>（缺失时导入 400，原因：规划意图不可隐式推断）。手工 <code>POST /api/tasks</code> 创建缺省为 false。</li>
+<li><code>CreateTaskBody</code> / <code>TaskPatchBody</code> / <code>ImportTask</code>（<code>tasks.rs:1129-1206</code>）支持这三个字段。<code>needs_split</code> 在所有结构上一律 <code>#[serde(default)]</code>——旧落盘文件和既有 plan 消费者必须继续能解析（把它设成 serde 必填会让所有现存清单导入直接 400）。"拆分产物必须带 needs_split"这条由 <strong>workflow 机械门</strong>保证：<code>outline_split</code> / <code>task_refine</code> 的 <code>require_plan_tasks</code> 与 <code>require_outline_against_plan</code> 在产出时就拒绝缺字段的清单。手工 <code>POST /api/tasks</code> 创建缺省为 false。</li>
 <li><code>ImportTask</code>（递归结构）逐节点透传 <code>needs_split</code>，<code>import_one</code>（<code>tasks.rs:1568</code>）写入每条 <code>Task</code>。</li>
 </ul>
 <h3 id="42-plantask">4.2 <code>PlanTask</code> 新增字段</h3>
@@ -2448,16 +2448,18 @@ updated_at: 1784996760000
 <li><strong>breakdown</strong>：<code>task_planner</code>，摘掉 plan 工具，输出"拆分依据 + 恰好一个 <code>{"tasks":[...]}</code> JSON fence"，每项含既有字段 + <code>needs_split</code>。引擎 <code>require_plan_tasks</code> 机械校验（路径存在性、字符串层重叠、workflow/task_type 名）。</li>
 <li><strong>outline_draft</strong>：<code>outline_writer</code>（新角色），读 <code>{{draft}}</code> 的任务树，输出大纲 Markdown（含 <code>tmp:&lt;标题&gt;</code> 临时锚、每个节点一段 body、needs_split 标记）。body 从各任务的 <code>description</code> 派生。</li>
 <li><strong>gate</strong>：<code>reviewer</code>，产出 <code>VERDICT: ACCEPT/REVISE/REJECT</code>，<code>loop_back_to="breakdown"</code>，<code>loop_abort_on="VERDICT: REJECT"</code>（<code>max_iterations=2</code>）。机械 gate 追加校验：大纲锚点的<strong>标题集合</strong>与 JSON 任务标题集合一一对应、needs_split 一致、无孤儿锚点（此阶段锚是 <code>tmp:</code>，按标题对账）。</li>
-<li><strong>submit</strong>：<code>submit_plan_from="final_draft"</code>（零模型）提交 plan 导入看板拿到真实 id → <code>outline.rs::rebind_tmp_ids</code> 按"标题→真实 id"回填锚点并落盘 <code>docs/outlines/&lt;slug&gt;.md</code>。两步在同一提交中完成。</li>
+<li><strong>submit</strong>：<code>submit_plan_from="draft"</code>（零模型）只<strong>提出</strong> plan；真实 id 要等用户在看板弹窗导入才分配，所以定稿分两段：submit 把大纲草案写到会话级路径并登记 <code>plan_id → draft_path</code>；<code>POST /api/tasks/import</code> 在创建完任务后用"标题→真实 id"映射跑 <code>outline.rs::rebind_tmp_ids</code>，回填锚点并落盘 <code>docs/outlines/&lt;slug&gt;.md</code>，同时把根任务的 <code>outline_path</code> 指向它。任何 <code>tmp:</code> 锚未绑上 = 整单报错，绝不把 <code>tmp:</code> 写进正式大纲。用户取消导入则什么也不写。</li>
 </ol>
+<p>（实现细则见 <code>docs/superpowers/plans/2026-11-17-outline-driven-workflows.md</code> Task 6。）</p>
 <h3 id="72-task_refine">7.2 子任务拆分（task_refine 改造）</h3>
 <p>仅对 <code>needs_split=true</code> 的任务开放（后端在 <code>POST /api/tasks/:id/refine</code> 前置校验，false 时 409 + 提示"叶子任务不可再拆"）。</p>
 <p>在现有五步基础上：</p>
 <ul>
 <li><strong>refine</strong> prompt 追加：输出每个子任务的 <code>needs_split</code>。</li>
-<li><strong>new step <code>outline_patch</code></strong>（在 submit 前）：复用 <code>patch_from</code> 机制，输出 <code>{"ops":[{"op":"insert_child","parent":"&lt;父节点 id&gt;","task":"&lt;子任务标题&gt;","needs_split":bool,"body":"..."}]}</code>。引擎按父节点真实 id 定位，在大纲 <code>children</code> 区块下插入带 <code>tmp:&lt;标题&gt;</code> 锚的子节点段，保留其余区块。</li>
-<li><strong>submit</strong>：写看板子任务（带 <code>parent_id</code>）→ <code>rebind_tmp_ids</code> 回填子节点真实 id → 落盘更新后大纲。三步在同一提交中完成，按 id 对账。</li>
+<li><strong>不加 outline_patch 模型步</strong>：<code>WorkflowStepDef</code> 是 <code>deny_unknown_fields</code>，模型补丁还需要引擎不提供的模板变量，收益不抵成本。改由<strong>导入时机械插入</strong>：refine 导入带 <code>parent_id</code>，<code>import_tasks_into_inner</code> 建完子任务后解析父任务的 <code>effective_outline_path</code>，对每个子任务调 <code>outline::insert_child(parent_id, child_id, title, needs_split, body)</code>，用<strong>真实 id</strong>作锚（子任务此时已有 id），按 id 幂等（已存在则更新而非重复插入），父节点找不到则报错不静默跳过。</li>
+<li>这样"同时更新看板与大纲"在一次导入内完成，零模型调用、无新配置键。</li>
 </ul>
+<p>（实现细则见 <code>docs/superpowers/plans/2026-11-17-outline-driven-workflows.md</code> Task 7。）</p>
 <h3 id="73">7.3 双向同步与冲突规则</h3>
 <p>沿用 D1"各管一段"：</p>
 <table>

@@ -87,7 +87,7 @@ pub doc_path: Option<String>,
 
 - `TaskView`（`tasks.rs:261-280`）新增 `effective_outline_path: Option<String>`（由祖先链解析后填入）。
 - TS 镜像 `TaskView`（`latte-agent-cli/ui/src/api.ts:1437-1478`）新增 `needs_split: boolean`、`outline_path: string | null`、`doc_path: string | null`、`effective_outline_path: string | null`。
-- `CreateTaskBody` / `TaskPatchBody` / `ImportTask`（`tasks.rs:1129-1206`）支持这三个字段；`needs_split` 对拆分产物为**必填**（缺失时导入 400，原因：规划意图不可隐式推断）。手工 `POST /api/tasks` 创建缺省为 false。
+- `CreateTaskBody` / `TaskPatchBody` / `ImportTask`（`tasks.rs:1129-1206`）支持这三个字段。`needs_split` 在所有结构上一律 `#[serde(default)]`——旧落盘文件和既有 plan 消费者必须继续能解析（把它设成 serde 必填会让所有现存清单导入直接 400）。"拆分产物必须带 needs_split"这条由 **workflow 机械门**保证：`outline_split` / `task_refine` 的 `require_plan_tasks` 与 `require_outline_against_plan` 在产出时就拒绝缺字段的清单。手工 `POST /api/tasks` 创建缺省为 false。
 - `ImportTask`（递归结构）逐节点透传 `needs_split`，`import_one`（`tasks.rs:1568`）写入每条 `Task`。
 
 ### 4.2 `PlanTask` 新增字段
@@ -195,7 +195,9 @@ workflow 步骤设计（沿用 `task_refine.toml:54-287` 已验证的结构）�
 1. **breakdown**：`task_planner`，摘掉 plan 工具，输出"拆分依据 + 恰好一个 `{"tasks":[...]}` JSON fence"，每项含既有字段 + `needs_split`。引擎 `require_plan_tasks` 机械校验（路径存在性、字符串层重叠、workflow/task_type 名）。
 2. **outline_draft**：`outline_writer`（新角色），读 `{{draft}}` 的任务树，输出大纲 Markdown（含 `tmp:<标题>` 临时锚、每个节点一段 body、needs_split 标记）。body 从各任务的 `description` 派生。
 3. **gate**：`reviewer`，产出 `VERDICT: ACCEPT/REVISE/REJECT`，`loop_back_to="breakdown"`，`loop_abort_on="VERDICT: REJECT"`（`max_iterations=2`）。机械 gate 追加校验：大纲锚点的**标题集合**与 JSON 任务标题集合一一对应、needs_split 一致、无孤儿锚点（此阶段锚是 `tmp:`，按标题对账）。
-4. **submit**：`submit_plan_from="final_draft"`（零模型）提交 plan 导入看板拿到真实 id → `outline.rs::rebind_tmp_ids` 按"标题→真实 id"回填锚点并落盘 `docs/outlines/<slug>.md`。两步在同一提交中完成。
+4. **submit**：`submit_plan_from="draft"`（零模型）只**提出** plan；真实 id 要等用户在看板弹窗导入才分配，所以定稿分两段：submit 把大纲草案写到会话级路径并登记 `plan_id → draft_path`；`POST /api/tasks/import` 在创建完任务后用"标题→真实 id"映射跑 `outline.rs::rebind_tmp_ids`，回填锚点并落盘 `docs/outlines/<slug>.md`，同时把根任务的 `outline_path` 指向它。任何 `tmp:` 锚未绑上 = 整单报错，绝不把 `tmp:` 写进正式大纲。用户取消导入则什么也不写。
+
+（实现细则见 `docs/superpowers/plans/2026-11-17-outline-driven-workflows.md` Task 6。）
 
 ### 7.2 子任务拆分（task_refine 改造）
 
@@ -204,8 +206,10 @@ workflow 步骤设计（沿用 `task_refine.toml:54-287` 已验证的结构）�
 在现有五步基础上：
 
 - **refine** prompt 追加：输出每个子任务的 `needs_split`。
-- **new step `outline_patch`**（在 submit 前）：复用 `patch_from` 机制，输出 `{"ops":[{"op":"insert_child","parent":"<父节点 id>","task":"<子任务标题>","needs_split":bool,"body":"..."}]}`。引擎按父节点真实 id 定位，在大纲 `children` 区块下插入带 `tmp:<标题>` 锚的子节点段，保留其余区块。
-- **submit**：写看板子任务（带 `parent_id`）→ `rebind_tmp_ids` 回填子节点真实 id → 落盘更新后大纲。三步在同一提交中完成，按 id 对账。
+- **不加 outline_patch 模型步**：`WorkflowStepDef` 是 `deny_unknown_fields`，模型补丁还需要引擎不提供的模板变量，收益不抵成本。改由**导入时机械插入**：refine 导入带 `parent_id`，`import_tasks_into_inner` 建完子任务后解析父任务的 `effective_outline_path`，对每个子任务调 `outline::insert_child(parent_id, child_id, title, needs_split, body)`，用**真实 id**作锚（子任务此时已有 id），按 id 幂等（已存在则更新而非重复插入），父节点找不到则报错不静默跳过。
+- 这样"同时更新看板与大纲"在一次导入内完成，零模型调用、无新配置键。
+
+（实现细则见 `docs/superpowers/plans/2026-11-17-outline-driven-workflows.md` Task 7。）
 
 ### 7.3 双向同步与冲突规则
 
