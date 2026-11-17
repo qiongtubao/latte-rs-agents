@@ -4698,6 +4698,52 @@ mod tests {
         assert!(!child.needs_split);
     }
 
+    /// `outline_path` 只在携带它的那条导入项上落值：既不能丢（大纲
+    /// 是后续拆分/学习流程的输入），也不能串到同批其他任务上（子孙
+    /// 靠祖先链解析，串值会让整棵树指向错的大纲）。任务以磁盘 JSON
+    /// 为权威，所以重载后必须还在。
+    #[test]
+    fn import_one_propagates_outline_path() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [
+                { "title": "root", "outline_path": "docs/outlines/root.md" },
+                { "title": "plain" }
+            ]
+        }))
+        .unwrap();
+        run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("import ok");
+        let all = store.list();
+        let root = all.iter().find(|t| t.title == "root").expect("root");
+        let plain = all.iter().find(|t| t.title == "plain").expect("plain");
+        assert_eq!(root.outline_path.as_deref(), Some("docs/outlines/root.md"));
+        assert_eq!(plain.outline_path, None, "未声明大纲的任务不得共享该路径");
+        let root_id = root.id.clone();
+        let plain_id = plain.id.clone();
+        drop(store);
+        // 落盘往返：磁盘 JSON 才是权威来源，重载后值必须原样还原。
+        let reloaded = TaskStore::load(cwd).expect("reload");
+        assert_eq!(
+            reloaded
+                .get(&root_id)
+                .expect("root 必须落盘")
+                .outline_path
+                .as_deref(),
+            Some("docs/outlines/root.md"),
+            "outline_path 必须随任务 JSON 存活"
+        );
+        assert_eq!(
+            reloaded
+                .get(&plain_id)
+                .expect("plain 必须落盘")
+                .outline_path,
+            None,
+            "重载后也不得凭空出现大纲路径"
+        );
+    }
+
     // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
     //
     // 回归 jemalloc 会话事故：plan 清单把 `paths` 写成 `involved_paths`，
