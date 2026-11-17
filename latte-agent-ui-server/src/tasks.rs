@@ -2631,6 +2631,9 @@ pub fn sync_outline_structure(
     pre_images.extend(prune_ids.iter().filter_map(|id| store.get(id).cloned()));
 
     let mut report = OutlineSyncReport::default();
+    // 同步前的 Notion dirty 集合：回滚只撤"本次新增"的标记。进到这里时整个
+    // 同步都握着 TaskStore 的写锁，所以这份快照在本次调用期间不会过期。
+    let dirty_before = store.notion_dirty.snapshot();
     // 所有失败项都要报出来（不停在第一个）：反正整单要回滚，多攒几条能让
     // 用户一次看清到底是哪几个文件写不进去。
     let mut failed: Vec<String> = Vec::new();
@@ -2678,7 +2681,7 @@ pub fn sync_outline_structure(
             "结构同步落盘失败，已整单回滚（看板回到同步前）：{}",
             failed.join("；")
         );
-        if let Err(e) = restore_sync_snapshot(store, pre_images, &deleted) {
+        if let Err(e) = restore_sync_snapshot(store, pre_images, &deleted, &dirty_before) {
             message.push_str(&format!("；回滚未完全成功：{e}"));
         }
         return Err(message);
@@ -2695,12 +2698,19 @@ struct OutlineSyncEdit {
 }
 
 /// 把一次失败的同步按快照撤回：内存索引 + 任务文件，被 prune 掉的还要从
-/// `archive/` 挪回来。所有条目都会尝试恢复，单项失败汇总返回（同
+/// `archive/` 挪回来；顺带撤掉本次新产生的 Notion dirty 标记、清掉残留的
+/// `<id>.json.tmp`。所有条目都会尝试恢复，单项失败汇总返回（同
 /// [`TaskStore::rollback_import`] 的口径：别让第一个错误掩盖后续残留）。
+///
+/// 为什么要管 dirty 标记：`persist` / `mark_notion_dirty` 是内存 + 落盘双写，
+/// 只把任务文件退回去、标记留着，下一轮 `sync_once` 就会把"已经退回同步前"
+/// 的内容推给 Notion——回滚就成了假动作。`dirty_before` 里已有的任务保留标记：
+/// 那是别人的待推送，不能连坐。
 fn restore_sync_snapshot(
     store: &mut TaskStore,
     pre_images: Vec<Task>,
     deleted: &[String],
+    dirty_before: &std::collections::HashSet<String>,
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     for task in pre_images {
@@ -2723,10 +2733,34 @@ fn restore_sync_snapshot(
         } else if let Err(e) = store.restore_task_file(&task) {
             errors.push(format!("恢复任务 {} 失败：{e}", task.id));
         }
+        // 写盘是"先写 `<id>.json.tmp` 再 rename"：rename 失败（或更早就挂了）
+        // 会把 tmp 留在盘上。`load` 不认它，但它会一直占位置，还可能让下一次
+        // 写盘撞上同一个残留，所以一并清掉（同 `rollback_import` 的收尾）。
+        // 用 `is_file` 判：撞名的是目录时不能删（那是外部占位，不是我们留下的）。
+        let tmp = store.dir.join(format!("{}.json.tmp", task.id));
+        if tmp.is_file() {
+            if let Err(e) = std::fs::remove_file(&tmp) {
+                errors.push(format!("清理 {} 失败：{e}", tmp.display()));
+            }
+        }
         // 内存索引无论如何都要退回同步前：它是本进程的权威，盘上那份由上面
         // 尽力还原（写不进去的那一条本来就没改到文件）。
         store.tasks.insert(task.id.clone(), task);
     }
+
+    // 本次 persist / mark 出来的 dirty 标记全部撤掉（内存 + 盘标记一起），
+    // 否则回滚后的"旧内容"会被当成待推送，下一轮同步把假动作做实。
+    let cwd = store.project_root().to_path_buf();
+    let marked_during_sync: Vec<String> = store
+        .notion_dirty
+        .snapshot()
+        .into_iter()
+        .filter(|id| !dirty_before.contains(id))
+        .collect();
+    for id in marked_during_sync {
+        store.notion_dirty.unmark(&cwd, &id);
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -10365,6 +10399,14 @@ mod tests {
         // 让 blocked 的落盘必失败：它的 tmp 路径被一个目录占住。
         let blocker = cwd.join(format!(".latte/tasks/{}.json.tmp", blocked.id));
         std::fs::create_dir_all(&blocker).expect("blocker dir");
+        // 同步前的 dirty 状态人为摆好：所有任务（含 create 时自动 mark 的）先
+        // 清零，只留 root 一个"本来就 dirty"的——回滚不许连坐清掉它。
+        let _ = std::fs::remove_dir_all(cwd.join(".latte/.tasks-dirty"));
+        let _ = store.take_notion_dirty();
+        store.mark_notion_dirty(&root.id);
+        // 盘上一份残留的 tmp（上一次写盘 rename 失败留下的）：回滚的收尾要清掉它。
+        let stray = cwd.join(format!(".latte/tasks/{}.json.tmp", extra.id));
+        std::fs::write(&stray, b"{}").expect("stray tmp");
 
         let path = write_outline_doc(
             cwd,
@@ -10391,6 +10433,21 @@ mod tests {
             store.get(&extra.id).is_some(),
             "prune 目标不许停在已删状态"
         );
+        // Notion dirty：本次同步新产生的标记必须撤掉（否则下一轮 sync_once
+        // 会把"已经退回同步前"的内容推出去——回滚就成了假动作），而同步前
+        // 就已经 dirty 的任务保留标记（那是别人的待推送，不能连坐）。
+        assert!(
+            !store.notion_dirty_contains(&editable.id),
+            "persist 出来的 dirty 标记要撤掉"
+        );
+        assert!(
+            !store.notion_dirty_contains(&extra.id),
+            "删除时 mark 出来的标记同样要撤"
+        );
+        assert!(
+            store.notion_dirty_contains(&root.id),
+            "同步前就 dirty 的任务必须保留标记"
+        );
 
         // 磁盘：重载后同样一条都没变——内存回了、盘上没回也是半个看板。
         drop(store);
@@ -10415,5 +10472,16 @@ mod tests {
                 .exists(),
             "回滚后的任务不该还留在 archive/"
         );
+        // 盘上的 dirty 标记也要同步：删掉的不能留给下一次重启复活，保留的
+        // 要连盘标记一起保留（`load` 就是扫它重建内存集的）。
+        assert!(
+            !cwd.join(".latte/.tasks-dirty").join(&editable.id).exists(),
+            "撤掉的内存标记必须连盘一起删"
+        );
+        assert!(
+            cwd.join(".latte/.tasks-dirty").join(&root.id).exists(),
+            "同步前就有的盘标记不许被顺手清掉"
+        );
+        assert!(!stray.exists(), "回滚要清掉残留的 <id>.json.tmp");
     }
 }

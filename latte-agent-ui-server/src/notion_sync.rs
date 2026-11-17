@@ -334,6 +334,22 @@ impl DirtySet {
     pub(crate) fn restore_id(&mut self, id: String) {
         self.ids.insert(id);
     }
+    /// 当前 dirty 的 id 快照。
+    ///
+    /// 给"回滚一次写操作"用：只有**本次新增**的标记才该被撤掉，操作开始前
+    /// 就已经 dirty 的任务是别人的待推送，不能被连坐清掉——所以调用方要
+    /// 先存一份快照，回滚时按差集撤。
+    pub fn snapshot(&self) -> std::collections::HashSet<String> {
+        self.ids.clone()
+    }
+    /// 撤掉一个 id 的 dirty 标记：内存 + 落盘双删。幂等。
+    ///
+    /// 与 [`DirtySet::mark`] 对称：只清内存会让重启后从盘标记复活（一次没
+    /// 发生过的推送），只清盘会让本进程的下一轮 sync 继续推它。
+    pub fn unmark(&mut self, cwd: &std::path::Path, id: &str) {
+        self.ids.remove(id);
+        clear_dirty_on_disk(cwd, id);
+    }
     /// 下一轮 `sync` 还会再读到。
     pub fn take_dirty(&mut self) -> Vec<String> {
         let out: Vec<String> = self.ids.iter().cloned().collect();
