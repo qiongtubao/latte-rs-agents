@@ -741,6 +741,91 @@ fn rebind_node(
     }
 }
 
+/// 在父节点下插入/更新一个子节点（子任务拆分用）。
+///
+/// - 父节点找不到 → Err 点名 id（绝不静默跳过，否则子任务在大纲里消失）。
+/// - 子节点 id 已存在于该父节点下 → 更新 title/needs_split/body（幂等，不重复插）。
+/// - 新节点的层级 = 父节点层级 + 1；父节点无标题（根，level 0）时取 1。
+/// - body 写成普通段落；同时把 has_body_block 置 true。
+///
+/// 为什么幂等而不是"插过就报错"：导入是可能被重试的动作（批次回滚后用户再勾
+/// 一次），同一个子任务再次落进来必须收敛到同一棵树，而不是在大纲里长出两份。
+///
+/// 为什么层级要算：新节点必须能被人读成"属于父节点"，而手写大纲的层级是排版
+/// 权威——写错一级，人工编辑时就会把它挪到别的模块下面去。
+pub fn insert_child(
+    doc: &mut OutlineDoc,
+    parent_id: &str,
+    child_id: &str,
+    title: &str,
+    needs_split: bool,
+    body: &str,
+) -> Result<(), String> {
+    let body = body_block_text(child_id, body)?;
+    // 先找父节点再算层级：找不到父节点时连层级都无从谈起，报错要立刻点名。
+    let Some(parent) = find_node_mut(&mut doc.root, parent_id) else {
+        return Err(format!(
+            "大纲里找不到父节点 `{parent_id}`（子节点 `{child_id}` 无处安放）"
+        ));
+    };
+    let level = match parent.heading_level() {
+        0 => 1,
+        n => n + 1,
+    };
+    if let Some(existing) = parent.children.iter_mut().find(|c| c.id == child_id) {
+        // 更新而不是重插：`set_title` 保住原有层级，body/needs_split 直接覆盖。
+        existing.set_title(title);
+        existing.needs_split = needs_split;
+        existing.body = body;
+        existing.has_body_block = true;
+        return Ok(());
+    }
+    let mut child =
+        OutlineNode::new_child(child_id.to_string(), title.to_string(), needs_split, level);
+    // `new_child` 已经给出空的 body 区块，这里只填内容（区块存在性不用动）。
+    child.body = body;
+    parent.children.push(child);
+    Ok(())
+}
+
+/// 在子树里按 id 找节点（可变）。递归到底，找不到返回 `None`。
+fn find_node_mut<'a>(node: &'a mut OutlineNode, id: &str) -> Option<&'a mut OutlineNode> {
+    if node.id == id {
+        return Some(node);
+    }
+    for child in &mut node.children {
+        if let Some(found) = find_node_mut(child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// 看板侧的一句话（任务描述）→ `section:body` 区块里的字节形态。
+///
+/// 非空正文必须以换行结尾，否则渲染时最后一行会和 `<!-- section:body:end -->`
+/// 粘在同一行，下次解析就把标记读成正文——见 [`join_as_body`] 的对称约定。
+///
+/// 为什么要挡受控标记：正文是模型/用户写的自由文本，其中的一行要是正好是
+/// `<!-- learn-links:start -->` 这类标记或 node 锚点，写进区块后下次解析会把它
+/// 当成结构指令（报错或把后文并进别的节点）。这种损坏发生在**写入**之后，等到
+/// 下次读大纲才炸，报错还指不到这次导入——所以宁可在写入前拒绝。
+fn body_block_text(child_id: &str, body: &str) -> Result<String, String> {
+    let text = body.trim();
+    if text.is_empty() {
+        return Ok(String::new());
+    }
+    for line in text.lines() {
+        if Marker::of(line).is_some() || is_anchor(line) {
+            return Err(format!(
+                "子节点 `{child_id}` 的正文里有受控标记行 `{}`，写进大纲会破坏文档结构",
+                line.trim()
+            ));
+        }
+    }
+    Ok(format!("{text}\n"))
+}
+
 /// 看板 → 大纲：把看板侧的 title/needs_split 落到文档；结构冲突（父不一致、
 /// 文档有而看板无的节点）报错。反向（大纲 → 看板）由 ui-server 的 sync 端点负责。
 ///
@@ -1491,5 +1576,79 @@ title: T
         let err = apply_board_fields(&mut doc, &tasks).expect_err("重复任务 id 必须报错");
         assert!(err.contains("LAT-1"), "错误信息要点名重复的 id：{err}");
         assert_eq!(doc, snapshot, "校验失败时不能留下改了一半的文档");
+    }
+
+    /// 子任务拆分：新子节点必须落在父节点的 children 下，层级 = 父 + 1
+    /// （根节点没有标题行 → 取 1），并且渲染结果还能原样解析回同一棵树。
+    #[test]
+    fn insert_child_appends_under_parent() {
+        let mut doc = parse_outline(FIXTURE).expect("规范样例必须能解析");
+
+        insert_child(&mut doc, "LAT-100", "LAT-7", "新子任务", true, "一句话说明")
+            .expect("父节点存在");
+
+        let parent = &doc.root;
+        assert_eq!(parent.children.len(), 2, "新子节点必须挂在父节点下");
+        let child = &parent.children[1];
+        assert_eq!(child.id, "LAT-7");
+        assert_eq!(child.title, "新子任务");
+        assert!(child.needs_split);
+        assert_eq!(
+            child.heading_level(),
+            1,
+            "根节点没有标题行（level 0）→ 子层级取 1"
+        );
+        assert_eq!(child.heading_raw(), Some("# 新子任务"));
+        assert_eq!(child.body, "一句话说明\n", "正文要以换行结尾");
+        assert!(child.has_body_block);
+
+        let rendered = render_outline(&doc);
+        assert!(rendered.contains("<!-- node:LAT-7 needs_split -->"), "{rendered}");
+        assert!(rendered.contains("# 新子任务"), "{rendered}");
+        let reparsed = parse_outline(&rendered).expect("渲染结果必须可再解析");
+        assert_eq!(reparsed, doc, "往返后结构必须一致");
+    }
+
+    /// 同一个子任务重试导入时（批次回滚后再勾一次）不许长出两份节点：按 id
+    /// 就地更新，取最新一次的内容。
+    #[test]
+    fn insert_child_is_idempotent_by_id() {
+        let mut doc = parse_outline(FIXTURE).expect("规范样例必须能解析");
+
+        insert_child(&mut doc, "LAT-100", "LAT-7", "旧标题", false, "旧正文").expect("插入");
+        insert_child(&mut doc, "LAT-100", "LAT-7", "新标题", true, "新正文").expect("更新");
+
+        let matches: Vec<&OutlineNode> = doc
+            .root
+            .children
+            .iter()
+            .filter(|c| c.id == "LAT-7")
+            .collect();
+        assert_eq!(matches.len(), 1, "同 id 再插必须就地更新，不能重复插");
+        let child = matches[0];
+        assert_eq!(child.title, "新标题");
+        assert!(child.needs_split);
+        assert_eq!(child.body, "新正文\n");
+        assert_eq!(child.heading_level(), 1, "更新不许改层级");
+
+        let rendered = render_outline(&doc);
+        assert_eq!(
+            rendered.matches("node:LAT-7").count(),
+            1,
+            "终稿里只能有一个 LAT-7 锚：\n{rendered}"
+        );
+    }
+
+    /// 父节点找不到必须响亮失败并点名：静默跳过等于子任务在大纲里凭空消失。
+    #[test]
+    fn insert_child_errors_on_missing_parent() {
+        let mut doc = parse_outline(FIXTURE).expect("规范样例必须能解析");
+        let before = render_outline(&doc);
+
+        let err = insert_child(&mut doc, "LAT-404", "LAT-7", "无处安放", false, "x")
+            .expect_err("父节点不存在必须报错");
+
+        assert!(err.contains("LAT-404"), "报错要点名找不到的父 id：{err}");
+        assert_eq!(render_outline(&doc), before, "失败不得改动文档");
     }
 }

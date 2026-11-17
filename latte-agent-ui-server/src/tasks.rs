@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use latte_agent_core::outline::{parse_outline, rebind_tmp_ids, render_outline, validate_unique_ids};
+use latte_agent_core::outline::{
+    insert_child, parse_outline, rebind_tmp_ids, render_outline, validate_unique_ids,
+};
 use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
 use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
@@ -326,6 +328,14 @@ pub struct TaskStore {
     /// `<id>.json` 会一直指向一份已被删掉的文档（重启后板上是个打不开的
     /// 大纲链接）。必须在改动任何任务之前记下来，回滚时原地还原。
     import_outline_owners: Vec<(String, Option<String>)>,
+    /// 本次导入**重写**过的既有大纲文档（往父节点下插入子任务锚点）。
+    ///
+    /// 与 [`PublishedOutline`] 分开记：那份是"这次导入新发布的文档"（回滚 =
+    /// 删掉/还原上一轮内容），这份是"本来就在的文档、这次往里插了锚点"（回滚 =
+    /// 把原文逐字节写回）。两者可能指向**同一个文件**（拆分时父任务的大纲恰好
+    /// 就是本轮定稿发布的那份），所以回滚顺序必须是"先撤插入、再撤发布"，
+    /// 见 `rollback_import`。
+    import_modified_outline: Option<ModifiedOutline>,
 }
 
 /// 导入期发布的大纲文档的撤销信息。
@@ -333,6 +343,13 @@ struct PublishedOutline {
     path: PathBuf,
     /// 发布前同名文档的原文；`None` = 发布前不存在（回滚时删掉即可）。
     previous: Option<String>,
+}
+
+/// 导入期重写过的既有大纲文档的撤销信息。
+struct ModifiedOutline {
+    path: PathBuf,
+    /// 改写前的全文（原样字节，回滚直接写回）。
+    previous: String,
 }
 
 /// 导入事务开始前的内存快照。导入只会新增任务并推进 `next_seq`，但保存
@@ -446,6 +463,7 @@ impl TaskStore {
             },
             import_published_outline: None,
             import_outline_owners: Vec::new(),
+            import_modified_outline: None,
         })
     }
 
@@ -537,6 +555,17 @@ impl TaskStore {
 
         if let Err(error) = write_atomic_json(&self.dir.join("board.json"), &snapshot.meta) {
             errors.push(format!("restore board.json: {error}"));
+        }
+        // 顺序不能反：插入子任务锚点发生在"发布"之后，撤销必须逆序——先按插入
+        // 前的原文写回，再撤发布（删掉 / 还原上一轮内容）。反过来时那次写回会
+        // 把已发布的内容留在一个本该被删掉的路径上，回滚就成了假动作。
+        if let Some(modified) = self.import_modified_outline.take() {
+            if let Err(error) = std::fs::write(&modified.path, &modified.previous) {
+                errors.push(format!(
+                    "restore outline {}: {error}",
+                    modified.path.display()
+                ));
+            }
         }
         // 大纲文档是导入唯一落在任务文件之外的产物：回滚时必须一起撤掉，
         // 否则板上一条任务都没有、`docs/outlines/` 里却躺着一份指向不存在
@@ -1783,6 +1812,10 @@ fn import_tasks_into_inner(
     // 第三趟：把 workflow 落下的大纲草案定稿（必须在 `created` / `by_title`
     // 都齐了之后——草案的锚点是 `tmp:<标题>`，真实 id 此刻才存在）。
     finalize_outline_from_draft(store, cwd, req, &created)?;
+    // 第四趟：子任务拆分时，把本次导入的直接子任务挂到父任务大纲的父节点下。
+    // 必须排在定稿之后：两者可能落在同一份文档上（草案先发布、再往里插锚点），
+    // 这个顺序也正好让回滚能简单逆序撤销。
+    insert_child_outline_anchors(store, cwd, req, &created)?;
     Ok(created)
 }
 
@@ -1948,6 +1981,90 @@ fn finalize_outline_from_draft(
     Ok(())
 }
 
+/// 子任务拆分收尾：把本次导入的**直接子任务**挂到父任务大纲的父节点下。
+///
+/// 为什么必须由引擎机械完成：拆分出的子任务除了看板条目，还必须在大纲里留下
+/// 锚点，否则反向同步（`apply_board_fields`）会认为文档里多出"看板没有"的
+/// 节点、用户也看不到这层结构；而这份文档的层级与受控区块格式不允许模型随手
+/// 拼字符串。
+///
+/// 只处理 `req.parent_id` 的**直接**子任务：孙子任务的锚点属于子任务自己那一层
+/// （它自己的大纲/后续拆分），一起塞进父任务文档会把层级拍平。
+///
+/// 任何错误（父节点锚点不存在、文档解析失败、插入后 id 不再唯一）都中止整单
+/// 导入：看板多了子任务、大纲里却没有对应锚点，两边就永久分叉了，比整单失败
+/// 难收拾得多。
+fn insert_child_outline_anchors(
+    store: &mut TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+    created: &[String],
+) -> Result<(), String> {
+    let Some(parent_id) = req
+        .parent_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(());
+    };
+    // 父任务（或它的祖先）没有大纲 = 这次拆分本来就不维护大纲：不是错误。
+    let Some(rel) = store
+        .get(parent_id)
+        .and_then(|task| store.effective_outline_path(task))
+    else {
+        return Ok(());
+    };
+    let path = resolve_project_relative(cwd, &rel)?;
+    let previous =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取父任务大纲 {rel} 失败：{e}"))?;
+    let mut doc =
+        parse_outline(&previous).map_err(|e| format!("父任务大纲 {rel} 解析失败：{e}"))?;
+
+    let mut planned = 0usize;
+    for id in created {
+        let Some(task) = store.get(id) else {
+            continue;
+        };
+        if task.parent_id.as_deref() != Some(parent_id) {
+            continue;
+        }
+        insert_child(
+            &mut doc,
+            parent_id,
+            id,
+            &task.title,
+            task.needs_split,
+            &task.description,
+        )
+        .map_err(|e| format!("子任务 {id} 挂到父任务大纲 {rel} 失败：{e}"))?;
+        planned += 1;
+    }
+    if planned == 0 {
+        return Ok(());
+    }
+    // 插入后 id 仍须唯一：同一批子任务重导入时这里是更新（幂等），但文档里若
+    // 已经在别的父节点下藏着同 id 的锚点，就会造出一份自相矛盾的大纲。
+    validate_unique_ids(&doc).map_err(|e| format!("{rel} 插入子任务锚点后 id 不唯一：{e}"))?;
+    let rendered = render_outline(&doc);
+    if rendered == previous {
+        // 内容没变（同批子任务重放）就不写盘：白改 mtime，还让回滚去"恢复"
+        // 一个从没动过的文件。
+        return Ok(());
+    }
+    // 写盘约定同 `finalize_outline_from_draft`：tmp + rename，不留半篇文档。
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, &rendered).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename {}: {e}", path.display()));
+    }
+    // 登记撤销信息放在 rename 之后：从这一刻起文件已被改写，后续任何失败都必须
+    // 由 `rollback_import` 把原文逐字节写回。
+    store.import_modified_outline = Some(ModifiedOutline { path, previous });
+    Ok(())
+}
+
 /// 本次导入要定稿的大纲草案；`None` = 这次导入没有大纲（正常路径）。
 fn resolve_outline_draft(cwd: &Path, req: &ImportTasksRequest) -> Result<Option<PathBuf>, String> {
     if let Some(rel) = req
@@ -2055,14 +2172,16 @@ fn run_import_transaction<T>(
             // outline_path 退回旧值。
             store.import_published_outline = None;
             store.import_outline_owners.clear();
+            store.import_modified_outline = None;
             Ok(value)
         }
-        // 没有任何落盘副作用（next_seq 未推进、也没发布过大纲/改过挂载任务）
-        // 时不必回滚。
+        // 没有任何落盘副作用（next_seq 未推进、也没发布/改写过大纲、没改过
+        // 挂载任务）时不必回滚。
         Err(error)
             if store.meta.next_seq == snapshot.meta.next_seq
                 && store.import_published_outline.is_none()
-                && store.import_outline_owners.is_empty() =>
+                && store.import_outline_owners.is_empty()
+                && store.import_modified_outline.is_none() =>
         {
             Err(error)
         }
@@ -3530,13 +3649,28 @@ pub struct RefineTaskResponse {
     pub session_id: String,
 }
 
+/// 能否对该任务继续拆分。needs_split=false = 叶子，拆下去只会得到一堆碎活。
+#[derive(Debug, PartialEq)]
+pub enum RefineError {
+    Leaf,
+}
+
+pub fn check_refine_allowed(task: &Task) -> Result<(), RefineError> {
+    if task.needs_split {
+        Ok(())
+    } else {
+        Err(RefineError::Leaf)
+    }
+}
+
 /// `POST /api/tasks/:id/refine` — 拆分子任务：新建 ui-session 跑
 /// `task_refine` workflow（manager 分析任务后用 plan 工具提交子任务
 /// 清单），用户在该 session 的弹窗里勾选导入。**不改变任务状态、不
 /// 记 run**——拆分是规划动作不是执行，任务留在原状态等子任务导入。
 ///
-/// 任意层级的任务都可再拆（任务树深度不限）；执行中（in_progress/
-/// merging）的任务不可拆。
+/// 任意层级的任务都可再拆（任务树深度不限），但 `needs_split=false` 的叶子
+/// 任务不可拆（[`check_refine_allowed`]）：它已经被判到可直接执行的粒度，
+/// 再拆只会得到一堆碎活。执行中（in_progress/merging）的任务不可拆。
 pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, ApiError> {
     // 读锁内校验 + 收集消息素材（含任务族上下文：祖先链 + 兄弟边界）。
     let (title, description, family_ctx) = {
@@ -3544,6 +3678,12 @@ pub async fn refine_task(b: &UiBackend, id: &str) -> Result<RefineTaskResponse, 
         let t = store
             .get(id)
             .ok_or_else(|| ApiError::not_found(format!("task {id:?} 不存在")))?;
+        // 叶子检查放在最前面（早于建 session 与改历史）：拒掉就不要留下任何
+        // 痕迹。409 而不是 400——请求本身没问题，是这个任务当前的状态不允许。
+        check_refine_allowed(t).map_err(|RefineError::Leaf| ApiError {
+            status: 409,
+            message: "叶子任务不可再拆（needs_split=false）；如需继续拆分，先在看板把该任务的 needs_split 置为 true".to_string(),
+        })?;
         if t.state == "in_progress" || t.state == "merging" {
             return Err(ApiError::bad_request(format!(
                 "state {:?} 不可拆分（执行中的任务请先中止）",
@@ -5461,6 +5601,127 @@ mod tests {
         }
         run_case(None);
         run_case(Some("docs/outlines/old.md"));
+    }
+
+    /// 给已存在的任务挂一份大纲文档（父节点带正文，正好可以验证"插入只碰
+    /// children 区块"），返回文档的项目相对路径。
+    fn attach_parent_outline(cwd: &Path, store: &mut TaskStore, parent: &Task) -> String {
+        let rel = "docs/outlines/big.md".to_string();
+        let path = cwd.join(&rel);
+        std::fs::create_dir_all(path.parent().expect("父目录")).expect("mkdir outlines");
+        std::fs::write(
+            &path,
+            format!(
+                "---\nschema: 1\ntask_id: {id}\ntitle: big\n---\n\
+                 # big\n\n\
+                 <!-- node:{id} needs_split -->\n\
+                 ### 大任务\n\
+                 <!-- section:body:start -->\n## 概述\n父任务正文\n<!-- section:body:end -->\n",
+                id = parent.id
+            ),
+        )
+        .expect("write outline");
+        store.get_mut(&parent.id).expect("刚建").outline_path = Some(rel.clone());
+        store.persist(&parent.id).expect("persist");
+        rel
+    }
+
+    /// 子任务拆分：本次导入的直接子任务必须在大纲里长出锚点、挂在父节点下
+    /// （层级 = 父 + 1），而父节点自己的正文一个字都不能动——插入只碰
+    /// children 区块，手写内容不归机器管。
+    #[test]
+    fn import_inserts_child_anchors_under_parent_outline() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let parent = make_task(&mut store, "大任务");
+        let rel = attach_parent_outline(cwd, &mut store, &parent);
+        let before = parse_outline(&std::fs::read_to_string(cwd.join(&rel)).expect("read"))
+            .expect("父任务大纲可解析");
+
+        let req = import_req(serde_json::json!({
+            "parent_id": parent.id,
+            "tasks": [
+                { "title": "子甲", "description": "子甲要做的事", "needs_split": true },
+                { "title": "子乙", "description": "子乙要做的事" }
+            ]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("导入成功");
+        assert_eq!(created.len(), 2);
+
+        let text = std::fs::read_to_string(cwd.join(&rel)).expect("大纲必须还在原处");
+        let doc = parse_outline(&text).expect("插入后仍可解析");
+        let child_ids: Vec<&str> = doc.root.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            child_ids,
+            vec![created[0].as_str(), created[1].as_str()],
+            "两个子任务必须作为父节点的子锚点出现（真实 id）：\n{text}"
+        );
+        let first = &doc.root.children[0];
+        assert_eq!(first.body, "子甲要做的事\n", "子任务描述成为普通段落");
+        assert!(first.needs_split, "needs_split 必须写进锚点");
+        assert_eq!(
+            first.heading_level(),
+            before.root.heading_level() + 1,
+            "子锚点层级 = 父 + 1"
+        );
+        assert_eq!(doc.root.body, before.root.body, "父节点正文不许被改");
+        assert_eq!(doc.root.title, before.root.title);
+    }
+
+    /// 锚点插入之后仍可能失败（plan marker、todo 落盘……）：回滚必须把大纲
+    /// 恢复成导入前的**字节**，否则看板退回原样、大纲里却多出两条指向不存在
+    /// 任务的锚点——下次同步会把它们当成看板缺节点而整份报错。
+    #[test]
+    fn import_child_insertion_rolls_back_on_failure() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let parent = make_task(&mut store, "大任务");
+        let rel = attach_parent_outline(cwd, &mut store, &parent);
+        let before = std::fs::read(cwd.join(&rel)).expect("read before");
+        // marker 路径上是目录 → `mark_plan_imported` 必然失败，事务在锚点插入
+        // （大纲已被改写）之后回滚。
+        std::fs::create_dir_all(store.imported_plans_dir().join("pc1")).expect("blocker dir");
+        let req = import_req(serde_json::json!({
+            "plan_id": "pc1",
+            "parent_id": parent.id,
+            "tasks": [{ "title": "子甲", "description": "子甲要做的事" }]
+        }));
+        let err = import_tasks_as_todo_into(&mut store, cwd, &req, Some("pc1"))
+            .expect_err("marker 写不进去 → 整单失败");
+        assert!(err.contains("marker"), "报错要点明 marker 落盘失败：{err}");
+        assert_eq!(store.list().len(), 1, "子任务必须回滚，只剩原来的父任务");
+        assert_eq!(
+            std::fs::read(cwd.join(&rel)).expect("read after"),
+            before,
+            "大纲必须逐字节还原"
+        );
+    }
+
+    /// 父任务（祖先链上也没有）没有大纲 = 这次拆分本来就不维护大纲：照常建
+    /// 子任务，一条文件都不写、也不报错。
+    #[test]
+    fn import_without_parent_outline_is_noop() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let parent = make_task(&mut store, "无大纲大任务");
+        let req = import_req(serde_json::json!({
+            "parent_id": parent.id,
+            "tasks": [{ "title": "子甲" }, { "title": "子乙" }]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("没有大纲不是错误");
+        assert_eq!(created.len(), 2);
+        for id in &created {
+            assert_eq!(
+                store.get(id).expect("子任务存在").parent_id.as_deref(),
+                Some(parent.id.as_str())
+            );
+        }
+        assert!(
+            !cwd.join("docs/outlines").exists(),
+            "没有大纲就不该创建任何文档"
+        );
     }
 
     /// 同名任务无法唯一绑定锚点（一个锚点绑到"第一个同名任务"并不会产生重复
@@ -8535,11 +8796,14 @@ mod tests {
         );
     }
 
-    /// 拆分子任务入口：建 session 跑 task_refine workflow，任务状态不变、
-    /// 不记 run，历史里留拆分会话备注。
-    #[tokio::test]
-    async fn refine_task_creates_session_without_state_change() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    /// 拆分入口的固定装置：写一份最小 `task_refine` workflow，并建一个
+    /// `needs_split` 由调用方指定的任务。拆分只接受 `needs_split=true`，
+    /// 所以需要被拆的任务必须显式置位（默认值 false = 叶子）。
+    fn refine_fixture(
+        dir: &tempfile::TempDir,
+        title: &str,
+        needs_split: bool,
+    ) -> (UiBackend, String) {
         // refine 依赖 task_refine workflow：写进项目 workflows.d。
         let wf_dir = dir.path().join(".latte").join("workflows.d");
         std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
@@ -8548,22 +8812,70 @@ mod tests {
             "name = \"task_refine\"\nmax_rounds = 1\n[[steps]]\nid = \"refine\"\nspeakers = [\"manager\"]\nprompt = \"拆分\"\n",
         )
         .expect("write workflow");
-        let b = test_backend(&dir);
-        let parent = create_task(
-            &b,
-            serde_json::from_value(serde_json::json!({"title": "大任务"})).expect("parse"),
-        )
-        .expect("create parent");
+        let b = test_backend(dir);
+        let mut store = b.tasks.write();
+        let task = store
+            .create(title, "desc", 2, vec![], None, None, None, None, "user")
+            .expect("create");
+        store.get_mut(&task.id).expect("刚建").needs_split = needs_split;
+        store.persist(&task.id).expect("persist");
+        drop(store);
+        (b, task.id)
+    }
+
+    /// 叶子任务（needs_split=false）不允许再拆：必须在建 session **之前**就
+    /// 拒掉（409），否则用户拿到的是一堆碎活，还白白烧掉一轮拆分会话。
+    /// 两个分支都要覆盖：叶子被拒、置 true 后同一个任务立刻可拆。
+    #[tokio::test]
+    async fn refine_rejects_leaf_task() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (b, leaf_id) = refine_fixture(&dir, "叶子", false);
+        let history_before = b
+            .tasks
+            .read()
+            .get(&leaf_id)
+            .expect("任务在")
+            .history
+            .len();
+
+        let err = refine_task(&b, &leaf_id).await.expect_err("叶子任务不可再拆");
+
+        assert_eq!(err.status, 409, "叶子任务 → 409 CONFLICT：{}", err.message);
+        assert!(
+            err.message.contains("needs_split"),
+            "报错要告诉用户怎么解：{}",
+            err.message
+        );
+        assert!(b.sessions.read().is_empty(), "被拒时不得建 session");
+        assert!(b.refine_parents.read().is_empty(), "被拒时不得登记拆分会话");
+        let store = b.tasks.read();
+        let leaf = store.get(&leaf_id).expect("任务还在");
+        assert!(leaf.runs.is_empty(), "被拒时不得记 run");
+        assert_eq!(leaf.history.len(), history_before, "被拒时不得往历史里记东西");
+        drop(store);
+
+        // 拒的是状态而不是这个任务：置为 true 后立刻可拆。
+        b.tasks.write().get_mut(&leaf_id).expect("在").needs_split = true;
+        let resp = refine_task(&b, &leaf_id).await.expect("needs_split=true 可拆");
+        assert!(!resp.session_id.is_empty());
+    }
+
+    /// 拆分子任务入口：建 session 跑 task_refine workflow，任务状态不变、
+    /// 不记 run，历史里留拆分会话备注。
+    #[tokio::test]
+    async fn refine_task_creates_session_without_state_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (b, id) = refine_fixture(&dir, "大任务", true);
         b.tasks
             .write()
-            .get_mut(&parent.task.id)
+            .get_mut(&id)
             .unwrap()
             .set_state("todo", "user", None, now_ms());
 
-        let resp = refine_task(&b, &parent.task.id).await.expect("refine");
+        let resp = refine_task(&b, &id).await.expect("refine");
         assert!(!resp.session_id.is_empty());
         let store = b.tasks.read();
-        let t = store.get(&parent.task.id).unwrap();
+        let t = store.get(&id).unwrap();
         assert_eq!(t.state, "todo", "拆分不改变任务状态");
         assert!(t.runs.is_empty(), "拆分不记 run");
         assert!(
@@ -8580,39 +8892,31 @@ mod tests {
     #[tokio::test]
     async fn refine_task_allows_subtask_rejects_running() {
         let dir = tempfile::tempdir().expect("tempdir");
-        // refine 依赖 task_refine workflow：写进项目 workflows.d。
-        let wf_dir = dir.path().join(".latte").join("workflows.d");
-        std::fs::create_dir_all(&wf_dir).expect("mkdir workflows.d");
-        std::fs::write(
-            wf_dir.join("task_refine.toml"),
-            "name = \"task_refine\"\nmax_rounds = 1\n[[steps]]\nid = \"refine\"\nspeakers = [\"manager\"]\nprompt = \"拆分\"\n",
-        )
-        .expect("write workflow");
-        let b = test_backend(&dir);
-        let parent = create_task(
-            &b,
-            serde_json::from_value(serde_json::json!({"title": "父"})).expect("parse"),
-        )
-        .expect("create");
+        let (b, parent_id) = refine_fixture(&dir, "父", true);
         let child = create_task(
             &b,
-            serde_json::from_value(serde_json::json!({"title": "子", "parent_id": parent.task.id}))
+            serde_json::from_value(serde_json::json!({"title": "子", "parent_id": parent_id}))
                 .expect("parse"),
         )
         .expect("create");
+        // 子任务自己也要 needs_split=true 才可拆（叶子规则对任意层级一致）。
+        b.tasks
+            .write()
+            .get_mut(&child.task.id)
+            .unwrap()
+            .needs_split = true;
         // 子任务也可以再拆（任意深度任务树）。
         let resp = refine_task(&b, &child.task.id)
             .await
             .expect("子任务应可再拆");
         assert!(!resp.session_id.is_empty());
         // 执行中的任务不可拆。
-        b.tasks.write().get_mut(&parent.task.id).unwrap().set_state(
-            "in_progress",
-            "user",
-            None,
-            now_ms(),
-        );
-        let err = refine_task(&b, &parent.task.id)
+        b.tasks
+            .write()
+            .get_mut(&parent_id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        let err = refine_task(&b, &parent_id)
             .await
             .expect_err("执行中的任务不可拆");
         assert_eq!(err.status, 400);
@@ -9055,6 +9359,12 @@ mod tests {
         b.tasks.write().get_mut(&sib.task.id).unwrap().paths = vec!["src/tcache.c".into()];
 
         let _ = l2a; // L2a 是叔辈（parent 的兄弟），不应出现在本任务的兄弟段
+        // 拆分只接受 needs_split=true 的任务（叶子不可拆），先把被拆任务置位。
+        b.tasks
+            .write()
+            .get_mut(&target.task.id)
+            .unwrap()
+            .needs_split = true;
         let resp = refine_task(&b, &target.task.id).await.expect("refine");
         assert!(!resp.session_id.is_empty());
 

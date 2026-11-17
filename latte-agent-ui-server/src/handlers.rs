@@ -1306,6 +1306,9 @@ pub(crate) async fn dispatch_task(
 
 /// `POST /api/tasks/:id/refine` —— 拆分子任务：新建 session 跑
 /// task_refine workflow，plan 提案导入后成为该任务的子任务。
+///
+/// 叶子任务（`needs_split=false`）不可再拆：`tasks::check_refine_allowed` 给出
+/// 409，这里把它映射成 `CONFLICT`——请求本身合法，是任务状态不允许。
 pub(crate) async fn refine_task(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<AppState>,
@@ -1313,7 +1316,10 @@ pub(crate) async fn refine_task(
     crate::tasks::refine_task(&state.backend, &id)
         .await
         .map(Json)
-        .map_err(Into::into)
+        .map_err(|e| match e.status {
+            s if s == StatusCode::CONFLICT.as_u16() => (StatusCode::CONFLICT, e.message),
+            _ => e.into(),
+        })
 }
 
 /// `POST /api/tasks/:id/abort` —— 中止执行（走现有 chat/abort 机制）。
