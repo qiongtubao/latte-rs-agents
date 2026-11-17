@@ -829,8 +829,30 @@ impl TaskStore {
     }
 
     /// 把内存中的任务原子写回 `<id>.json`。
-    pub fn save_task(&self, task: &Task) -> Result<(), String> {
-        write_atomic_json(&self.dir.join(format!("{}.json", task.id)), task)
+    ///
+    /// **盘上的 `doc_path` 优先于内存**：`doc_path` 是 latte-agent-core 发布
+    /// 学习文档时**不持 store 锁**直接写进同一个 JSON 的归属指针
+    /// （`learn_doc::write_task_doc_path`）。内存里的 `Task` 是外部写之前建的，
+    /// 字段仍是 `None`；照它序列化就会把盘上那个值抹掉，之后每个子任务的
+    /// `parent_doc` 全部指空。所以"盘上有值、内存没有"时以盘为准，并把这个值
+    /// 收进内存——否则下一次 persist 还要再靠盘救一遍。
+    ///
+    /// 只认这一个字段：其它字段仍以内存/调用方为准，外部改动不因为这一条
+    /// 变成权威。
+    pub fn save_task(&mut self, task: &Task) -> Result<(), String> {
+        let path = self.dir.join(format!("{}.json", task.id));
+        let mut adopted = None;
+        if task.doc_path.is_none() {
+            if let Some(on_disk) = external_doc_path(&path) {
+                if let Some(cached) = self.tasks.get_mut(&task.id) {
+                    cached.doc_path = Some(on_disk.clone());
+                }
+                let mut owned = task.clone();
+                owned.doc_path = Some(on_disk);
+                adopted = Some(owned);
+            }
+        }
+        write_atomic_json(&path, adopted.as_ref().unwrap_or(task))
     }
 
     /// 回滚用：按快照把任务文件写回原文。
@@ -855,11 +877,14 @@ impl TaskStore {
     /// 同时把任务 id 推入 Notion 同步的 dirty 集合（内存 + 落盘标记
     /// 双写，重启/离线不漏推）。
     pub fn persist(&mut self, id: &str) -> Result<(), String> {
+        // 先克隆再落盘：`save_task` 现在要 `&mut self`（它可能把盘上的
+        // `doc_path` 收进内存），不能同时借出 `self.tasks` 里的那一份。
         let t = self
             .tasks
             .get(id)
+            .cloned()
             .ok_or_else(|| format!("task {id:?} 不存在"))?;
-        self.save_task(t)?;
+        self.save_task(&t)?;
         let cwd = self.project_root().to_path_buf();
         self.notion_dirty.mark(&cwd, id);
         Ok(())
@@ -1121,6 +1146,20 @@ fn project_name(cwd: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("project")
         .to_string()
+}
+
+/// 盘上已存在、而 store 从没经手过的 `doc_path`（外部写者留下的归属指针）。
+///
+/// 只读这一个字段：文件不存在 / 不是合法 JSON / 值为空串都当没有——遇到
+/// 坏文件时宁可照常写内存那份，也不能让一次落盘整个失败。
+fn external_doc_path(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    json.get("doc_path")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// 原子写 JSON：先写 `<file>.tmp` 再 rename（同 ui-sessions 约定）。
@@ -6589,6 +6628,44 @@ mod tests {
             Some("实现 ringbuf")
         );
         assert_eq!(store2.meta().next_seq, 101);
+    }
+
+    /// 回归：core 发布学习文档时不持 store 的锁，直接把 `doc_path` 写进任务
+    /// JSON；store 内存里那份 `Task` 仍是 `None`。之后任何一次 `persist`
+    /// （例如工作流跑完的 report）都不许用旧缓存把这个归属指针抹掉——每个
+    /// 子任务的 `parent_doc` 都指着它。
+    #[test]
+    fn persist_preserves_externally_written_doc_path() {
+        let (dir, mut store) = tmp_store();
+        let t = make_task(&mut store, "slab 分配");
+        let path = dir.path().join(format!(".latte/tasks/{}.json", t.id));
+        // 模拟 core：绕开 store 直接改同一个任务文件。
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        json["doc_path"] = serde_json::Value::String("docs/learn/slab.md".into());
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+
+        store.persist(&t.id).expect("persist");
+
+        assert_eq!(
+            store.get(&t.id).and_then(|t| t.doc_path.as_deref()),
+            Some("docs/learn/slab.md"),
+            "persist 之后内存里的 Task 也要认这个外部写的值"
+        );
+        let on_disk: Task =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.doc_path.as_deref(),
+            Some("docs/learn/slab.md"),
+            "盘上的归属指针不能被内存里的 None 覆盖"
+        );
+
+        let reloaded = TaskStore::load(dir.path()).expect("reload");
+        assert_eq!(
+            reloaded.get(&t.id).and_then(|t| t.doc_path.as_deref()),
+            Some("docs/learn/slab.md"),
+            "重启加载后仍然保留"
+        );
     }
 
     /// P1-编排回归（实测实录）：纯探索流（explore/learn）

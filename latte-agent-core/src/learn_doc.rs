@@ -1417,7 +1417,11 @@ pub fn read_outline_path(cwd: &Path, id: &str) -> Option<String> {
 
 /// 把发布后的文档路径写回任务 JSON（`doc_path`）：子任务之后要靠它把
 /// `parent_doc` 指过来。只改这一个键、其余字段原样保留（最小编辑），
-/// 落盘先写 `.tmp` 再 rename，避免半个 JSON 挡住看板加载。
+/// 落盘先写临时文件再 rename，避免半个 JSON 挡住看板加载。
+///
+/// 临时文件名**必须**和 ui-server 的 `<id>.json.tmp` 不同：看板进程随时可能
+/// 在写同一个任务文件（`TaskStore::persist`），两边用同一个临时名就会有一方
+/// 读到/rename 走另一方正在写的内容。
 pub fn write_task_doc_path(cwd: &Path, id: &str, doc_path: &str) -> Result<(), String> {
     let path = task_json_path(cwd, id)
         .ok_or_else(|| format!("任务 id「{id}」拼不出任务文件路径（`{id}.json`）"))?;
@@ -1433,9 +1437,16 @@ pub fn write_task_doc_path(cwd: &Path, id: &str, doc_path: &str) -> Result<(), S
         serde_json::Value::String(doc_path.to_string()),
     );
     let data = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &data).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {} 失败：{e}", path.display()))
+    let tmp = path.with_extension("json.docpath.tmp");
+    if let Err(e) = std::fs::write(&tmp, &data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("写 {} 失败：{e}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename {} 失败：{e}", path.display()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1561,6 +1572,8 @@ mod tests {
         assert_eq!(json["doc_path"], "docs/learn/slab.md");
         assert_eq!(json["state"], "todo");
         assert_eq!(json["paths"][0], "src/a.rs");
+        // 临时文件必须与看板进程的 `<id>.json.tmp` 不同，且写完不留残渣。
+        assert!(!tasks.join("LAT-110.json.docpath.tmp").exists());
         assert!(!tasks.join("LAT-110.json.tmp").exists());
         // 任务文件不存在 → Err（调用方据此记警告）。
         assert!(write_task_doc_path(cwd, "LAT-999", "docs/learn/x.md").is_err());
@@ -1587,6 +1600,48 @@ mod tests {
             Some("docs/outlines/mem.md")
         );
         assert_eq!(read_outline_path(cwd, "LAT-999"), None);
+    }
+
+    /// 数据损坏成环（两个任务互相当父）时必须立刻放弃，不能卡住定稿。
+    #[test]
+    fn read_outline_path_stops_on_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let tasks = cwd.join(".latte/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("LAT-1.json"),
+            r#"{"id":"LAT-1","parent_id":"LAT-2"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tasks.join("LAT-2.json"),
+            r#"{"id":"LAT-2","parent_id":"LAT-1"}"#,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        assert_eq!(read_outline_path(cwd, "LAT-1"), None);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "成环时必须很快返回，不能死循环"
+        );
+    }
+
+    /// 大纲不一定在 `docs/outlines/` 下：链接路径按它自己的目录算。
+    #[test]
+    fn relative_to_handles_outline_outside_docs() {
+        // 大纲就在项目根：定稿路径原样。
+        assert_eq!(relative_to("docs/learn/x.md", ""), "docs/learn/x.md");
+        // 大纲在 `.latte/outlines/`：得爬两级出来。
+        assert_eq!(
+            relative_to("docs/learn/x.md", ".latte/outlines"),
+            "../../docs/learn/x.md"
+        );
+        // 常规位置（既有行为不能写坏）。
+        assert_eq!(
+            relative_to("docs/learn/x.md", "docs/outlines"),
+            "../learn/x.md"
+        );
     }
 
     #[test]
