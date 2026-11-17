@@ -4847,6 +4847,57 @@ mod tests {
         assert_eq!(store.view(&lone).effective_outline_path, None);
     }
 
+    /// 自身大纲优先于祖先，且孙辈必须停**最近**那个祖先——否则拆到
+    /// 第二层会整体回退到根大纲，子树的拆分依据就错了。
+    #[test]
+    fn effective_outline_path_prefers_own_over_ancestor() {
+        let (_dir, mut store) = tmp_store();
+        let mut root = store
+            .create("r", "", 3, vec![], None, None, None, None, "test")
+            .unwrap();
+        root.outline_path = Some("docs/outlines/root.md".into());
+        store.insert_task_for_test(root.clone());
+        let mut child = store
+            .create(
+                "c",
+                "",
+                3,
+                vec![],
+                None,
+                Some(root.id.clone()),
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
+        child.outline_path = Some("docs/outlines/child.md".into());
+        store.insert_task_for_test(child.clone());
+        assert_eq!(
+            store.view(&child).effective_outline_path.as_deref(),
+            Some("docs/outlines/child.md"),
+            "自身 outline_path 必须压过祖先"
+        );
+
+        let grandchild = store
+            .create(
+                "g",
+                "",
+                3,
+                vec![],
+                None,
+                Some(child.id.clone()),
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
+        assert_eq!(
+            store.view(&grandchild).effective_outline_path.as_deref(),
+            Some("docs/outlines/child.md"),
+            "孙辈应停在最近携带大纲的祖先，而不是根"
+        );
+    }
+
     // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
     //
     // 回归 jemalloc 会话事故：plan 清单把 `paths` 写成 `involved_paths`，
