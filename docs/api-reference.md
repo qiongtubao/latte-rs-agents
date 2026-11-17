@@ -792,7 +792,10 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 新建任务。
 
-**请求体：** `CreateTaskRequest`（title / description / priority / labels / parent_id / scheduled_at / workflow / paths / depends_on / isolated）
+**请求体：** `CreateTaskRequest`（title / description / priority / labels / parent_id / scheduled_at / workflow / paths / depends_on / isolated / needs_split）
+
+`needs_split` = 规划判定：`true` = 该任务还需继续拆（拆分子任务入口对它开放），`false`/缺省 = 普通可执行任务。
+手工建的大任务必须自己带这个字段，否则「拆分子任务」只对 workflow 导入出来的任务可用。
 
 `depends_on` = 依赖的任务 id 数组，全部进终态（`done`/`cancelled`）后本任务才可派发。
 未知 id / 自依赖 / 父子关系 / 成环一律 `400`（不静默丢弃）。父子是**聚合**关系不是依赖，
@@ -812,7 +815,8 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 **请求体：** `TaskPatch`（与 `create` 相同字段）。`paths` / `depends_on` 是**整体替换**语义
 （空数组 = 清空）；`depends_on` 走与 `create` 相同的校验。`isolated` 三态：缺省 = 不变，
-`null` = 跟随类型默认，`true`/`false` = 显式。
+`null` = 跟随类型默认，`true`/`false` = 显式。`needs_split`：缺省 = 不变，`true`/`false` = 直接设置
+（手工建的任务事后也能补打/撤掉「还需继续拆」）。
 
 **响应 `200`：** `TaskView`
 

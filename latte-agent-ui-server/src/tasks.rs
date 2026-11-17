@@ -1231,6 +1231,11 @@ pub struct CreateTaskRequest {
     /// 是否在独立 git worktree 里执行；缺省跟随 `task_type` 的默认。
     #[serde(default)]
     pub isolated: Option<bool>,
+    /// 规划判定：是否仍需继续拆分。缺省 false（普通可执行任务）。
+    /// 手工建的大任务必须能自己打这个标记，否则「拆分子任务」入口
+    /// 只对 workflow 导入出来的任务可见。
+    #[serde(default)]
+    pub needs_split: bool,
 }
 
 /// `PATCH /api/tasks/:id` 请求体：全 Option，缺省字段不变。
@@ -1249,6 +1254,9 @@ pub struct TaskPatch {
     pub scheduled_at: Option<Option<i64>>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// 是否仍需继续拆分：缺省 = 不变；true/false = 直接设置。
+    #[serde(default)]
+    pub needs_split: Option<bool>,
     /// 业务类型：三态（缺省不变 / null 清空 / 字符串设置），未知类型 400。
     #[serde(default, deserialize_with = "deserialize_nullable")]
     pub task_type: Option<Option<String>>,
@@ -1486,6 +1494,12 @@ pub fn create_task(b: &UiBackend, req: CreateTaskRequest) -> Result<TaskView, Ap
     }
     if req.isolated.is_some() {
         store.get_mut(&id).expect("刚创建").isolated = req.isolated;
+        store.persist(&id).map_err(ApiError::internal)?;
+    }
+    // 与 import_one 同款：create 的参数列表已经 too_many_arguments，规划
+    // 标记在创建后单独落。缺省 false 就不必多写一次盘。
+    if req.needs_split {
+        store.get_mut(&id).expect("刚创建").needs_split = true;
         store.persist(&id).map_err(ApiError::internal)?;
     }
     let t = store.get(&id).expect("刚创建").clone();
@@ -2843,6 +2857,12 @@ pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView
         }
         if let Some(labels) = patch.labels {
             t.labels = labels;
+        }
+        if let Some(needs_split) = patch.needs_split {
+            // 规划字段（与 title / labels 同级，不走状态机、不记 history）：
+            // 手工建的任务得能事后补打/撤掉「还需继续拆」，否则拆分入口
+            // 只对导入任务可见。
+            t.needs_split = needs_split;
         }
         if let Some(paths) = patch.paths {
             // 归一化：去空白、丢空串、去重（保持首次出现顺序）。派发时
@@ -6522,6 +6542,82 @@ mod tests {
         let p2: TaskPatch =
             serde_json::from_value(serde_json::json!({ "paths": [] })).expect("解析");
         assert_eq!(p2.paths, Some(vec![]), "显式空数组 = 清空声明，与缺省区分");
+    }
+
+    // ─── needs_split：手工建/改任务也能打「还需继续拆」标记 ──────────
+
+    /// create 必须接受请求里的 `needs_split`（原先硬编码 false，手工建的
+    /// 大任务永远进不了拆分入口）。落盘后再 `TaskStore::load` 校验持久化。
+    #[test]
+    fn create_task_persists_needs_split() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let req: CreateTaskRequest = serde_json::from_value(serde_json::json!({
+            "title": "手工大任务",
+            "needs_split": true,
+        }))
+        .expect("请求解析");
+        let view = create_task(&b, req).expect("create");
+        assert!(view.task.needs_split, "POST 必须回显请求里的 needs_split");
+        let id = view.task.id.clone();
+        let reloaded = TaskStore::load(dir.path()).expect("reload");
+        assert!(
+            reloaded.get(&id).expect("重载后任务仍在").needs_split,
+            "needs_split 必须落盘，重启后仍是 true"
+        );
+
+        // 不带该字段 = 普通可执行任务（false）。
+        let req: CreateTaskRequest = serde_json::from_value(serde_json::json!({
+            "title": "普通任务",
+        }))
+        .expect("请求解析");
+        let plain = create_task(&b, req).expect("create");
+        assert!(!plain.task.needs_split, "缺省必须是 false");
+    }
+
+    /// patch 三态：true → 置位；省略 → 不变；false → 撤销。
+    #[test]
+    fn patch_task_sets_and_clears_needs_split() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let b = test_backend(&dir);
+        let req: CreateTaskRequest =
+            serde_json::from_value(serde_json::json!({ "title": "待补标记" })).expect("请求解析");
+        let id = create_task(&b, req).expect("create").task.id;
+
+        let patched = update_task(
+            &b,
+            &id,
+            serde_json::from_value(serde_json::json!({ "needs_split": true })).expect("patch 解析"),
+        )
+        .expect("patch true");
+        assert!(patched.task.needs_split, "PATCH true → true");
+        let reloaded = TaskStore::load(dir.path()).expect("reload");
+        assert!(
+            reloaded.get(&id).expect("重载后任务仍在").needs_split,
+            "置位必须落盘"
+        );
+
+        // 省略字段：只改 priority，needs_split 不能被顺手清掉。
+        let kept = update_task(
+            &b,
+            &id,
+            serde_json::from_value(serde_json::json!({ "priority": 2 })).expect("patch 解析"),
+        )
+        .expect("patch 省略");
+        assert!(kept.task.needs_split, "省略 needs_split = 不变");
+
+        let cleared = update_task(
+            &b,
+            &id,
+            serde_json::from_value(serde_json::json!({ "needs_split": false })).expect("patch 解析"),
+        )
+        .expect("patch false");
+        assert!(!cleared.task.needs_split, "PATCH false → false");
+        let reloaded = TaskStore::load(dir.path()).expect("reload");
+        assert!(
+            !reloaded.get(&id).expect("重载后任务仍在").needs_split,
+            "撤销也必须落盘"
+        );
     }
 
     /// plan 阶段门：import 带 plan_id 时，持有对应 PendingApproval 的
