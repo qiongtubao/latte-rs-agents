@@ -14620,24 +14620,42 @@ pub(crate) mod tests {
 
     /// `outline_writer` 的大纲格式是硬契约：提示词一旦漂离
     /// `outline.rs` 的解析器，`outline_split` 的 gate 会把每一份草案都打回。
-    /// 这里钉住配置可解析、提示词存在且写进了全部解析器关键标记。
+    ///
+    /// 两段校验：
+    /// 1. 用**真实加载类型**（`AgentConfig` → `RoleTemplate`）解析配置：缺必填
+    ///    字段、`category` / `model_tier` 非法都在这里炸，而不是只看 TOML 语法；
+    /// 2. 把提示词里的骨架当**结构**校验（frontmatter 键顺序、每个锚点紧跟标题行、
+    ///    区块成对、`needs_split` 单空格），删掉任何一条硬约束都会失败。
     #[test]
     fn outline_writer_role_config_parses() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../config/agents/outline_writer.toml");
-        let raw = std::fs::read_to_string(&path).expect("outline_writer.toml 必须存在");
-        let v: toml::Value = toml::from_str(&raw).expect("TOML 解析");
-        let role = &v["roles"]["outline_writer"];
-        assert_eq!(role["id"].as_str(), Some("outline_writer"));
+        let read = |rel: &str| -> String {
+            std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel))
+                .unwrap_or_else(|e| panic!("{rel} 必须存在且可读：{e}"))
+        };
+
+        // 1) 配置：走加载器真正用的反序列化路径。
+        let cfg: crate::config::AgentConfig =
+            toml::from_str(&read("../config/agents/outline_writer.toml")).expect("TOML 解析");
+        let role = cfg
+            .roles
+            .get("outline_writer")
+            .expect("roles.outline_writer 必须存在");
+        assert_eq!(role.id, "outline_writer");
+        assert_eq!(role.name, "Outline Writer");
+        assert_eq!(role.category, "planning");
+        assert_eq!(role.model_tier, "standard");
+        assert_eq!(role.temperature, Some(0.2));
+        assert_eq!(role.tools, vec!["read".to_string()]);
+        assert_eq!(role.model_chain, vec!["deepseek-v4-flash".to_string()]);
         assert_eq!(
-            role["prompt_file"].as_str(),
+            role.prompt_file.as_deref(),
             Some("prompts/outline_writer.md")
         );
-        let prompt = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../prompts/outline_writer.md"),
-        )
-        .expect("prompt 文件必须存在");
-        // 提示词必须把解析器的硬约束写进去，否则每次拆分都会被 gate 打回。
+        assert_eq!(role.icon, "📐");
+
+        let prompt = read("../prompts/outline_writer.md");
+
+        // 2) 提示词必须把解析器的硬约束写进去，否则每次拆分都会被 gate 打回。
         for needle in [
             "node:",
             "needs_split",
@@ -14647,6 +14665,117 @@ pub(crate) mod tests {
             "tmp:",
         ] {
             assert!(prompt.contains(needle), "prompt 缺少关键约束：{needle}");
+        }
+
+        // 3) 骨架必须恰好一个 fenced 代码块（提示词只允许它一个代码块，
+        //    所以整份文件的行首围栏只能是"开+闭"两行）。
+        let fence_lines = prompt
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(fence_lines, 2, "提示词必须恰好一个 fenced 代码块");
+
+        let fence_at = prompt
+            .lines()
+            .position(|l| l.trim() == "```markdown")
+            .expect("骨架必须用 ```markdown 围栏");
+        let block = prompt
+            .lines()
+            .skip(fence_at + 1)
+            .take_while(|l| l.trim() != "```")
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!block.is_empty(), "骨架代码块不得为空");
+
+        let idx = |needle: &str| {
+            block
+                .find(needle)
+                .unwrap_or_else(|| panic!("骨架缺少 `{needle}`"))
+        };
+        assert!(block.starts_with("---\n"), "骨架必须以 frontmatter 开头");
+        assert!(
+            idx("schema: 1") < idx("task_id:") && idx("task_id:") < idx("title:"),
+            "frontmatter 键顺序必须是 schema → task_id → title"
+        );
+        assert_eq!(
+            block.matches("\n---\n").count() + usize::from(block.starts_with("---\n")),
+            2,
+            "frontmatter 必须有开头和结尾两条 `---`"
+        );
+
+        let lines: Vec<&str> = block.lines().collect();
+        let anchors: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("<!-- node:"))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            anchors.len() >= 3,
+            "骨架至少要演示根 → 子 → 孙三层，实际锚点数 {}",
+            anchors.len()
+        );
+        assert!(
+            idx("<!-- node:<") < idx("<!-- section:body:start -->"),
+            "根锚点必须在第一个受控区块之前"
+        );
+        // 根节点没有标题行（文档标题在人手维护区）；其余锚点下一行必须是标题行
+        // ——"标题行紧跟锚点"就是靠这个形状表达的。
+        assert_eq!(
+            lines[anchors[0] + 1].trim(),
+            "<!-- section:body:start -->",
+            "根锚点后应紧跟 body 区块（根节点无标题行）"
+        );
+        for &a in &anchors[1..] {
+            let next = lines
+                .get(a + 1)
+                .unwrap_or_else(|| panic!("锚点 `{}` 后缺少标题行", lines[a].trim()));
+            assert!(
+                next.trim_start().starts_with('#'),
+                "锚点后必须紧跟标题行，实际：{} → {}",
+                lines[a].trim(),
+                next.trim()
+            );
+        }
+        // `needs_split` 与 id 之间恰好一个空格：多空格、无空格都不行。
+        assert!(
+            lines.iter().any(|l| l.trim_end().ends_with(" needs_split -->")),
+            "骨架必须演示带 needs_split 的锚点"
+        );
+        assert!(
+            !block.contains("  needs_split") && !block.contains("needs_split-->"),
+            "needs_split 与 id 之间必须恰好一个空格"
+        );
+        // 区块必须成对，且 `learn-links` 即使为空也要写出起止标记（模板如此）。
+        for (open, close) in [
+            ("<!-- section:body:start -->", "<!-- section:body:end -->"),
+            ("<!-- learn-links:start -->", "<!-- learn-links:end -->"),
+            ("<!-- children:start -->", "<!-- children:end -->"),
+        ] {
+            let (o, c) = (block.matches(open).count(), block.matches(close).count());
+            assert!(o > 0, "骨架缺少区块 {open}");
+            assert_eq!(o, c, "区块必须成对：{open} ×{o} vs {close} ×{c}");
+        }
+        assert!(
+            block.contains("<!-- learn-links:start -->\n<!-- learn-links:end -->"),
+            "空的 learn-links 区块也必须写成一对起止标记"
+        );
+        assert_eq!(
+            block.matches("<!-- learn-links:start -->").count(),
+            anchors.len() - 1,
+            "除根节点外每个节点都必须有 learn-links 区块"
+        );
+        // 区块之后不得再出现标题行（解析器直接报错）。
+        for pair in lines.windows(2) {
+            let (cur, next) = (pair[0].trim(), pair[1].trim_start());
+            let closed_block = matches!(
+                cur,
+                "<!-- section:body:end -->" | "<!-- learn-links:end -->"
+            );
+            assert!(
+                !(closed_block && next.starts_with('#')),
+                "区块之后不得再出现标题行：{next}"
+            );
         }
     }
 
