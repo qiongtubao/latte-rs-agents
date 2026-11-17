@@ -833,6 +833,24 @@ impl TaskStore {
         write_atomic_json(&self.dir.join(format!("{}.json", task.id)), task)
     }
 
+    /// 回滚用：按快照把任务文件写回原文。
+    ///
+    /// 盘上内容**已经等于**快照时不写。为什么：那次失败的写盘根本可能没碰到
+    /// 文件（`write_atomic_json` 是先写 `.tmp` 再 rename），硬写只会因为同一个
+    /// 原因再失败一次，把"已整单回滚"报成"回滚失败"，真正的原因反而被埋掉。
+    fn restore_task_file(&self, task: &Task) -> Result<(), String> {
+        let path = self.dir.join(format!("{}.json", task.id));
+        let target = serde_json::to_value(task).map_err(|e| format!("serialize {}: {e}", task.id))?;
+        let unchanged = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .is_some_and(|on_disk| on_disk == target);
+        if unchanged {
+            return Ok(());
+        }
+        write_atomic_json(&path, task)
+    }
+
     /// 内存里的 `id` 当前值落盘（配合 `get_mut` 原地改后用）。
     /// 同时把任务 id 推入 Notion 同步的 dirty 集合（内存 + 落盘标记
     /// 双写，重启/离线不漏推）。
@@ -2377,6 +2395,24 @@ fn approve_plan_stage(b: &UiBackend, plan_id: &str) {
 
 // ─── 大纲 → 看板：结构同步 ────────────────────────────────────────
 
+/// 一次结构同步的结果。
+///
+/// 为什么把三类 id 分开报：`changed` 只是"动过谁"的并集，调用方真正要区分的
+/// 是"这个任务是**脱离**了我原来那棵树（reparented）"还是"它连同子树被**删掉**了
+/// （deleted）"——只看并集的话，剪枝和搬家长得一模一样。
+///
+/// `changed` = `reparented ∪ 其它结构改动 ∪ deleted`（保留旧调用方的语义：
+/// 被 prune 掉的 id 也算"动过"）。`reparented` 不含被删的 id。
+#[derive(Serialize, Debug, Default)]
+pub struct OutlineSyncReport {
+    /// 结构被改动的全部 id（文档顺序在前，被删的在后）。
+    pub changed: Vec<String>,
+    /// 父链变了的 id（排除被删的）。
+    pub reparented: Vec<String>,
+    /// 被 prune 删掉的 id（缺项那个节点 + 它不在文档中的后代）。
+    pub deleted: Vec<String>,
+}
+
 /// 大纲节点拍平后的一行：`id` + 文档给出的父 id。
 ///
 /// 为什么先拍平：校验要看全树、落地要按文档顺序走，递归两遍不如一次收齐。
@@ -2444,13 +2480,15 @@ pub fn outline_abs_path_for_task(store: &TaskStore, task_id: &str) -> Result<Pat
 ///   变迁（看板的 `updated_at` 会动，`history` 不会）。
 /// - **prune 只删"整棵子树里不在本文档中的部分"**：文档里还留着的节点会被改挂
 ///   到新的父节点上，不能跟着一起埋掉。
+/// - **落地失败整单回滚**：落盘/删除任一步失败，改过的标题、改过的父链、已经
+///   prune 掉的子树全部退回同步前（见 [`restore_sync_snapshot`]）。
 ///
-/// 返回被改动的 id（文档顺序在前，被删的在后）。
+/// 返回 [`OutlineSyncReport`]：`changed`（并集）/ `reparented` / `deleted`。
 pub fn sync_outline_structure(
     store: &mut TaskStore,
     outline_path: &Path,
     prune: bool,
-) -> Result<Vec<String>, String> {
+) -> Result<OutlineSyncReport, String> {
     let project_root = store.project_root().to_path_buf();
     let abs = if outline_path.is_absolute() {
         outline_path.to_path_buf()
@@ -2564,59 +2602,136 @@ pub fn sync_outline_structure(
         return Err(errors.join("\n"));
     }
 
-    let mut changed: Vec<String> = Vec::new();
-    let mut write_errors: Vec<String> = Vec::new();
-    let now = now_ms();
+    // ── 落地计划：只留"真的会变"的节点 ──────────────────────────
+    // 快照与响应都建立在这份计划上，所以先算清楚，再动看板。
+    let mut edits: Vec<OutlineSyncEdit> = Vec::new();
     for node in plans {
-        let mut diff = false;
+        let Some(task) = store.get(&node.id) else {
+            continue;
+        };
+        // 空标题 = 大纲对标题没话说（根节点通常没有标题行），不是"清空标题"。
+        let title_changed = !node.title.trim().is_empty() && task.title != node.title;
+        let split_changed = task.needs_split != node.needs_split;
+        let reparented = node
+            .parent_id
+            .as_deref()
+            .is_some_and(|parent| task.parent_id.as_deref() != Some(parent));
+        if title_changed || split_changed || reparented {
+            edits.push(OutlineSyncEdit { node, reparented });
+        }
+    }
+
+    // 回滚快照：只克隆这次会被动到的任务。校验已经全过，但落盘仍可能失败
+    // （磁盘满、文件被占、目录被换成文件），那时必须退回同步前的样子——
+    // 一半任务改了标题、父链还停在旧形状，比整单没做更难查。
+    let mut pre_images: Vec<Task> = edits
+        .iter()
+        .filter_map(|e| store.get(&e.node.id).cloned())
+        .collect();
+    pre_images.extend(prune_ids.iter().filter_map(|id| store.get(id).cloned()));
+
+    let mut report = OutlineSyncReport::default();
+    // 所有失败项都要报出来（不停在第一个）：反正整单要回滚，多攒几条能让
+    // 用户一次看清到底是哪几个文件写不进去。
+    let mut failed: Vec<String> = Vec::new();
+    let now = now_ms();
+    for edit in &edits {
+        let node = &edit.node;
         {
             let Some(task) = store.get_mut(&node.id) else {
                 continue;
             };
-            // 空标题 = 大纲对标题没话说（根节点通常没有标题行），不是"清空标题"。
-            if !node.title.trim().is_empty() && task.title != node.title {
+            if !node.title.trim().is_empty() {
                 task.title = node.title.clone();
-                diff = true;
             }
-            if task.needs_split != node.needs_split {
-                task.needs_split = node.needs_split;
-                diff = true;
-            }
+            task.needs_split = node.needs_split;
             if let Some(parent) = &node.parent_id {
-                if task.parent_id.as_deref() != Some(parent.as_str()) {
-                    task.parent_id = Some(parent.clone());
-                    diff = true;
-                }
-            }
-            if !diff {
-                continue;
+                task.parent_id = Some(parent.clone());
             }
             task.updated_at = now;
         }
         // 落盘走 persist 而不是 save_task：persist 顺手把 id 标进 Notion dirty
         // 集合，只 save_task 的话看板改了、Notion 那份永远还是旧的。
         if let Err(e) = store.persist(&node.id) {
-            write_errors.push(format!("任务 {} 落盘失败：{e}", node.id));
+            failed.push(format!("{}（{e}）", node.id));
             continue;
         }
-        changed.push(node.id.clone());
+        if edit.reparented {
+            report.reparented.push(node.id.clone());
+        }
+        report.changed.push(node.id.clone());
     }
-    for id in prune_ids {
-        match store.delete(&id) {
+    let mut deleted: Vec<String> = Vec::new();
+    for id in &prune_ids {
+        match store.delete(id) {
             Ok(()) => {
-                store.mark_notion_dirty(&id);
-                changed.push(id);
+                store.mark_notion_dirty(id);
+                deleted.push(id.clone());
+                report.changed.push(id.clone());
             }
-            Err(e) => write_errors.push(format!("删除任务 {id} 失败：{e}")),
+            Err(e) => failed.push(format!("{id}（{e}）")),
         }
     }
-    if !write_errors.is_empty() {
-        return Err(format!(
-            "结构同步未完全落地（内存已改，落盘/删除有失败）：{}",
-            write_errors.join("；")
-        ));
+    if !failed.is_empty() {
+        // 失败即全撤：改过的标题、改过的父链、已经 prune 掉的子树一起回退。
+        let mut message = format!(
+            "结构同步落盘失败，已整单回滚（看板回到同步前）：{}",
+            failed.join("；")
+        );
+        if let Err(e) = restore_sync_snapshot(store, pre_images, &deleted) {
+            message.push_str(&format!("；回滚未完全成功：{e}"));
+        }
+        return Err(message);
     }
-    Ok(changed)
+    report.deleted = deleted;
+    Ok(report)
+}
+
+/// 一次同步里"真的会变"的节点。
+struct OutlineSyncEdit {
+    node: OutlineSyncNode,
+    /// 父链变了没有（响应要把 `reparented` 和普通结构改写分开报）。
+    reparented: bool,
+}
+
+/// 把一次失败的同步按快照撤回：内存索引 + 任务文件，被 prune 掉的还要从
+/// `archive/` 挪回来。所有条目都会尝试恢复，单项失败汇总返回（同
+/// [`TaskStore::rollback_import`] 的口径：别让第一个错误掩盖后续残留）。
+fn restore_sync_snapshot(
+    store: &mut TaskStore,
+    pre_images: Vec<Task>,
+    deleted: &[String],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for task in pre_images {
+        if deleted.iter().any(|id| id == &task.id) {
+            // delete 是"移进 archive/"：挪回去最接近原状（inode/mtime 都不变）。
+            let archived = store.dir.join("archive").join(format!("{}.json", task.id));
+            let live = store.dir.join(format!("{}.json", task.id));
+            if let Err(move_error) = std::fs::rename(&archived, &live) {
+                // archive 里没有（或挪不动）就按快照写回，内容一样，只是新文件；
+                // 顺手清掉 archive 里那份，免得盘上留下一份"已删除"的副本。
+                if let Err(write_error) = store.restore_task_file(&task) {
+                    errors.push(format!(
+                        "恢复任务 {} 失败：{write_error}（archive 回挪失败：{move_error}）",
+                        task.id
+                    ));
+                } else {
+                    let _ = std::fs::remove_file(&archived);
+                }
+            }
+        } else if let Err(e) = store.restore_task_file(&task) {
+            errors.push(format!("恢复任务 {} 失败：{e}", task.id));
+        }
+        // 内存索引无论如何都要退回同步前：它是本进程的权威，盘上那份由上面
+        // 尽力还原（写不进去的那一条本来就没改到文件）。
+        store.tasks.insert(task.id.clone(), task);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView, ApiError> {
@@ -9894,8 +10009,10 @@ mod tests {
                 root.id, child.id
             ),
         );
-        let changed = sync_outline_structure(&mut store, &path, false).expect("同步成功");
-        assert_eq!(changed, vec![child.id.clone()], "只有子任务真的变了");
+        let report = sync_outline_structure(&mut store, &path, false).expect("同步成功");
+        assert_eq!(report.changed, vec![child.id.clone()], "只有子任务真的变了");
+        assert!(report.reparented.is_empty(), "父链没动");
+        assert!(report.deleted.is_empty(), "没删任何任务");
 
         let t = store.get(&child.id).expect("child");
         assert_eq!(t.title, "文档里的新标题");
@@ -9951,8 +10068,10 @@ mod tests {
                 root.id, a.id, b.id
             ),
         );
-        let changed = sync_outline_structure(&mut store, &path, false).expect("合法移动");
-        assert_eq!(changed, vec![b.id.clone()]);
+        let report = sync_outline_structure(&mut store, &path, false).expect("合法移动");
+        assert_eq!(report.changed, vec![b.id.clone()]);
+        assert_eq!(report.reparented, vec![b.id.clone()], "父链变了要单独报");
+        assert!(report.deleted.is_empty(), "没删任何任务");
         assert_eq!(
             store.get(&b.id).expect("B").parent_id.as_deref(),
             Some(a.id.as_str()),
@@ -10018,9 +10137,10 @@ mod tests {
                 a.id, b.id
             ),
         );
-        let changed =
+        let report =
             sync_outline_structure(&mut store, &path, false).expect("占位根不该被当成未知 id");
-        assert_eq!(changed, vec![b.id.clone()], "A 的标题与 needs_split 都没变");
+        assert_eq!(report.changed, vec![b.id.clone()], "A 的标题与 needs_split 都没变");
+        assert!(report.reparented.is_empty(), "根下面那一层不动父链");
         let t = store.get(&b.id).expect("B");
         assert_eq!(t.title, "文档里的 B");
         assert!(t.needs_split);
@@ -10081,11 +10201,16 @@ mod tests {
                 root.id
             ),
         );
-        let changed = sync_outline_structure(&mut store, &path, true).expect("显式 prune");
+        let report = sync_outline_structure(&mut store, &path, true).expect("显式 prune");
+        let mut deleted = report.deleted.clone();
+        deleted.sort();
+        assert_eq!(deleted, vec![extra.id.clone(), orphan.id.clone()], "deleted 要列出被 prune 的整棵子树");
         assert!(
-            changed.contains(&extra.id) && changed.contains(&orphan.id),
-            "changed 要列出被删的 id：{changed:?}"
+            report.changed.contains(&extra.id) && report.changed.contains(&orphan.id),
+            "changed 是被动过的 id 的并集：{:?}",
+            report.changed
         );
+        assert!(report.reparented.is_empty(), "被删的不算 reparented");
         assert!(store.get(&extra.id).is_none(), "缺项整棵子树都要删");
         assert!(store.get(&orphan.id).is_none(), "后代不许留成孤儿");
         assert!(store.get(&root.id).is_some(), "文档里还在的任务不许动");
@@ -10121,12 +10246,18 @@ mod tests {
                 root.id, survivor.id
             ),
         );
-        let changed = sync_outline_structure(&mut store, &path, true).expect("prune");
-        let mut got = changed.clone();
+        let report = sync_outline_structure(&mut store, &path, true).expect("prune");
+        let mut got = report.changed.clone();
         got.sort();
         let mut want = vec![extra.id.clone(), survivor.id.clone()];
         want.sort();
         assert_eq!(got, want, "改挂的 + 被删的都要出现在 changed 里");
+        assert_eq!(report.deleted, vec![extra.id.clone()], "只删缺项");
+        assert_eq!(
+            report.reparented,
+            vec![survivor.id.clone()],
+            "文档里还留着的那个是改挂，不是删除"
+        );
         assert!(store.get(&extra.id).is_none(), "缺项要删");
         let t = store.get(&survivor.id).expect("文档里还留着的节点不许删");
         assert_eq!(
@@ -10215,5 +10346,74 @@ mod tests {
         let child = make_child(&mut store, &root, "子");
         let abs = outline_abs_path_for_task(&store, &child.id).expect("靠祖先链解析");
         assert!(abs.ends_with("docs/outlines/chain.md"), "{abs:?}");
+    }
+
+    /// 落盘失败必须**整单回滚**：改了一半的标题、已经 prune 掉的子树都不许留在
+    /// 板上（内存与磁盘两边都是）。
+    ///
+    /// 失败要确定性：把 `<id>.json.tmp` 占成目录——`write_atomic_json` 是先写
+    /// tmp 再 rename，所以第一步就必然失败，而真正的任务文件一个字节都没被动过
+    /// （这正好是"写盘失败"最真实的样子：文件本身可能还是好的，只是写不进去）。
+    #[test]
+    fn outline_sync_rolls_back_on_write_failure() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/rollback.md");
+        let editable = make_child(&mut store, &root, "旧标题一");
+        let blocked = make_child(&mut store, &root, "旧标题二");
+        let extra = make_child(&mut store, &root, "缺项");
+        // 让 blocked 的落盘必失败：它的 tmp 路径被一个目录占住。
+        let blocker = cwd.join(format!(".latte/tasks/{}.json.tmp", blocked.id));
+        std::fs::create_dir_all(&blocker).expect("blocker dir");
+
+        let path = write_outline_doc(
+            cwd,
+            "rollback",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 回滚\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### 新标题一\n\
+                 <!-- node:{2} -->\n### 新标题二\n\
+                 <!-- children:end -->\n",
+                root.id, editable.id, blocked.id
+            ),
+        );
+        // prune=true：extra 会在同一轮里被删掉，回滚也必须把它捞回来。
+        let err = sync_outline_structure(&mut store, &path, true).expect_err("落盘失败必须报错");
+        assert!(err.contains(&blocked.id), "报错要点名写不进去的那个 id：{err}");
+        assert!(err.contains("回滚"), "报错要说清看板已整单回滚：{err}");
+
+        // 内存索引：一条都没变（包括被回滚的那次删除）。
+        assert_eq!(store.get(&editable.id).expect("一").title, "旧标题一");
+        assert_eq!(store.get(&blocked.id).expect("二").title, "旧标题二");
+        assert!(
+            store.get(&extra.id).is_some(),
+            "prune 目标不许停在已删状态"
+        );
+
+        // 磁盘：重载后同样一条都没变——内存回了、盘上没回也是半个看板。
+        drop(store);
+        let reloaded = TaskStore::load(cwd).expect("reload");
+        for (id, title) in [
+            (&editable.id, "旧标题一"),
+            (&blocked.id, "旧标题二"),
+            (&extra.id, "缺项"),
+        ] {
+            let t = reloaded.get(id).unwrap_or_else(|| panic!("{id} 必须还在"));
+            assert_eq!(&t.title, title, "{id} 的标题不许被改");
+            assert_eq!(
+                t.parent_id.as_deref(),
+                Some(root.id.as_str()),
+                "{id} 的父链不许被改"
+            );
+        }
+        assert!(reloaded.get(&root.id).is_some(), "大纲所有者本身没动");
+        // 被删又被捞回来的那条：archive/ 里不许留下副本（否则同一任务两份文件）。
+        assert!(
+            !cwd.join(format!(".latte/tasks/archive/{}.json", extra.id))
+                .exists(),
+            "回滚后的任务不该还留在 archive/"
+        );
     }
 }

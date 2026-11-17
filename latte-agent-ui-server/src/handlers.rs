@@ -1346,31 +1346,29 @@ pub(crate) async fn resume_task(
 /// 只同步结构（标题/父链/needs_split），执行状态由看板独占。
 ///
 /// - 404：`:task_id` 不存在；409：该任务（含祖先链）没有 `outline_path`，
-///   或者大纲与看板对不上（未知 id / 缺项 / 成环 / 未定稿的 `tmp:` 锚点）——
-///   这些错误都由 [`crate::tasks::sync_outline_structure`] 在**改任何东西之前**
-///   收集齐，看板不会留下半套状态。
+///   或者大纲与看板对不上（未知 id / 缺项 / 成环 / 未定稿的 `tmp:` 锚点），
+///   或者落盘/删除失败（已整单回滚）——这些错误都由
+///   [`crate::tasks::sync_outline_structure`] 在**改任何东西之前**收集齐，
+///   看板不会留下半套状态。
 /// - `prune` 缺省关：缺项只报不删。为什么默认不删见上面那个函数的文档注释。
 pub(crate) async fn sync_outline(
     axum::extract::Path(task_id): axum::extract::Path<String>,
     axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> Result<Json<crate::tasks::OutlineSyncReport>, (StatusCode, String)> {
     let prune = q
         .get("prune")
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
-    // 路径解析放在只读锁里做完：`outline_abs_path_for_task` 只读一次索引，
-    // 别让这次纯查询占着写锁。
-    let abs = {
-        let store = state.backend.tasks.read();
-        crate::tasks::outline_abs_path_for_task(&store, &task_id)
-            .map_err(Into::<(StatusCode, String)>::into)?
-    };
-    let changed = {
-        let mut store = state.backend.tasks.write();
-        crate::tasks::sync_outline_structure(&mut store, &abs, prune)
-            .map_err(|e| (StatusCode::CONFLICT, e))?
-    };
-    Ok(Json(serde_json::json!({ "changed": changed })))
+    // **一把写锁到底**：`outline_path` 是可变的，分两次拿锁（读锁解析路径 →
+    // 放锁 → 写锁同步）中间就可能被别的请求改掉，那样真正拿来校验看板的大纲
+    // 和用户以为的那份不是同一个文件——`prune=true` 时会把另一份大纲辖区内的
+    // 任务整片删掉。路径解析与同步必须在同一个临界区里。
+    let mut store = state.backend.tasks.write();
+    let abs = crate::tasks::outline_abs_path_for_task(&store, &task_id)
+        .map_err(Into::<(StatusCode, String)>::into)?;
+    let report = crate::tasks::sync_outline_structure(&mut store, &abs, prune)
+        .map_err(|e| (StatusCode::CONFLICT, e))?;
+    Ok(Json(report))
 }
 
 /// `GET /api/tasks/:id/worktree-diff` —— 隔离任务的改动预览（批准前看一眼）。
