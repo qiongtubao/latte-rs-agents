@@ -91,6 +91,7 @@ mod subsession_disk;
 pub mod supervisor;
 pub mod task_worktree;
 pub mod todo;
+pub mod tool_artifact;
 pub mod tool_docs;
 pub mod tool_fix;
 pub mod trace;

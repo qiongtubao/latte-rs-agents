@@ -196,6 +196,9 @@ mod tests {
                     role_id: "m".into(),
                     tool_name: "read".into(),
                     result: "ok".into(),
+                    output_complete: true,
+                    output_bytes: None,
+                    artifact: None,
                     sub_id: None,
                 },
             ),
@@ -358,6 +361,9 @@ mod tests {
             role_id: "manager".into(),
             tool_name: "read".into(),
             result: "ok".into(),
+            output_complete: true,
+            output_bytes: None,
+            artifact: None,
             sub_id: None,
         };
         let v2: serde_json::Value =

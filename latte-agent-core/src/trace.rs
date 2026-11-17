@@ -390,6 +390,14 @@ pub enum TraceEvent {
         args_json: String,
         latency_ms: u64,
         status: ToolStatus,
+        /// Metadata retained even when `status` carries only a bounded output
+        /// preview. Older traces omitted this and deserialize as complete.
+        #[serde(default = "default_output_complete")]
+        output_complete: bool,
+        #[serde(default)]
+        output_bytes: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<String>,
     },
     ToolRetry {
         meta: TraceMeta,
@@ -706,6 +714,10 @@ pub enum ToolStatus {
     Err(String),
 }
 
+fn default_output_complete() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HookPoint {
     PreCall,
@@ -998,15 +1010,27 @@ impl TraceEvent {
                 args_json,
                 latency_ms,
                 status,
+                output_complete,
+                output_bytes,
+                artifact,
                 ..
             } => {
                 let result_str = match status {
                     ToolStatus::Ok(s) => format!("ok: {}", s),
                     ToolStatus::Err(s) => format!("err: {}", s),
                 };
+                let evidence = if *output_complete {
+                    "complete".to_string()
+                } else {
+                    format!(
+                        "PARTIAL ({} bytes before truncation; not complete verification evidence{})",
+                        output_bytes,
+                        if artifact.is_some() { "; artifact available" } else { "" }
+                    )
+                };
                 format!(
-                    "name={}\n  args:  {}\n  result: {}\n  latency: {}ms",
-                    name, args_json, result_str, latency_ms
+                    "name={}\n  args:  {}\n  result: {}\n  output: {}\n  latency: {}ms",
+                    name, args_json, result_str, evidence, latency_ms
                 )
             }
             TraceEvent::ToolRetry {
@@ -1310,6 +1334,9 @@ impl TraceEvent {
                 name,
                 latency_ms,
                 status,
+                output_complete,
+                output_bytes,
+                artifact,
                 ..
             } => IndexLine {
                 turn: meta.turn,
@@ -1322,12 +1349,21 @@ impl TraceEvent {
                 tokens_out: None,
                 tokens_think: None,
                 detail: format!(
-                    "name={} status={}",
+                    "name={} status={} output={}{}",
                     name,
                     match status {
                         ToolStatus::Ok(_) => "ok",
                         ToolStatus::Err(_) => "err",
-                    }
+                    },
+                    if *output_complete {
+                        "complete".to_string()
+                    } else {
+                        format!("partial({output_bytes}B)")
+                    },
+                    artifact
+                        .as_ref()
+                        .map(|_| " artifact=available")
+                        .unwrap_or("")
                 ),
             },
             TraceEvent::ToolRetry {
@@ -2449,6 +2485,9 @@ mod tests {
                 args_json: r#"{"command":"pwd"}"#.into(),
                 latency_ms: 50,
                 status: ToolStatus::Ok("/Users/zhouguodong".into()),
+                output_complete: true,
+                output_bytes: "/Users/zhouguodong".len(),
+                artifact: None,
             },
             TraceEvent::HookFired {
                 meta: meta.clone(),

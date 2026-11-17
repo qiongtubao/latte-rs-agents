@@ -212,7 +212,8 @@ export type ChatEvent =
   // role_id 猜；旧归档/直连接口缺省时退回 role 归属。
   | { type: "ToolUse"; role_id: string; tool_name: string; args: string; sub_id?: string | null }
   | { type: "ToolError"; role_id: string; tool_name: string; error: string; sub_id?: string | null }
-  | { type: "ToolResult"; role_id: string; tool_name: string; result: string; sub_id?: string | null }
+  /** `output_complete:false` means result is a bounded preview, not complete validation evidence. */
+  | { type: "ToolResult"; role_id: string; tool_name: string; result: string; output_complete?: boolean; output_bytes?: number; artifact?: string; sub_id?: string | null }
   | { type: "ImageGenerated"; role_id: string; path: string; prompt: string }
   // plan 工具提交的任务候选：manager 调 plan 后广播，UI 弹窗勾选导入
   // 看板。tasks 与 POST /api/tasks/import 的 ImportTask 同构。

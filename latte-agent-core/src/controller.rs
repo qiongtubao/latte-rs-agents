@@ -141,6 +141,14 @@ fn truncate_event_text(text: &str, max: usize) -> String {
     format!("{}...[+{}B]", &text[..end], text.len() - end)
 }
 
+fn bool_is_true(value: &bool) -> bool {
+    *value
+}
+
+fn default_output_complete() -> bool {
+    true
+}
+
 /// 找到 `from` 之后的下一个 think 标签。
 ///
 /// 认三种形状：`<think>` / `</think>`，以及**带命名空间前缀**的
@@ -336,13 +344,27 @@ impl crate::trace::TraceSink for ChatEventTraceSink {
                 });
             }
             crate::trace::TraceEvent::ToolExec {
-                meta, name, status, ..
+                meta,
+                name,
+                status,
+                output_complete,
+                output_bytes,
+                artifact,
+                ..
             } => match status {
                 crate::trace::ToolStatus::Ok(result) => {
+                    // The UI transport has a stricter bound than the model
+                    // preview. Carry that second truncation as metadata too:
+                    // a 2KB diagnostic result must not appear “complete” just
+                    // because it did not cross the artifact spill threshold.
+                    let event_output_complete = output_complete && result.len() <= 1_500;
                     let _ = self.event_tx.send(ChatEvent::ToolResult {
                         role_id: meta.role,
                         tool_name: name,
                         result: truncate_event_text(&result, 1_500),
+                        output_complete: event_output_complete,
+                        output_bytes: (!event_output_complete).then_some(output_bytes),
+                        artifact,
                         sub_id: self.sub_id.clone(),
                     });
                 }
@@ -485,11 +507,22 @@ pub enum ChatEvent {
         sub_id: Option<String>,
     },
     /// Tool result (for display in the editor UI).
+    /// `output_complete == false` means `result` is only a preview and must
+    /// not be presented as complete validation evidence.
     /// `sub_id` 与对应的 [`ChatEvent::ToolUse`] 一致。
     ToolResult {
         role_id: String,
         tool_name: String,
         result: String,
+        #[serde(
+            default = "default_output_complete",
+            skip_serializing_if = "bool_is_true"
+        )]
+        output_complete: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_bytes: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_id: Option<String>,
     },
@@ -11744,6 +11777,9 @@ pub(crate) mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: crate::trace::ToolStatus::Err("all models unavailable".into()),
+            output_complete: true,
+            output_bytes: "all models unavailable".len(),
+            artifact: None,
         });
 
         match rx.try_recv().unwrap() {
@@ -11800,6 +11836,9 @@ pub(crate) mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: crate::trace::ToolStatus::Ok("file contents".into()),
+            output_complete: true,
+            output_bytes: "file contents".len(),
+            artifact: None,
         });
         sink.emit(crate::trace::TraceEvent::ToolExec {
             meta: crate::trace::TraceMeta::test_default(),
@@ -11807,6 +11846,9 @@ pub(crate) mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: crate::trace::ToolStatus::Err("boom".into()),
+            output_complete: true,
+            output_bytes: "boom".len(),
+            artifact: None,
         });
 
         match rx.try_recv().unwrap() {

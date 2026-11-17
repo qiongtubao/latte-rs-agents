@@ -4698,7 +4698,8 @@ enum CheckpointRecord {
         finished_at: u64,
     },
     /// Terminal workflow failure. This is diagnostic state only: it never
-    /// counts as a completed step and is not copied into a resumed run.
+    /// counts as a completed step. Resume reads it as targeted repair context,
+    /// but does not copy the old terminal record into the new run.
     Failure {
         wf_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4706,6 +4707,8 @@ enum CheckpointRecord {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
         reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tokens_used: Option<u64>,
         failed_at: u64,
     },
 }
@@ -4780,6 +4783,16 @@ fn append_checkpoint(cwd: &Path, wf_id: &str, record: &CheckpointRecord) {
     }
 }
 
+/// Last terminal failure recovered from a checkpoint. It remains diagnostic
+/// state, not a completed step, and is consumed only as targeted resume input.
+#[derive(Debug, Clone)]
+struct CheckpointFailure {
+    step_id: Option<String>,
+    role: Option<String>,
+    reason: String,
+    tokens_used: Option<u64>,
+}
+
 /// State recovered from a checkpoint file for [`run_workflow_resume`].
 /// pub 是给 UI-server 的 `POST /api/workflows/resume` 做启动前校验
 /// （404 检查 + 读 workflow 名）用；`completed` 仅引擎内部使用。
@@ -4794,6 +4807,9 @@ pub struct CheckpointState {
     /// 扇出 step → 已完成元素 `(item_id, output)`，按完成顺序。同一
     /// item 后写覆盖。step 本身不因此算完成。
     fan_out: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Last terminal failure, if the run reached a structured failure path.
+    /// It does not count as completion; resume uses it only to target repair.
+    last_failure: Option<CheckpointFailure>,
     /// Meta 里的 session。旧文件没有这一栏。
     session_id: Option<String>,
     /// Persisted task-level write boundary. Old checkpoints are unscoped.
@@ -4830,6 +4846,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
     let mut answers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut fan_out: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
+    let mut last_failure: Option<CheckpointFailure> = None;
     for (lineno, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -4869,9 +4886,21 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
                 // 的回答。
                 answers.insert(question, answer);
             }
-            CheckpointRecord::Failure { .. } => {
-                // Terminal diagnostics are intentionally excluded from resume
-                // state. Only completed work and user answers carry forward.
+            CheckpointRecord::Failure {
+                step_id,
+                role,
+                reason,
+                tokens_used,
+                ..
+            } => {
+                // 后写覆盖：JSONL 可能因迁移或手工恢复包含多条终态记录，
+                // resume 只认最后一次失败。
+                last_failure = Some(CheckpointFailure {
+                    step_id,
+                    role,
+                    reason,
+                    tokens_used,
+                });
             }
             CheckpointRecord::FanOutItem {
                 step_id,
@@ -4896,6 +4925,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
         completed,
         answers,
         fan_out,
+        last_failure,
         session_id,
         artifact_paths,
         started_at,
@@ -5201,7 +5231,13 @@ impl CheckpointLog {
     }
 
     /// Persist terminal failure diagnostics without changing completion count.
-    fn record_failure(&self, step_id: Option<&str>, role: Option<&str>, reason: &str) {
+    fn record_failure(
+        &self,
+        step_id: Option<&str>,
+        role: Option<&str>,
+        reason: &str,
+        tokens_used: Option<u64>,
+    ) {
         append_checkpoint(
             &self.cwd,
             &self.wf_id,
@@ -5210,6 +5246,7 @@ impl CheckpointLog {
                 step_id: step_id.map(str::to_string),
                 role: role.map(str::to_string),
                 reason: reason.to_string(),
+                tokens_used,
                 failed_at: now_secs(),
             },
         );
@@ -9646,10 +9683,12 @@ async fn learn_fact_check(ctx: &WorkflowRunContext, vars: &HashMap<String, Strin
     // 推理型模型回答前会想很久：一批太大会把输出额度用在思考上、content 为空。所以失败的批
     // 对半拆开再问，而不是原样重试。
     let agent = Arc::new(agent);
+    let token_budget = ctx.token_budget.clone();
     let sem = Arc::new(tokio::sync::Semaphore::new(3));
     let mut set: tokio::task::JoinSet<lc::GroupResult> = tokio::task::JoinSet::new();
     for (gi, group) in groups.into_iter().enumerate() {
         let agent = agent.clone();
+        let token_budget = token_budget.clone();
         let sem = sem.clone();
         let sink = sink.clone();
         let cancel = ctx.cancel_flag.clone();
@@ -9667,13 +9706,36 @@ async fn learn_fact_check(ctx: &WorkflowRunContext, vars: &HashMap<String, Strin
                 let msgs = [Message::system(lc::SYSTEM_PROMPT), Message::user(user)];
                 let started = std::time::Instant::now();
                 let mut verdicts = None;
+                let mut budget_blocked = false;
+                let mut params = agent.params.clone();
+                params.tools.clear();
+                params.tool_choice = latte_ai::models::ToolChoice::None;
                 for _ in 0..2 {
+                    if cancel.load(Ordering::SeqCst) {
+                        budget_blocked = true;
+                        break;
+                    }
+                    let reservation = match crate::agent::reserve_model_request(
+                        token_budget.as_ref(),
+                        None,
+                        &msgs,
+                        &params,
+                    ) {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            budget_blocked = true;
+                            break;
+                        }
+                    };
                     let Ok(c) = agent
-                        .chat(&msgs, None, crate::agent::WaitPolicy::NoWait)
+                        .chat(&msgs, Some(&params), crate::agent::WaitPolicy::NoWait)
                         .await
                     else {
                         continue;
                     };
+                    if let Some(permit) = reservation {
+                        permit.settle(crate::agent::completion_usage(&c));
+                    }
                     if let Some(sink) = &sink {
                         sink.emit(crate::trace::TraceEvent::ModelCall {
                             meta: crate::trace::TraceMeta::now(gi as u32, "fact_check", ""),
@@ -9712,6 +9774,7 @@ async fn learn_fact_check(ctx: &WorkflowRunContext, vars: &HashMap<String, Strin
                                 .map(|(_, c)| c.clone()),
                         );
                     }
+                    None if budget_blocked => res.failed += cs.len(),
                     None if cs.len() >= 4 && depth < 2 => {
                         let mid = cs.len() / 2;
                         let right = cs.split_off(mid);
@@ -10684,9 +10747,24 @@ async fn run_workflow_inner(
                 );
             }
         }
+        let failure_note = state
+            .last_failure
+            .as_ref()
+            .map_or(String::new(), |failure| {
+                let target = match (&failure.step_id, &failure.role) {
+                    (Some(step), Some(role)) => format!("；上次失败在 {step}/{role}"),
+                    (Some(step), None) => format!("；上次失败在 {step}"),
+                    _ => "；上次失败没有可定位 step".to_string(),
+                };
+                let usage = failure
+                    .tokens_used
+                    .map(|used| format!("，上次 run 使用 {used} token"))
+                    .unwrap_or_default();
+                format!("{target}{usage}")
+            });
         let _ = ctx.event_tx.send(ChatEvent::Status {
             message: format!(
-                "workflow '{name}' 从断点续跑（checkpoint {}）：跳过已完成的 {} 步",
+                "workflow '{name}' 从断点续跑（checkpoint {}）：跳过已完成的 {} 步{failure_note}",
                 resume_wf_id.unwrap_or_default(),
                 state.completed.len()
             ),
@@ -10849,6 +10927,7 @@ async fn run_workflow_inner(
                 failure.step_id.as_deref(),
                 failure.role.as_deref(),
                 &failure.reason,
+                ctx.token_budget.as_ref().map(|budget| budget.used()),
             );
             // 失败不丢成果：已完成 step 都落了 checkpoint，消息尾部
             // 带上进度与 wf_id，manager 可直接用 resume 续跑。
@@ -11970,6 +12049,33 @@ fn context_overflow_detail(error: &crate::error::AgentError) -> Option<String> {
     }
 }
 
+fn resume_failure_targets(
+    failure: &CheckpointFailure,
+    step_id: &str,
+    role: &str,
+    first_speaker: bool,
+) -> bool {
+    failure.step_id.as_deref() == Some(step_id)
+        && match failure.role.as_deref() {
+            Some(expected) => expected == role,
+            None => first_speaker,
+        }
+}
+
+fn resume_failure_feedback(failure: &CheckpointFailure) -> String {
+    let usage = failure
+        .tokens_used
+        .map(|used| format!("上次 run 在失败前累计使用 {used} token。\n"))
+        .unwrap_or_default();
+    format!(
+        "【断点续跑定向返修】\n{usage}\
+         上次该步骤失败：\n{}\n\n\
+         请复用已经落盘的产物和已完成取证，只修复失败原因点名的问题。\
+         不要重新展开完整调查；信息不足时只定向读取必要文件。",
+        output_excerpt(&failure.reason, 4_000)
+    )
+}
+
 fn learn_plan_validation_repair_prompt(
     topic: &str,
     learn_root_rel: &str,
@@ -12517,7 +12623,7 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                                     break;
                                 }
                                 attempt = Err(StepFail::Failed(format!(
-                                    "subagent '{speaker}' 启动前发现 workflow 共享 token 预算已用完（{used}/{budget}），未再发模型请求"
+                                    "subagent '{speaker}' 启动前发现 workflow 共享 token 预算已达上限：本发请求估算落点 {used}，{limit_kind} {budget}，未再发模型请求"
                                 )));
                                 break;
                             }
@@ -13068,7 +13174,8 @@ async fn run_workflow_serial(
             ctx.resolver.clone(),
             ctx.default_params.clone(),
         )
-        .with_review_settings(gate.review_settings);
+        .with_review_settings(gate.review_settings)
+        .with_shared_token_budget(ctx.token_budget.clone());
         let engine = match (&ctx.subsession_store, &ctx.session_id) {
             (Some(store), Some(sid)) if !sid.is_empty() => {
                 let (_id, sink) = store.create(sid, "advisor");
@@ -13113,6 +13220,10 @@ async fn run_workflow_serial(
 
     // learn_loop：本次学习独占的主题，持有到整个 run 结束。
     let mut learn_lock: Option<LearnTopicLock> = None;
+    // Terminal failure is consumed once by the exact failed step/speaker.
+    // It is separate from loop feedback so resume cannot leak it into a
+    // neighboring step when the old checkpoint lacks a precise target.
+    let mut resume_failure = resume.and_then(|state| state.last_failure.clone());
 
     for round in 0..wf.effective_max_rounds() {
         // 跨 step 循环（loop_until）的每轮状态：迭代计数按 loop_until
@@ -13572,6 +13683,15 @@ async fn run_workflow_serial(
                     Some(fb) => format!("{nested_topic}\n\n【上轮审查反馈】\n{fb}"),
                     None => nested_topic,
                 };
+                let nested_topic = if resume_failure
+                    .as_ref()
+                    .is_some_and(|failure| failure.step_id.as_deref() == Some(step.id.as_str()))
+                {
+                    let failure = resume_failure.take().expect("targeted nested failure");
+                    format!("{nested_topic}\n\n{}", resume_failure_feedback(&failure))
+                } else {
+                    nested_topic
+                };
                 match run_nested_workflow(
                     nested_name.clone(),
                     nested_topic,
@@ -13751,7 +13871,7 @@ async fn run_workflow_serial(
             // context-overflow fresh restarts are bounded per step and do not
             // reset loop_iters, token accounting, or dispatch budget.
             let mut context_overflow_restarts = 0usize;
-            for speaker in active_speakers {
+            for (speaker_index, speaker) in active_speakers.into_iter().enumerate() {
                 if ctx.cancel_flag.load(Ordering::SeqCst) {
                     return WfOutcome::Cancelled;
                 }
@@ -13765,10 +13885,38 @@ async fn run_workflow_serial(
                         pin.instruction(&learn_root_rel(ctx))
                     );
                 }
+                let targeted_resume = resume_failure.as_ref().is_some_and(|failure| {
+                    resume_failure_targets(failure, &step.id, &speaker, speaker_index == 0)
+                });
+                if targeted_resume {
+                    let failure = resume_failure.take().expect("targeted resume failure");
+                    if wf.name == "learn_loop" && step.id == "plan" {
+                        if let Some(slug) = recover_learn_slug(&learn_root(ctx), slug_pin.as_ref())
+                        {
+                            let reason = validate_learn_plan(&ctx.cwd, &learn_root(ctx), &slug)
+                                .err()
+                                .unwrap_or_else(|| failure.reason.clone());
+                            clean_prompt = learn_plan_validation_repair_prompt(
+                                topic,
+                                &learn_root_rel(ctx),
+                                &slug,
+                                &reason,
+                                "",
+                            );
+                        } else {
+                            clean_prompt =
+                                format!("{clean_prompt}\n\n{}", resume_failure_feedback(&failure));
+                        }
+                    } else {
+                        clean_prompt =
+                            format!("{clean_prompt}\n\n{}", resume_failure_feedback(&failure));
+                    }
+                }
                 let mut base_prompt = clean_prompt.clone();
                 // A loop-back carries reviewer feedback into a fresh attempt.
                 // Treat it like validation repair for shared-budget admission.
-                let loop_repair = step_transcript.is_empty() && pending_feedback.is_some();
+                let loop_repair =
+                    targeted_resume || (step_transcript.is_empty() && pending_feedback.is_some());
                 // 循环返工批注：跳回目标 step 的第一个 speaker 的 prompt
                 // = 渲染后的 task + 上轮审查反馈（loop step 的产出）。
                 if step_transcript.is_empty() {
@@ -14985,6 +15133,9 @@ struct DagStepInput {
     /// loop_until 返工时由调度器预置的「上轮审查反馈」（未满足循环
     /// 条件的那个 step 的产出），拼进本 step 的 prompt 后消费。
     feedback: Option<String>,
+    /// Resume-only terminal failure targeted to this step. Unlike loop
+    /// feedback, run_dag_step delivers it only to the failed role.
+    resume_failure: Option<CheckpointFailure>,
     /// 用户回答台账（透传给 SpeakerDispatch）。
     answer_log: Arc<AnswerLog>,
 }
@@ -15038,6 +15189,10 @@ async fn run_dag_step(
         // 被丢掉，返工退化成原地重摇骰子，白烧 max_iterations 轮。
         let nested_topic = match &inp.feedback {
             Some(fb) => format!("{nested_topic}\n\n【上轮审查反馈】\n{fb}"),
+            None => nested_topic,
+        };
+        let nested_topic = match &inp.resume_failure {
+            Some(failure) => format!("{nested_topic}\n\n{}", resume_failure_feedback(failure)),
             None => nested_topic,
         };
         let ctx = WorkflowRunContext {
@@ -15125,7 +15280,7 @@ async fn run_dag_step(
             ),
         });
     }
-    for speaker in active_speakers {
+    for (speaker_index, speaker) in active_speakers.into_iter().enumerate() {
         if inp.cancel_flag.load(Ordering::SeqCst) {
             return Err(StepFail::Cancelled);
         }
@@ -15139,6 +15294,17 @@ async fn run_dag_step(
         let base_prompt = match &inp.feedback {
             Some(fb) => format!("{base_prompt}\n\n【上轮审查反馈】\n{fb}"),
             None => base_prompt,
+        };
+        let targeted_resume = inp.resume_failure.as_ref().is_some_and(|failure| {
+            resume_failure_targets(failure, &step.id, &speaker, speaker_index == 0)
+        });
+        let base_prompt = if targeted_resume {
+            format!(
+                "{base_prompt}\n\n{}",
+                resume_failure_feedback(inp.resume_failure.as_ref().expect("resume failure"))
+            )
+        } else {
+            base_prompt
         };
         let full_prompt = if step_transcript.is_empty() {
             base_prompt
@@ -15199,7 +15365,7 @@ async fn run_dag_step(
                 token_budget: inp.token_budget.clone(),
                 token_budget_ceiling: inp.token_budget.as_ref().map(|budget| {
                     budget.attempt_ceiling(
-                        inp.feedback.is_some() || attempt > 0,
+                        targeted_resume || inp.feedback.is_some() || attempt > 0,
                         workflow_repair_reserve_ratio(),
                     )
                 }),
@@ -15599,7 +15765,8 @@ async fn run_workflow_dag(
             ctx.resolver.clone(),
             ctx.default_params.clone(),
         )
-        .with_review_settings(gate.review_settings);
+        .with_review_settings(gate.review_settings)
+        .with_shared_token_budget(ctx.token_budget.clone());
         let engine = match (&ctx.subsession_store, &ctx.session_id) {
             (Some(store), Some(sid)) if !sid.is_empty() => {
                 let (_id, sink) = store.create(sid, "advisor");
@@ -15645,6 +15812,8 @@ async fn run_workflow_dag(
             }
         }
     }
+
+    let mut resume_failure = resume.and_then(|state| state.last_failure.clone());
 
     for round in 0..wf.effective_max_rounds() {
         // loop_until 返工的每轮状态（对齐串行引擎）：迭代计数按
@@ -15879,6 +16048,13 @@ async fn run_workflow_dag(
                     });
                 }
                 let feedback = pending_feedback.remove(wf.steps[idx].id.as_str());
+                let step_resume_failure = if resume_failure.as_ref().is_some_and(|failure| {
+                    failure.step_id.as_deref() == Some(wf.steps[idx].id.as_str())
+                }) {
+                    resume_failure.take()
+                } else {
+                    None
+                };
                 let tolerate = wf.steps[idx]
                     .fan_out
                     .as_ref()
@@ -15962,6 +16138,7 @@ async fn run_workflow_dag(
                         dispatch_budget: ctx.dispatch_budget.clone(),
                         token_budget: ctx.token_budget.clone(),
                         feedback: feedback.clone(),
+                        resume_failure: step_resume_failure.clone(),
                         answer_log: answer_log.clone(),
                     };
                     let sem = sem.clone();

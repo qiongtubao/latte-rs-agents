@@ -508,6 +508,9 @@ mod tests {
             args_json: "{}".into(),
             latency_ms: 3,
             status: ToolStatus::Ok("ok".into()),
+            output_complete: true,
+            output_bytes: 2,
+            artifact: None,
         }
     }
 

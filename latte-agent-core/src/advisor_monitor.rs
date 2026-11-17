@@ -1131,6 +1131,9 @@ pub struct AdvisorReviewEngine {
     agent_config: Arc<AgentConfig>,
     resolver: Arc<ModelResolver>,
     default_params: GenerateParams,
+    /// Optional workflow-local token meter. Session-wide monitor engines leave
+    /// this unset because they cannot safely attribute a review to one run.
+    shared_token_budget: Option<Arc<crate::agent::SharedTokenBudget>>,
     /// Session workspace root (`ControllerConfig.cwd`) for the
     /// project-level 监察笔记. `None` = project layer skipped.
     session_cwd: Option<PathBuf>,
@@ -1163,6 +1166,7 @@ impl AdvisorReviewEngine {
             agent_config,
             resolver,
             default_params,
+            shared_token_budget: None,
             session_cwd: None,
             watchdog_notes: true,
             subsession_sink: None,
@@ -1185,6 +1189,17 @@ impl AdvisorReviewEngine {
     /// 注入 delegate-return 审查参数（`AdvisorMonitorConfig::review_settings`）。
     pub fn with_review_settings(mut self, settings: AdvisorReviewSettings) -> Self {
         self.review_settings = settings;
+        self
+    }
+
+    /// Attach a workflow-local shared token meter. Ordinary session monitor
+    /// engines deliberately leave this unset because they are not owned by a
+    /// single workflow run.
+    pub fn with_shared_token_budget(
+        mut self,
+        budget: Option<Arc<crate::agent::SharedTokenBudget>>,
+    ) -> Self {
+        self.shared_token_budget = budget;
         self
     }
 
@@ -1257,10 +1272,32 @@ impl AdvisorReviewEngine {
         // ── 落盘：调 LLM 后 emit ModelCall（真实时延 + finish_reason。
         // 此前在调用前记 latency=0/finish=''，审查耗时与成败全黑盒）──
         let started = std::time::Instant::now();
-        let completion = agent.chat(&[sys, user], None, WaitPolicy::NoWait).await;
+        let messages = [sys, user];
+        let params = agent.params.clone();
+        let reservation = crate::agent::reserve_model_request(
+            self.shared_token_budget.as_ref(),
+            None,
+            &messages,
+            &params,
+        )
+        // 审查路径不带分派 ceiling（传 None），撞的只能是 workflow 硬上限。
+        .map_err(|(used, budget)| AgentError::TokenBudgetExceeded {
+            used,
+            budget,
+            dispatch_ceiling: false,
+            partial: String::new(),
+        })?;
+        let completion = agent
+            .chat(&messages, Some(&params), WaitPolicy::NoWait)
+            .await;
         let latency_ms = started.elapsed().as_millis() as u64;
         let completion = match completion {
-            Ok(c) => c,
+            Ok(c) => {
+                if let Some(permit) = reservation {
+                    permit.settle(crate::agent::completion_usage(&c));
+                }
+                c
+            }
             Err(e) => {
                 if let Some(sink) = self.subsession_sink.as_ref() {
                     let meta = crate::trace::TraceMeta::now(0, "advisor", "");
@@ -1363,7 +1400,20 @@ impl AdvisorReviewEngine {
             *self.inflight_model.lock() = model_id.clone();
             let started = std::time::Instant::now();
             let msgs = [sys, user];
-            let call = agent.chat(&msgs, None, WaitPolicy::NoWait);
+            let params = agent.params.clone();
+            let reservation = crate::agent::reserve_model_request(
+                self.shared_token_budget.as_ref(),
+                None,
+                &msgs,
+                &params,
+            )
+            .map_err(|(used, budget)| AgentError::TokenBudgetExceeded {
+                used,
+                budget,
+                dispatch_ceiling: false,
+                partial: String::new(),
+            })?;
+            let call = agent.chat(&msgs, Some(&params), WaitPolicy::NoWait);
             let completion = match limit {
                 Some(l) => match tokio::time::timeout(l, call).await {
                     Ok(r) => r,
@@ -1377,6 +1427,9 @@ impl AdvisorReviewEngine {
             };
             match completion {
                 Ok(c) => {
+                    if let Some(permit) = reservation {
+                        permit.settle(crate::agent::completion_usage(&c));
+                    }
                     self.emit_review_call(
                         &model_id,
                         started,
@@ -2525,6 +2578,9 @@ mod tests {
             role_id: "manager".into(),
             tool_name: name.into(),
             result: result.into(),
+            output_complete: true,
+            output_bytes: None,
+            artifact: None,
             sub_id: None,
         }
     }
@@ -2669,6 +2725,9 @@ mod tests {
             role_id: "programmer".into(),
             tool_name: "read".into(),
             result: "ok".into(),
+            output_complete: true,
+            output_bytes: None,
+            artifact: None,
             sub_id: None,
         });
         // streak 被重置，单个错误不再触发

@@ -3207,9 +3207,15 @@ export function mountChat(opts: {
       }
       case "ToolResult": {
         const short = truncate(e.result, 80);
-        const resultLine = e.result.toLowerCase().startsWith("error")
-          ? `❌ ${e.tool_name} → ${short}`
-          : `✅ ${e.tool_name} → ${short}`;
+        const incomplete = e.output_complete === false;
+        const completenessNote = incomplete
+          ? `⚠️ 输出不完整${e.output_bytes !== undefined ? `（原始 ${e.output_bytes}B）` : ""}，不能作为验证通过的证据`
+          : "";
+        const resultLine = incomplete
+          ? `⚠️ ${e.tool_name} → 输出不完整，未验证：${short}`
+          : e.result.toLowerCase().startsWith("error")
+            ? `❌ ${e.tool_name} → ${short}`
+            : `✅ ${e.tool_name} → ${short}`;
         subagentTools.push(resultLine);
         updateFooter(); updateStatusPillLabel(`${currentRoleIcon || resolveIcon(e.role_id)} 处理中…`); resetWaitTimer();
         if (e.sub_id) {
@@ -3218,7 +3224,10 @@ export function mountChat(opts: {
           break;
         }
         if (!appendToolToExecutingRow(e.role_id, resultLine)) {
-          const resultRow = addMessage({ kind: "tool", content: `${e.tool_name} → ${truncate(e.result, 200)}`, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
+          const content = completenessNote
+            ? `${e.tool_name} → ${truncate(e.result, 200)}\n\n${completenessNote}`
+            : `${e.tool_name} → ${truncate(e.result, 200)}`;
+          const resultRow = addMessage({ kind: "tool", content, meta: e.role_id, icon: resolveIcon(e.role_id), filePath: getFilePath(e.role_id) });
           const resultChips = makeRefChips(extractCodeRefs(e.tool_name, "", e.result));
           if (resultChips) resultRow.querySelector(".msg-bubble")?.appendChild(resultChips);
         }

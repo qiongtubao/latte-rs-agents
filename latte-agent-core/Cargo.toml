@@ -36,6 +36,7 @@ handlebars = { workspace = true }
 # /v1/images/generations endpoint, b64_json response).
 reqwest = { workspace = true }
 base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"

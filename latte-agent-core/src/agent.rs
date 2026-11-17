@@ -3301,14 +3301,22 @@ async fn run_one_tool_call(
                     ));
                     break;
                 }
+                // Store the exact post-hook payload, then expose only a bounded
+                // preview and opaque capability to the model, trace and step
+                // journal. edit_anchor already consumed the original structured
+                // result above, so provenance checks keep their full data.
+                let output = crate::tool_artifact::spill_if_large(result_str, anchor_scope_id);
                 sink.emit(TraceEvent::ToolExec {
                     meta: meta.refreshed(),
                     name: tc.name.clone(),
                     args_json: args_json.clone(),
                     latency_ms: tool_latency,
-                    status: ToolStatus::Ok(serde_json::to_string(&result).unwrap_or_default()),
+                    status: ToolStatus::Ok(output.content.clone()),
+                    output_complete: output.content_complete,
+                    output_bytes: output.total_bytes,
+                    artifact: output.artifact.clone(),
                 });
-                final_outcome = Ok(result_str);
+                final_outcome = Ok(output.content);
                 break;
             }
             Err(e) => {
@@ -3335,6 +3343,9 @@ async fn run_one_tool_call(
                     args_json: args_json.clone(),
                     latency_ms: tool_latency,
                     status: ToolStatus::Err(detail.clone()),
+                    output_complete: true,
+                    output_bytes: detail.len(),
+                    artifact: None,
                 });
                 final_outcome = Err((kind, detail));
             }
@@ -3423,6 +3434,12 @@ impl AgentRunner {
         agent: Agent,
         tool_manager: Arc<dyn latte_rs_agent_tools::types::ToolManager>,
     ) -> Self {
+        // Large successful tool results are spilled before they enter model
+        // history. Attach the bounded, owner-scoped reader automatically so
+        // every runner that receives an artifact capability can page it back.
+        if !tool_manager.has("artifact_read") {
+            tool_manager.register(crate::tool_artifact::artifact_read_tool(), None);
+        }
         Self {
             agent,
             context: ConversationContext::default(),
@@ -4149,6 +4166,9 @@ impl AgentRunner {
                                 args_json: calls[idx].args.clone(),
                                 latency_ms: 0,
                                 status: crate::trace::ToolStatus::Err(detail.clone()),
+                                output_complete: true,
+                                output_bytes: detail.len(),
+                                artifact: None,
                             });
                             results[idx] = Some(OneCallResult {
                                 id: calls[idx].id.clone(),

@@ -551,6 +551,11 @@ impl IndexLineExt for latte_agent_core::trace::IndexLine {
                 args_json: String::new(),
                 latency_ms: self.latency_ms.unwrap_or(0),
                 status: ToolStatus::Ok(String::new()),
+                // 索引行不带输出正文，也就无从判断是否截断：重放出来的
+                // 事件按「完整」标注，避免把纯占位当成 PARTIAL 证据。
+                output_complete: true,
+                output_bytes: 0,
+                artifact: None,
             },
             "HookFired" => TraceEvent::HookFired {
                 meta,
