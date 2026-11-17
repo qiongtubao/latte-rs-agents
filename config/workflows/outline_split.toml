@@ -1,0 +1,84 @@
+# Workflow: outline_split
+# 大任务拆分：任务树（含 needs_split）+ 受控大纲文档。
+#
+# 为什么单独一份（而不是复用 task_refine）：task_refine 是「看板任务 →
+# 子任务」，大纲文档只是它的附属产物；大任务拆分要先有**任务树**（哪块
+# 还要继续拆），再有大纲（模块划分讲给审查者听）。两条产出各有自己的机械
+# 门禁，串在一条流里才不会「清单放行了、大纲却和清单对不上」。
+#
+# 四步串行：
+# 1) breakdown：task_planner 出结构化拆分草案（清单**必须**含 needs_split，
+#    标题唯一）——引擎机械校验两件事，不合格带批注重做本步；
+# 2) outline_draft：outline_writer 按任务树写大纲（子任务锚 `tmp:<标题原文>`）
+#    ——引擎拿大纲与清单做标题/needs_split 对账；
+# 3) gate：reviewer 终审（覆盖度/粒度/大纲可读性），只裁决不改稿；
+# 4) submit：引擎机械提交 plan（零模型调用），用户在弹窗勾选后导入看板。
+#
+# 为什么标题与 needs_split 交给引擎而不是 reviewer：两者都是可数的——
+# 大纲锚点是 `tmp:<标题原文>`，导入时按标题回填真实 task id，模型改写一个字
+# 那个锚点就永远匹配不上；needs_split 漏写会被 serde 默认成 false，与「已经
+# 拆到叶子」无法区分。能数出来的就让引擎数（同 task_refine 的取舍）。
+
+name = "outline_split"
+command = "/outline-split"
+description = "大任务拆分：出任务树(含 needs_split) + 受控大纲文档｜落点：任务看板 + docs/outlines/<slug>.md"
+max_rounds = 1
+
+[[steps]]
+id = "breakdown"
+description = "task_planner 出结构化拆分草案（含 needs_split；本步不调 plan 工具）"
+speakers = ["task_planner"]
+output_key = "draft"
+max_retries = 1
+# 本步硬性摘掉 plan 工具（引擎层 enforce）：草案要先过 review/gate，
+# 提交统一由 submit 步机械完成。
+tools = ["read", "search", "code_graph"]
+require_plan_tasks = true
+# 拆分类清单必须显式声明 needs_split：缺字段 = 规划意图不明，不能默默当叶子。
+require_needs_split = true
+prompt = """拆分下面这条大任务：
+
+【大任务】
+{{topic}}
+
+先读代码/文档摸清现状再拆。输出：1) 拆分依据（每条引「文件路径 + 符号名」）；2) **恰好一个** ```json 代码块 {"tasks":[...]}。每个任务必须含 title / description(做什么+验收标准) / priority / labels / depends_on / task_type / workflow / paths，且 **必须含 needs_split**（true=还需继续拆，false=叶子）；标题必须唯一。其余拆分纪律沿用 task_planner 角色 prompt。"""
+
+[steps.output_contract]
+min_chars = 200
+forbid = ["TBD", "待补充", "占位符"]
+
+[[steps]]
+id = "outline_draft"
+description = "outline_writer 按任务树写受控大纲文档（tmp: 临时锚）"
+speakers = ["outline_writer"]
+output_key = "outline"
+max_retries = 1
+# 不写 tools：本步要继承角色自己的工具表（outline_writer = ["read"]）。
+# 写成 `tools = []` 会变成「零工具」——大纲里的模块划分全靠读代码，摘掉
+# read 就只能凭任务树臆造正文。
+require_outline_against_plan = true
+prompt = """把这份任务树写成大纲 Markdown（严格按你的角色 prompt 的受控区块格式；子任务锚用 tmp:<标题原文>）：
+
+【任务树】
+{{draft}}
+
+只输出一个 ```markdown 代码块。"""
+
+[[steps]]
+id = "gate"
+description = "reviewer 终审：覆盖度/粒度/大纲可读性"
+speakers = ["reviewer"]
+output_key = "approved"
+loop_until = "VERDICT: ACCEPT"
+loop_back_to = "breakdown"
+loop_abort_on = "VERDICT: REJECT"
+max_iterations = 2
+prompt = """评审任务树与大纲：覆盖度、粒度、依赖、needs_split 是否判对、大纲是否讲清模块划分。只输出 VERDICT: ACCEPT/REVISE/REJECT 与证据化问题清单，不要重写草案。锚点/标题/needs_split 一致性已由引擎机械校验，不必你复核。"""
+
+[steps.output_contract]
+require = ["VERDICT:"]
+
+[[steps]]
+id = "submit"
+description = "引擎机械提交：抽 tasks JSON 提 plan，用户勾选后导入看板"
+submit_plan_from = "draft"

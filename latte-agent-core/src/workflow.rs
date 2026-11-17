@@ -535,6 +535,224 @@ fn check_plan_tasks_output(
     Ok(())
 }
 
+/// 清单里一个任务在**原始 JSON** 里的样子——只留对账要用的三样东西。
+///
+/// 为什么不复用 `controller::PlanTask`：`PlanTask.needs_split` 带
+/// `#[serde(default)]`，「没写」和「写了 false」解析后一模一样，而
+/// [`check_plan_task_shape`] 要区分它们（缺字段 = 规划意图不明，绝不能
+/// 默默当叶子）。所以要另留一个 `has_needs_split_key`。
+struct RawPlanTask {
+    title: String,
+    /// JSON 里有没有 `needs_split` 这个键。
+    has_needs_split_key: bool,
+    /// 键存在时的布尔值；不存在或不是布尔 → `None`。
+    needs_split: Option<bool>,
+}
+
+/// 按 `tasks` + 任意深度 `subtasks` 收集所有任务（原始 JSON 视角）。
+fn collect_raw_plan_tasks(plan: &serde_json::Value) -> Vec<RawPlanTask> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<RawPlanTask>) {
+        let Some(obj) = v.as_object() else { return };
+        out.push(RawPlanTask {
+            title: obj
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("<无标题>")
+                .to_string(),
+            has_needs_split_key: obj.contains_key("needs_split"),
+            needs_split: obj.get("needs_split").and_then(serde_json::Value::as_bool),
+        });
+        if let Some(subs) = obj.get("subtasks").and_then(|s| s.as_array()) {
+            for sub in subs {
+                walk(sub, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(arr) = plan.get("tasks").and_then(|t| t.as_array()) {
+        for task in arr {
+            walk(task, &mut out);
+        }
+    }
+    out
+}
+
+/// 把「纯 JSON 清单」或「模型产出（说明文字 + ```json fence）」统一成
+/// `{"tasks": [...]}` 形态的值。
+///
+/// 为什么要两个入口：单元测试直接喂 JSON，而 runner 手里是整份模型产出。
+/// 判据各写一份迟早会漂开，所以两个门禁共用这一个入口。
+fn extract_plan_tasks(text: &str) -> Result<serde_json::Value, String> {
+    let trimmed = text.trim();
+    if !trimmed.is_empty() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if v.get("tasks").is_some_and(|t| t.is_array()) {
+                return Ok(v);
+            }
+        }
+    }
+    let (_, tasks) = find_tasks_fence(text)?;
+    Ok(serde_json::json!({ "tasks": tasks }))
+}
+
+/// 拆分类清单的**形状**校验：每个任务（含任意深度 `subtasks`）都必须显式
+/// 带 `needs_split`，且标题唯一。
+///
+/// 为什么缺字段要硬拒：`needs_split` 决定这份清单能不能继续往下拆。模型漏写
+/// 时 serde 默认成 `false`，读起来与「已经拆到叶子」一模一样——「没想清楚」
+/// 于是被当成「确定不用再拆」放行。
+///
+/// 为什么标题必须唯一（实测动因）：大纲锚点是 `tmp:<标题>`，重名两个任务会
+/// 撞同一个锚点（解析器拒），而标题对账又会把其中一个判成缺项（本文件的
+/// [`check_outline_against_plan`] 拒）；更糟的是 patch/对账都按标题定位，模型
+/// 根本改不动清单——refine ↔ gate 会死循环。所以在清单阶段就拒，并点名要改的标题。
+fn check_plan_task_shape(plan_json: &str) -> Result<(), String> {
+    let plan = extract_plan_tasks(plan_json)?;
+    let tasks = collect_raw_plan_tasks(&plan);
+
+    let missing: Vec<&str> = tasks
+        .iter()
+        .filter(|t| !t.has_needs_split_key)
+        .map(|t| t.title.as_str())
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "以下任务缺少 needs_split（拆分类清单必填）：{}",
+            missing.join("、")
+        ));
+    }
+
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for task in &tasks {
+        *counts.entry(task.title.as_str()).or_insert(0) += 1;
+    }
+    let dup: Vec<&str> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(title, _)| *title)
+        .collect();
+    if dup.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "任务标题重复：{}。大纲锚点是 tmp:<标题>，重名会撞锚点并被对账拒绝——请改成唯一标题。",
+        dup.join("、")
+    ))
+}
+
+/// 大纲侧的解析：模型产出是「一句话 + 一个 ```markdown fence」，而
+/// `parse_outline` 只认文件本体。先按原文试（模型可能只吐裸文档），失败再
+/// 逐个 fence 试——报错沿用原文那一次，因为它最可能是真原因（没有 frontmatter）。
+fn parse_outline_from_output(md: &str) -> Result<crate::outline::OutlineDoc, String> {
+    let first_err = match crate::outline::parse_outline(md) {
+        Ok(doc) => return Ok(doc),
+        Err(e) => e,
+    };
+    for (_, _info, content) in fenced_code_blocks(md) {
+        if let Ok(doc) = crate::outline::parse_outline(&content) {
+            return Ok(doc);
+        }
+    }
+    Err(format!("大纲文档无法解析：{first_err}"))
+}
+
+/// 收集大纲里**除根节点外**所有节点的 `(标题, needs_split)`。
+///
+/// 根节点不参与对账：它是整份大纲的根（`LAT-ROOT` 或大任务自己的 id），
+/// 清单里的任务全都是它的后代，拿它对账必然报「多余」。
+fn collect_outline_titles(node: &crate::outline::OutlineNode, out: &mut Vec<(String, bool)>) {
+    for child in &node.children {
+        let title = if child.title.trim().is_empty() {
+            // 锚点后面没有标题行：用 id 占位，报错才指得出是哪一个节点。
+            format!("<无标题 {}>", child.id)
+        } else {
+            child.title.clone()
+        };
+        out.push((title, child.needs_split));
+        collect_outline_titles(child, out);
+    }
+}
+
+/// `require_outline_against_plan` 的校验：本步产出的大纲文档必须与
+/// `require_plan_tasks` 的任务树在**锚点标题**与 **needs_split** 上一致。
+///
+/// 为什么需要它（实测动机）：大纲锚点是 `tmp:<标题原文>`，导入时按标题回填
+/// 真实 task id。模型改写标题一个字（补个空格、把「模块一」缩成「模块1」），
+/// 导入时那个 `tmp:` 锚点就永远匹配不上——而这一步没有任何报错，大纲与看板
+/// 从此各说各话。标题与 needs_split 是纯机械可数的，不该交给终审模型去眼过。
+///
+/// 先跑 [`check_plan_task_shape`]：标题唯一是「按标题对账」的前提，缺字段则
+/// 无从比较 needs_split。
+fn check_outline_against_plan(plan_json: &str, outline_md: &str) -> Result<(), String> {
+    check_plan_task_shape(plan_json)?;
+    let plan = extract_plan_tasks(plan_json)?;
+    let plan_tasks = collect_raw_plan_tasks(&plan);
+    let doc = parse_outline_from_output(outline_md)?;
+
+    let mut outline_titles = Vec::new();
+    collect_outline_titles(&doc.root, &mut outline_titles);
+
+    // 标题按多重集比：清单侧唯一（形状门禁保证），大纲侧可以重复——两个锚点
+    // 标同一个标题就是多出来的一项，同样会把 `tmp:` 回填搞乱。
+    let mut plan_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for task in &plan_tasks {
+        *plan_counts.entry(task.title.as_str()).or_insert(0) += 1;
+    }
+    let mut outline_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for (title, _) in &outline_titles {
+        *outline_counts.entry(title.as_str()).or_insert(0) += 1;
+    }
+    let missing: Vec<&str> = plan_counts
+        .iter()
+        .filter(|(title, n)| outline_counts.get(*title).copied().unwrap_or(0) < **n)
+        .map(|(title, _)| *title)
+        .collect();
+    let extra: Vec<&str> = outline_counts
+        .iter()
+        .filter(|(title, n)| plan_counts.get(*title).copied().unwrap_or(0) < **n)
+        .map(|(title, _)| *title)
+        .collect();
+    if !missing.is_empty() || !extra.is_empty() {
+        let mut parts = Vec::new();
+        if !missing.is_empty() {
+            parts.push(format!("缺少 [{}]", missing.join("、")));
+        }
+        if !extra.is_empty() {
+            parts.push(format!("多余 [{}]", extra.join("、")));
+        }
+        return Err(format!(
+            "大纲锚点标题与任务清单不一致：{}。锚点的标题行必须与任务 `title` 逐字一致\
+             （导入时按 `tmp:<标题原文>` 回填真实 id），不要改写、缩写或补空格。",
+            parts.join("／")
+        ));
+    }
+
+    // 标题对齐之后 needs_split 才有比较对象：一个是「这条要再拆」，一个是
+    // 「大纲里标了要再拆」，两处不一致就等于大纲在骗读者。
+    let plan_flags: std::collections::BTreeMap<&str, bool> = plan_tasks
+        .iter()
+        .map(|t| (t.title.as_str(), t.needs_split.unwrap_or(false)))
+        .collect();
+    let mismatched: Vec<String> = outline_titles
+        .iter()
+        .filter_map(|(title, outline_flag)| {
+            let plan_flag = *plan_flags.get(title.as_str())?;
+            (*outline_flag != plan_flag)
+                .then(|| format!("{title}（清单 {plan_flag}／大纲 {outline_flag}）"))
+        })
+        .collect();
+    if mismatched.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "大纲 needs_split 与任务清单不一致：{}。`needs_split` 标记当且仅当任务 JSON 的 \
+         needs_split=true 时才能写进锚点。",
+        mismatched.join("、")
+    ))
+}
+
 /// 学习书目录的层级标签，按阅读顺序：地基（可选）、树干、枝干、树叶。
 const BOOK_LAYERS: [&str; 4] = ["层-地基", "层-树干", "层-枝干", "层-树叶"];
 /// 层级序号：地基（先跑起来、会用 API）→ 树干 → 枝干 → 树叶。
@@ -2752,6 +2970,23 @@ pub struct WorkflowStepDef {
     /// 自查从「说的」变成「算的」。
     #[serde(default)]
     pub require_plan_tasks: bool,
+    /// 清单机械校验：每个任务必须**显式**带 needs_split，且标题唯一（拆分类清单）。
+    ///
+    /// 为什么缺字段要硬拒：`PlanTask.needs_split` 有 `#[serde(default)]`，
+    /// 模型漏写时会被静默默认成 `false`，读起来与「已经拆到叶子」一模一样——
+    /// 「没想清楚」于是当成「确定不用再拆」放行。标题唯一同理：重名会撞
+    /// `tmp:<标题>` 锚点，而对账按标题定位，模型改不动清单。
+    /// 判据见 [`check_plan_task_shape`]。
+    #[serde(default)]
+    pub require_needs_split: bool,
+    /// 大纲机械校验：本步 markdown fence 必须与 `require_plan_tasks` 的任务树在
+    /// 锚点标题 / needs_split 上一致（见 [`check_outline_against_plan`]）。
+    ///
+    /// 为什么需要它：大纲锚点是 `tmp:<标题原文>`，导入时按标题回填真实 task id。
+    /// 模型改写一个字，那个锚点就永远匹配不上，而这一步此前没有任何报错——
+    /// 大纲与看板各说各话。任务树取上游 `output_key = "draft"` 的产出。
+    #[serde(default)]
+    pub require_outline_against_plan: bool,
     /// 学习书目录的结构校验（与 `require_plan_tasks` 配合，只用于 learn_plan 的清单步）：
     /// 带「学习」标签的章必须标「层-树干 / 层-枝干 / 层-树叶」之一、阅读顺序按层单调（先主干后枝叶）、
     /// 树干里要有「推导」章、锚点体量不能过大 / 过薄、不能只锚头文件。判据见 [`check_learn_book_output`]。
@@ -3581,12 +3816,15 @@ impl WorkflowDef {
             // patch / 机械提交字段的形状校验（三者都只在串行引擎实现，
             // DAG 用到即报配置错误，不静默忽略）。
             if (step.require_plan_tasks
+                || step.require_needs_split
+                || step.require_outline_against_plan
                 || step.patch_from.is_some()
                 || step.submit_plan_from.is_some())
                 && uses_dag
             {
                 return Err(format!(
-                    "step '{}': require_plan_tasks / patch_from / submit_plan_from \
+                    "step '{}': require_plan_tasks / require_needs_split / \
+                     require_outline_against_plan / patch_from / submit_plan_from \
                      目前仅支持串行引擎（本 workflow 有 step 声明了 depends_on）",
                     step.id
                 ));
@@ -3621,6 +3859,25 @@ impl WorkflowDef {
                     "step '{}': `submit_plan_from` 是零模型调用的机械步，与 role/speakers 互斥",
                     step.id
                 ));
+            }
+            // 大纲对账的任务树取**固定变量名** `draft`（见 runner 的
+            // `require_outline_against_plan` 分支）：配置里必须真有更早的 step
+            // 绑了这个 output_key，否则运行时永远拿到空串，这条门禁就只剩
+            // 「变量为空」一个报错——配置错误被拖到执行期才暴露。
+            if step.require_outline_against_plan {
+                let own_idx = self.steps.iter().position(|s| s.id == step.id);
+                let ok = own_idx.is_some_and(|i| {
+                    self.steps[..i]
+                        .iter()
+                        .any(|s| s.output_key.as_deref() == Some("draft"))
+                });
+                if !ok {
+                    return Err(format!(
+                        "step '{}': `require_outline_against_plan` 需要更早的 step 声明 \
+                         output_key = \"draft\"（对账用的任务树取这个变量）",
+                        step.id
+                    ));
+                }
             }
             if step.require_learn_chapters
                 && !step.require_plan_tasks
@@ -14286,6 +14543,62 @@ async fn run_workflow_serial(
                             continue;
                         }
                     }
+                    // 拆分类门禁（require_needs_split / require_outline_against_plan）：
+                    // 与 require_plan_tasks 走同一条批注重试链——失败处理逐字相同，
+                    // 只有判据不同，所以合成一个块、共用一次 attempt 计数。
+                    // 顺序有意：先查清单形状（needs_split 显式、标题唯一），再拿
+                    // 清单去对大纲——标题不唯一时按标题对账根本无从谈起。
+                    if step.require_needs_split || step.require_outline_against_plan {
+                        let checked = (|| -> Result<(), String> {
+                            if step.require_needs_split {
+                                check_plan_task_shape(&response)?;
+                            }
+                            if step.require_outline_against_plan {
+                                // 任务树取上游清单步的产出（output_key = "draft"）。
+                                // 空 = 这条门禁无从对账，直接判失败：静默放过等于
+                                // 「大纲和清单一致」的假结论。
+                                let plan_json = vars.get("draft").map_or("", String::as_str);
+                                if plan_json.trim().is_empty() {
+                                    return Err(
+                                        "`require_outline_against_plan` 需要对账的任务树变量 \
+                                         'draft' 为空：上游 step 必须把清单产出绑到 \
+                                         output_key = \"draft\""
+                                            .to_string(),
+                                    );
+                                }
+                                check_outline_against_plan(plan_json, &response)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(reason) = checked {
+                            if attempt >= step.max_retries {
+                                return WfOutcome::speaker_failed(
+                                    &step.id,
+                                    &speaker,
+                                    format!(
+                                        "step '{}' speaker '{}': {reason}（已重试 {attempt} 次）\
+                                     ；不合格产出摘要：{}",
+                                        step.id,
+                                        speaker,
+                                        output_excerpt(&response, 1200)
+                                    ),
+                                );
+                            }
+                            attempt += 1;
+                            tracing::warn!(
+                                step = %step.id, speaker = %speaker, attempt,
+                                reason = %reason,
+                                "workflow step output failed needs_split/outline check; retrying"
+                            );
+                            let annotation = format!(
+                                "{}上次产出未通过验收：{reason}。请修正后重新产出完整结果。",
+                                truncation_retry_hint(&response)
+                            );
+                            step_transcript.push_str(&format!("[验收批注]: {annotation}\n"));
+                            prompt = format!("{full_prompt}\n\n{annotation}");
+                            continue;
+                        }
+                    }
                     // 结构化裁决硬校验（require_verdict_json）：下游 gate_from
                     // 机械判定的输入，格式不合格就带批注重做本步。
                     if step.require_verdict_json {
@@ -17024,6 +17337,8 @@ prompt = "x"
                         s.require_tools.clone(),
                         s.require_tools_any.clone(),
                         s.require_plan_tasks,
+                        s.require_needs_split,
+                        s.require_outline_against_plan,
                         s.require_plan_submit,
                         s.require_symbols_resolvable,
                         s.tools.clone(),
@@ -19398,6 +19713,35 @@ task = "t"
             vec!["TBD", "待补充", "占位符"]
         );
         assert!(breakdown.max_retries >= 1, "contract needs retry budget");
+    }
+
+    /// 验收：`outline_split` 能解析、能通过配置期校验，且四步顺序固定
+    /// （breakdown → outline_draft → gate → submit）。
+    ///
+    /// 为什么用路径读而不是 `include_str!`：这份 workflow 的关键在
+    /// `deny_unknown_fields` + 两条新门禁字段——字段名拼错、TOML 多行字符串
+    /// 写崩，都会在这里炸；顺序断言则钉住「大纲要在清单之后、审阅之前」。
+    #[test]
+    fn outline_split_workflow_is_valid() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../config/workflows/outline_split.toml");
+        let raw = std::fs::read_to_string(&path).expect("outline_split.toml 必须存在");
+        let wf: WorkflowDef = toml::from_str(&raw).expect("解析");
+        wf.validate().expect("校验");
+        let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["breakdown", "outline_draft", "gate", "submit"]);
+        // 两条门禁必须各自落在该落的步上：清单形状管草案，大纲对账管大纲步。
+        assert!(wf.steps[0].require_needs_split, "breakdown 必须校验 needs_split");
+        assert!(
+            wf.steps[1].require_outline_against_plan,
+            "outline_draft 必须与清单对账"
+        );
+        // 大纲步刻意不写 tools（继承角色自己的只读工具表）；写死成空数组
+        // 会变成「零工具」，大纲正文就只能凭任务树臆造。
+        assert!(
+            wf.steps[1].tools.is_empty(),
+            "outline_draft 不该自己声明 tools（否则盖掉角色的 read）"
+        );
     }
 
     /// 验收：task_refine 是「草案 → 评审 → 终审门 → important 定向修补
@@ -26012,6 +26356,35 @@ output_key = "design"
             "```json\n{\"tasks\": [{\"title\": \"T\", \"paths\": [\"nonexistent_dir_xyz\"]}]}\n```";
         let err = check_plan_tasks_output(bad, &dir, false).unwrap_err();
         assert!(err.contains("机械校验"), "{err}");
+    }
+
+    // ─── 拆分类门禁：清单形状（needs_split / 标题唯一）与大纲对账 ───
+
+    /// 大纲里多一个「模块二」、少了「模块一」→ 必须点名缺项。
+    ///
+    /// 与设计稿里的样例差一处（有意）：大纲文档**必须先有 frontmatter**，
+    /// `outline.rs::parse_frontmatter` 第 1 行就要求 `---`。样例省掉它时
+    /// 解析会先死在「格式错误」上，报错里一个标题都没有——这条测试要钉的
+    /// 「标题对账点名缺项」就完全测不到了。
+    #[test]
+    fn outline_gate_rejects_anchor_title_mismatch() {
+        let plan = r#"{"tasks":[{"title":"模块一","needs_split":true,"subtasks":[]}]}"#;
+        let outline = "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: 大任务\n---\n<!-- node:LAT-ROOT -->\n<!-- section:body:start -->\nx\n<!-- section:body:end -->\n<!-- children:start -->\n<!-- node:tmp:模块二 needs_split -->\n### 模块二\n<!-- children:end -->";
+        let err = check_outline_against_plan(plan, outline).unwrap_err();
+        assert!(err.contains("模块一"), "报错要点名缺失/多余的标题: {err}");
+    }
+
+    #[test]
+    fn plan_shape_gate_rejects_missing_needs_split() {
+        let plan = r#"{"tasks":[{"title":"甲"}]}"#;
+        assert!(check_plan_task_shape(plan).unwrap_err().contains("甲"));
+    }
+
+    #[test]
+    fn plan_shape_gate_rejects_duplicate_titles() {
+        // 同标题无处安放：tmp 锚点会撞，标题对账会缺项，且模型改不动清单。
+        let plan = r#"{"tasks":[{"title":"甲","needs_split":false},{"title":"甲","needs_split":false}]}"#;
+        assert!(check_plan_task_shape(plan).unwrap_err().contains("甲"));
     }
 
     /// `require_symbols_resolvable` 的引擎侧接线：产出里查不到的符号要被
