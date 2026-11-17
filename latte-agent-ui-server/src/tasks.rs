@@ -113,6 +113,15 @@ pub struct Task {
     /// 若未显式绑定但 `task_type` 有默认 workflow，则按类型推导。
     #[serde(default)]
     pub workflow: Option<String>,
+    /// 规划判定：是否仍需继续拆分。与"实际有无子任务"解耦——删掉子任务不丢规划意图。
+    #[serde(default)]
+    pub needs_split: bool,
+    /// 大纲文档路径（项目相对），仅在根任务写入；子孙通过祖先链解析。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline_path: Option<String>,
+    /// 学习任务发布后的文档路径（项目相对），如 docs/learn/<slug>.md。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_path: Option<String>,
     /// 任务声明涉及的文件/目录前缀（相对项目根），用于派发时的文件
     /// 范围互斥（见 [`path_running_conflict`] / [`family_running_conflict`]）。
     /// 空 = 未声明，无法证明不冲突 —— 同族任务此时退回整棵树串行。
@@ -695,6 +704,9 @@ impl TaskStore {
             sub_order,
             scheduled_at,
             workflow,
+            needs_split: false,
+            outline_path: None,
+            doc_path: None,
             paths: vec![],
             artifact_paths: None,
             depends_on: vec![],
@@ -1161,6 +1173,12 @@ pub struct ImportTask {
     pub task_type: Option<String>,
     #[serde(default)]
     pub workflow: Option<String>,
+    /// 规划判定：是否仍需继续拆分（拆分 workflow 产出必填；手工导入缺省 false）。
+    #[serde(default)]
+    pub needs_split: bool,
+    /// 大纲文档路径（仅根任务携带）。
+    #[serde(default)]
+    pub outline_path: Option<String>,
     /// 任务涉及的文件/目录前缀（相对项目根）：派发时与在跑任务范围
     /// 重叠会被拒绝（409）。空 = 未声明。
     ///
@@ -1586,6 +1604,14 @@ fn import_one(
         workflow,
         "import",
     )?;
+    if item.needs_split || item.outline_path.is_some() {
+        let t = store.get_mut(&task.id).expect("刚创建");
+        t.needs_split = item.needs_split;
+        if let Some(p) = &item.outline_path {
+            t.outline_path = Some(p.clone());
+        }
+        store.persist(&task.id)?;
+    }
     if !item.paths.is_empty() {
         store.get_mut(&task.id).expect("刚创建").paths = normalize_paths(item.paths.clone());
         store.persist(&task.id)?;
@@ -4637,6 +4663,39 @@ mod tests {
         let fixed: BoardMeta =
             serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
         assert!(fixed.next_seq >= 101, "board.json 应回写修正后的 next_seq");
+    }
+
+    #[test]
+    fn task_new_fields_default_for_old_json() {
+        // 旧任务 JSON 没有新字段 → 必须按缺省解析，不能报错。
+        let old = serde_json::json!({
+            "schema": 1, "id": "LAT-1", "title": "t", "state": "todo",
+            "created_at": 1i64, "updated_at": 1i64
+        });
+        let t: Task = serde_json::from_value(old).expect("old task must parse");
+        assert!(!t.needs_split, "缺省 false");
+        assert_eq!(t.outline_path, None);
+        assert_eq!(t.doc_path, None);
+    }
+
+    #[test]
+    fn import_one_propagates_needs_split_recursively() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let req: ImportTasksRequest = serde_json::from_value(serde_json::json!({
+            "tasks": [{
+                "title": "parent", "needs_split": true,
+                "subtasks": [{ "title": "child", "needs_split": false }]
+            }]
+        }))
+        .unwrap();
+        run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("import ok");
+        let all = store.list();
+        let parent = all.iter().find(|t| t.title == "parent").expect("parent");
+        let child = all.iter().find(|t| t.title == "child").expect("child");
+        assert!(parent.needs_split);
+        assert!(!child.needs_split);
     }
 
     // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
