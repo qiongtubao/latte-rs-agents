@@ -6,17 +6,32 @@
 //! [`render_outline`] 进出，不许自己拼这个文件的字符串，否则格式一改就到处漏改。
 //!
 //! 格式（设计文档 §5）：第一个 `<!-- node: -->` 之前的全部内容是人手写的前言，
-//! 机器一个字都不许动（原样存进 [`OutlineDoc::preamble`]）。机器只碰四类受控区块：
+//! 除行尾规范化外机器一个字都不许动（原样存进 [`OutlineDoc::preamble`]）。
+//! 机器只碰四类受控区块：
 //! `section:body`、`learn-links`、`children`，以及 node 锚点本身。
 //!
 //! 解析为什么是"按行扫描"而不是正则：不能新增依赖；这个格式的标记独占一行、结构
 //! 简单，按行扫描足够，而且能顺手给出**出错行号**——手改大纲写崩时行号比"格式错误"
 //! 有用得多。
 //!
-//! 字节级往返（`render_outline(parse_outline(x)) == x`）是本模块的核心不变量：
-//! 前景不可预测，任何"顺手格式化一下"都会在下一次 diff 里变成噪声甚至丢内容。
+//! # 契约：渲染是**规范化**，不是无损往返
+//!
+//! `render_outline(parse_outline(x))` 对**规范输入**逐字节相同（规范样例见下面的
+//! `FIXTURE` 与 `canonical_fixture_round_trips_byte_exactly`），一般输入则会被
+//! 规范化：机器保证"内容不丢"，但不保证"排版不变"。为什么不追每个空格：为了
+//! 每一处随意空白都往返，`OutlineNode` 里就得塞满排版字段，结构体被噪声占满而
+//! 真正要紧的（id、标题、正文）反而看不清。
+//!
+//! 会被规范化掉的只有这几类，别的一概不动：
+//!
+//! - 区块之间、标题前后的空行：不保留（正文必须显式写在 `section:body` 里）；
+//! - 受控标记与 node 锚点的行首缩进：统一去掉；
+//! - 锚点内的空白：`<!-- node:X  needs_split -->` → `<!-- node:X needs_split -->`；
+//! - 行尾序列：CRLF → LF（正文和前言的内容行除换行符外一字不动）；
+//! - 空的 `children` 区块：渲染时丢弃（内容为空的标记没有信息量）。
 
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 
 const NODE_PREFIX: &str = "<!-- node:";
 const BODY_START: &str = "<!-- section:body:start -->";
@@ -38,9 +53,14 @@ pub struct OutlineNode {
     pub needs_split: bool,
     /// 标题行原文（含 `### ` 前缀）。`None` = 锚点后没有标题行（根节点常见）。
     ///
-    /// 保留原文是为了字节级往返：标题的 `#` 层级、奇怪的空白都是排版信息，
-    /// 不能因为"重新生成一下"就变掉。
+    /// 保留原文是为了排版信息不丢：标题的 `#` 层级、奇怪的空白都按原样写回。
     pub heading_raw: Option<String>,
+    /// 标题层级（`#` 的个数）：`### 标题` → 3；没有标题行时为 0。
+    ///
+    /// 为什么显式存一份而不是每次从 [`OutlineNode::heading_raw`] 数：
+    /// 之后要在大纲里插入子节点（Task 7）时需要"父层级 + 1"这种算术，
+    /// 让调用方去解析标题文本既脆又容易数错。
+    pub heading_level: u8,
     /// `section:body` 区块内的正文，机器同步时原样保留。
     ///
     /// 内容含结尾换行（区块非空时必然是 `...\n`），这样渲染时可以直接拼回去。
@@ -53,14 +73,52 @@ pub struct OutlineNode {
     pub children: Vec<OutlineNode>,
 }
 
+impl OutlineNode {
+    /// 子节点构造器：层级由调用方给出，避免从标题文本反推。
+    ///
+    /// `heading_level` 是 `#` 的个数（1..=6 是 Markdown 的常规范围，0 按 1 处理）。
+    ///
+    /// **为什么 body / learn-links 区块默认存在（内容为空）**：大纲生成器
+    /// （outline_writer 模板）写出来的节点永远带这两个区块，随后的手工编辑只是
+    /// 往里填字。构造器跟着模板走，生成的文件才和模板逐字节同构；反过来"没有区块
+    /// 就省掉"会让同一棵树因为"谁构造的"而渲染出两种形状，diff 全是噪声。
+    pub fn new_child(
+        id: String,
+        title: String,
+        needs_split: bool,
+        heading_level: u8,
+    ) -> OutlineNode {
+        let level = heading_level.max(1);
+        OutlineNode {
+            id,
+            title: title.clone(),
+            needs_split,
+            heading_raw: Some(make_heading(level, &title)),
+            heading_level: level,
+            body: String::new(),
+            has_body_block: true,
+            learn_links: Vec::new(),
+            has_learn_links_block: true,
+            children: Vec::new(),
+        }
+    }
+}
+
 /// 整份大纲文档。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutlineDoc {
     pub task_id: String,
+    /// 根任务的标题。
+    ///
+    /// **文档里展示的标题不归它管**：那是 [`OutlineDoc::preamble`] 里人手写的
+    /// `# 总纲` 一级标题，机器从不改写。根节点没有自己的标题行
+    /// （[`OutlineNode::heading_raw`] 为 `None`）时，[`OutlineNode::title`] 也只是
+    /// 结构元数据——大纲 → 看板的同步靠它，但文件里没有它对应的那一行文字。
     pub title: String,
     /// 第一个 `<!-- node: -->` 之前的全部原文（frontmatter、文档标题、人手写的前言）。
     ///
-    /// 以换行结尾（锚点在第 0 字节时为空串），渲染时直接拼在最前面即可原样还原。
+    /// 以换行结尾（锚点在第 0 字节时为空串），渲染时直接拼在最前面；行尾已按
+    /// 契约规范化为 LF。
     pub preamble: String,
     pub root: OutlineNode,
 }
@@ -132,9 +190,25 @@ fn parse_anchor(line: &str) -> (String, bool) {
     }
 }
 
+/// 标题行里 `#` 的个数（`### 标题` → 3）。没有 `#` 前缀的行返回 0。
+fn heading_level_of(line: &str) -> u8 {
+    let n = line.trim_start().chars().take_while(|c| *c == '#').count();
+    n.min(u8::MAX as usize) as u8
+}
+
+/// 由层级与标题文字拼出规范标题行（`3, "模块一"` → `### 模块一`）。
+fn make_heading(level: u8, title: &str) -> String {
+    format!("{} {}", "#".repeat(level.max(1) as usize), title)
+}
+
 /// 把 `### 模块一` 之类的标题行取成纯标题文字。
+///
+/// 只吃掉 `#` 连串和紧跟其后的**一个**空格：标题自身以 `#` 开头时
+/// （`### ## 小节` → `## 小节`）必须保住那几个 `#`，否则文字被吃掉一半。
 fn heading_title(line: &str) -> String {
-    line.trim().trim_start_matches('#').trim().to_string()
+    let rest = line.trim_start().trim_start_matches('#');
+    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+    rest.trim_end().to_string()
 }
 
 /// 找第一个 node 锚点行的**起始字节偏移**；它之前的一切都是前言。
@@ -201,8 +275,8 @@ fn parse_frontmatter(md: &str) -> Result<(String, String), String> {
             "第 {lineno} 行: frontmatter 未闭合：找不到结尾的 `---`"
         ));
     }
-    let task_id = task_id
-        .ok_or_else(|| format!("第 {close_lineno} 行: frontmatter 缺少 `task_id`"))?;
+    let task_id =
+        task_id.ok_or_else(|| format!("第 {close_lineno} 行: frontmatter 缺少 `task_id`"))?;
     let title = title.ok_or_else(|| format!("第 {close_lineno} 行: frontmatter 缺少 `title`"))?;
     Ok((task_id, title))
 }
@@ -223,6 +297,9 @@ struct Parser<'a> {
     i: usize,
     /// `lines[0]` 在整份文档里的 1-based 行号。
     base_line: usize,
+    /// 已经出现过的 node id → 它第一次出现的行下标（局部下标，报错时换算行号）。
+    /// id 是节点身份，重复即歧义，必须在解析阶段就拦下来。
+    seen: HashMap<String, usize>,
 }
 
 impl<'a> Parser<'a> {
@@ -254,11 +331,25 @@ impl<'a> Parser<'a> {
         }
         self.i = anchor_i + 1;
 
+        // id 是节点身份：第二次出现意味着"两个节点自认为同一个"，同步和重绑定
+        // 都会认错人，所以宁可在解析时炸掉。
+        if let Some(first) = self.seen.get(&id) {
+            return Err(self.err(
+                anchor_i,
+                format!(
+                    "重复的 node id `{id}`：第 {} 行已经出现过",
+                    self.line_no(*first)
+                ),
+            ));
+        }
+        self.seen.insert(id.clone(), anchor_i);
+
         let mut node = OutlineNode {
             id,
             title: String::new(),
             needs_split,
             heading_raw: None,
+            heading_level: 0,
             body: String::new(),
             has_body_block: false,
             learn_links: Vec::new(),
@@ -277,6 +368,7 @@ impl<'a> Parser<'a> {
             let cand = self.lines[j];
             if cand.trim_start().starts_with('#') {
                 node.heading_raw = Some(cand.to_string());
+                node.heading_level = heading_level_of(cand);
                 node.title = heading_title(cand);
                 self.i = j + 1;
             }
@@ -377,7 +469,10 @@ impl<'a> Parser<'a> {
         loop {
             self.skip_blank();
             if self.i >= self.lines.len() {
-                return Err(self.err(start_i, "`<!-- children:start -->` 未闭合：找不到 `<!-- children:end -->`"));
+                return Err(self.err(
+                    start_i,
+                    "`<!-- children:start -->` 未闭合：找不到 `<!-- children:end -->`",
+                ));
             }
             let cur = self.lines[self.i];
             if Marker::of(cur) == Some(Marker::ChildrenEnd) {
@@ -452,7 +547,17 @@ fn join_as_body(inner: &[String]) -> String {
 /// 解析大纲文档。
 ///
 /// 出错时给出具体行号：手改大纲写崩了，行号比"格式错误"能救命。
+/// CRLF 输入先规范化为 LF（见模块级"规范化"清单），因此渲染结果里不会再有 `\r`。
 pub fn parse_outline(md: &str) -> Result<OutlineDoc, String> {
+    // 行尾先统一：后面所有偏移、行号、正文拼接都按 LF 算，渲染时自然不再出现
+    // '\r'。不逐行 trim：正文里的 '\r' 属于内容，只有行尾序列才该被规范化。
+    let normalized: Cow<'_, str> = if md.contains('\r') {
+        Cow::Owned(md.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(md)
+    };
+    let md: &str = normalized.as_ref();
+
     let (task_id, title) = parse_frontmatter(md)?;
 
     let anchor_off = first_anchor_offset(md)
@@ -476,6 +581,7 @@ pub fn parse_outline(md: &str) -> Result<OutlineDoc, String> {
         lines: md[anchor_off..].split('\n').collect(),
         i: 0,
         base_line,
+        seen: HashMap::new(),
     };
     let root = parser.parse_node()?;
 
@@ -501,7 +607,10 @@ pub fn parse_outline(md: &str) -> Result<OutlineDoc, String> {
     })
 }
 
-/// 渲染大纲文档。对 [`parse_outline`] 的输出，结果与原文**逐字节相同**。
+/// 渲染大纲文档。
+///
+/// 对**规范输入**（见模块级的规范化清单与 `FIXTURE`）逐字节还原原文；其它输入
+/// 输出的是同一棵树规范化后的形状，内容不丢、排版可能变。
 pub fn render_outline(doc: &OutlineDoc) -> String {
     let mut out = String::new();
     out.push_str(&doc.preamble);
@@ -555,10 +664,14 @@ fn render_node(node: &OutlineNode, out: &mut String) {
 
 /// 把 `tmp:<标题>` 锚点换成真实 task id；返回**仍然没绑上**的标题
 /// （去重、保持出现顺序）。调用方拿到非空结果应当中止导入。
-pub fn rebind_tmp_ids(
-    doc: &mut OutlineDoc,
-    title_to_id: &HashMap<String, String>,
-) -> Vec<String> {
+///
+/// # 调用约束：绑定之后必须再查一次 id 唯一性
+///
+/// 本函数只改 id，不负责唯一性：两个不同的 `tmp:<标题>` 可能被映射到同一个真实
+/// id（导入时同名任务被建了两遍），也可能撞上大纲里本来就没加 `tmp:` 前缀的 id。
+/// 所以**调用方 MUST 在绑定后调用 [`validate_unique_ids`]**，不是 `Ok` 就中止
+/// 导入——否则后续同步会把两个节点当成同一个任务，静默改错地方。
+pub fn rebind_tmp_ids(doc: &mut OutlineDoc, title_to_id: &HashMap<String, String>) -> Vec<String> {
     let mut missing: Vec<String> = Vec::new();
     rebind_node(&mut doc.root, title_to_id, &mut missing);
     missing
@@ -586,15 +699,41 @@ fn rebind_node(
     }
 }
 
-/// 用看板任务校准大纲的**共享结构**（标题、`needs_split`、树位置）。
+/// 看板 → 大纲：把看板侧的 title/needs_split 落到文档；结构冲突（父不一致、
+/// 文档有而看板无的节点）报错。反向（大纲 → 看板）由 ui-server 的 sync 端点负责。
 ///
 /// 手写内容（`body`、`learn_links`）一个字都不碰；大纲里有而看板没有的节点
 /// 直接报错——静默丢弃一个带手写正文的节点是不可接受的损失。
-pub fn sync_with_tasks(doc: &mut OutlineDoc, tasks: &[TaskBrief]) -> Result<(), String> {
+/// 标题行只改文字、保留各自原有的 `#` 层级（层级是排版，看板不管排版）。
+pub fn apply_board_fields(doc: &mut OutlineDoc, tasks: &[TaskBrief]) -> Result<(), String> {
     let index: HashMap<&str, &TaskBrief> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     // 先整体校验再改：中途失败不该留下"改了一半"的文档。
+    // id 唯一性也在这里兜住——身份都不成立时，谈标题是不是最新的没有意义。
+    validate_unique_ids(doc)?;
     check_node(&doc.root, None, &index)?;
     apply_node(&mut doc.root, &index);
+    Ok(())
+}
+
+/// 校验整棵树里 node id 不重复。
+///
+/// 解析时已经查过一遍（那时能给出两处行号）；这个入口给"内存里构造/改过 id
+/// 之后"的调用方用——[`rebind_tmp_ids`] 之后就必查一次。
+pub fn validate_unique_ids(doc: &OutlineDoc) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    check_unique_ids(&doc.root, &mut seen)
+}
+
+fn check_unique_ids<'a>(node: &'a OutlineNode, seen: &mut HashSet<&'a str>) -> Result<(), String> {
+    if !seen.insert(node.id.as_str()) {
+        return Err(format!(
+            "重复的 node id `{}`：同一份大纲里 id 必须唯一（否则同步/重绑定会认错节点）",
+            node.id
+        ));
+    }
+    for child in &node.children {
+        check_unique_ids(child, seen)?;
+    }
     Ok(())
 }
 
@@ -642,9 +781,18 @@ fn apply_node(node: &mut OutlineNode, index: &HashMap<&str, &TaskBrief>) {
         if node.title != task.title {
             // 标题是共享字段：文件里那行标题也得跟着变，否则渲染出来的文档会
             // 和看板互相打架。只保留原有的 `#` 层级（那是排版），文字用看板的。
-            if let Some(raw) = &node.heading_raw {
-                node.heading_raw = Some(rewrite_heading(raw, &task.title));
+            if let Some(raw) = node.heading_raw.as_deref() {
+                let level = if node.heading_level > 0 {
+                    node.heading_level
+                } else {
+                    heading_level_of(raw)
+                };
+                node.heading_level = level;
+                node.heading_raw = Some(make_heading(level, &task.title));
             }
+            // 根节点、以及锚点后没写标题行的节点，`heading_raw` 为 `None`：
+            // 这时 `title` 只是结构元数据，**展示用**的文档标题在前言/frontmatter
+            // 里（人手写的 `# 总纲`），这里只更新元数据，一个字的文档标题都不改。
             node.title = task.title.clone();
         }
         node.needs_split = task.needs_split;
@@ -655,24 +803,12 @@ fn apply_node(node: &mut OutlineNode, index: &HashMap<&str, &TaskBrief>) {
     }
 }
 
-/// 换掉标题文字，保留原来的 `#` 层级。
-fn rewrite_heading(raw: &str, title: &str) -> String {
-    let hashes: String = raw
-        .trim_start()
-        .chars()
-        .take_while(|c| *c == '#')
-        .collect();
-    if hashes.is_empty() {
-        return title.to_string();
-    }
-    format!("{hashes} {title}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 设计文档 §5 的规范样例：往返必须逐字节相同。
+    /// 设计文档 §5 的规范样例：`render(parse(x)) == x` 必须逐字节成立。
+    /// 非规范输入走的是"规范化"契约（见模块文档），不要求逐字节。
     const FIXTURE: &str = r#"---
 schema: 1
 task_id: LAT-100
@@ -699,7 +835,7 @@ title: 总纲
 "#;
 
     #[test]
-    fn parse_render_is_idempotent_and_preserves_body() {
+    fn canonical_fixture_round_trips_byte_exactly() {
         let doc = parse_outline(FIXTURE).expect("规范样例必须能解析");
 
         assert_eq!(doc.task_id, "LAT-100");
@@ -709,9 +845,13 @@ title: 总纲
         assert_eq!(doc.root.id, "LAT-100");
         assert_eq!(doc.root.title, "");
         assert_eq!(doc.root.heading_raw, None, "根节点不该有标题行");
+        assert_eq!(doc.root.heading_level, 0);
         assert!(doc.root.has_body_block);
         assert_eq!(doc.root.body, "## 概述\n正文一段。\n");
-        assert!(!doc.root.has_learn_links_block, "根节点没有 learn-links 区块");
+        assert!(
+            !doc.root.has_learn_links_block,
+            "根节点没有 learn-links 区块"
+        );
         assert_eq!(doc.root.children.len(), 1);
 
         let child = &doc.root.children[0];
@@ -719,13 +859,17 @@ title: 总纲
         assert_eq!(child.title, "模块一");
         assert!(child.needs_split);
         assert_eq!(child.heading_raw.as_deref(), Some("### 模块一"));
+        assert_eq!(child.heading_level, 3);
         assert_eq!(child.body, "子正文。\n");
         assert!(child.has_learn_links_block);
         assert!(child.learn_links.is_empty());
         assert!(child.children.is_empty());
 
         let rendered = render_outline(&doc);
-        assert_eq!(rendered, FIXTURE, "\n渲染结果必须与原文逐字节相同\n{rendered:#?}");
+        assert_eq!(
+            rendered, FIXTURE,
+            "\n渲染结果必须与原文逐字节相同\n{rendered:#?}"
+        );
     }
 
     #[test]
@@ -906,7 +1050,7 @@ title: T
     }
 
     #[test]
-    fn sync_with_tasks_updates_title_keeps_body() {
+    fn apply_board_fields_updates_title_keeps_body() {
         let md = "\
 ---
 schema: 1
@@ -942,7 +1086,7 @@ title: T
             },
         ];
 
-        sync_with_tasks(&mut doc, &tasks).expect("同步失败");
+        apply_board_fields(&mut doc, &tasks).expect("同步失败");
 
         assert_eq!(doc.root.title, "新标题");
         assert!(doc.root.needs_split);
@@ -952,13 +1096,16 @@ title: T
             "文件里的标题行也要跟着看板走（保留原有 # 层级）"
         );
         assert_eq!(doc.root.body, "手写正文，机器别动。\n", "body 不许被改");
-        assert_eq!(doc.root.learn_links, vec!["- [设计](design.md)".to_string()]);
+        assert_eq!(
+            doc.root.learn_links,
+            vec!["- [设计](design.md)".to_string()]
+        );
         assert_eq!(doc.root.children[0].title, "子节点");
         assert!(!doc.root.children[0].needs_split);
     }
 
     #[test]
-    fn sync_with_tasks_errors_on_unknown_node() {
+    fn apply_board_fields_errors_on_unknown_node() {
         let md = "\
 ---
 schema: 1
@@ -980,7 +1127,259 @@ title: T
             needs_split: false,
         }];
 
-        let err = sync_with_tasks(&mut doc, &tasks).expect_err("缺失节点必须报错");
+        let err = apply_board_fields(&mut doc, &tasks).expect_err("缺失节点必须报错");
         assert!(err.contains("LAT-404"), "错误信息要点名 id：{err}");
+    }
+
+    #[test]
+    fn crlf_input_is_normalized_to_lf() {
+        let crlf = FIXTURE.replace('\n', "\r\n");
+        let doc = parse_outline(&crlf).expect("CRLF 输入必须能解析");
+        let rendered = render_outline(&doc);
+        assert!(
+            !rendered.contains('\r'),
+            "渲染结果里不许残留 CR：{rendered:?}"
+        );
+        assert_eq!(rendered, FIXTURE, "规范化后应当与 LF 版本完全一致");
+        assert_eq!(
+            doc.root,
+            parse_outline(FIXTURE).expect("解析失败").root,
+            "两种行尾解析出的树必须相同"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_node_ids() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:LAT-1 -->
+<!-- children:start -->
+<!-- node:LAT-1 -->
+<!-- children:end -->
+";
+        let err = parse_outline(md).expect_err("重复 id 必须报错");
+        assert!(err.contains("LAT-1"), "错误信息要点名 id：{err}");
+        assert!(
+            err.contains("第 8 行") && err.contains("第 6 行"),
+            "错误信息要带两处行号（重复处与首次出现处）：{err}"
+        );
+    }
+
+    #[test]
+    fn rebind_then_validate_catches_collision() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:tmp:A -->
+<!-- children:start -->
+<!-- node:tmp:B -->
+<!-- children:end -->
+";
+        let mut doc = parse_outline(md).expect("解析失败");
+        // 两个不同的临时标题被映射到同一个真实 id：导入建重复任务时就是这样。
+        let mut map = HashMap::new();
+        map.insert("A".to_string(), "LAT-9".to_string());
+        map.insert("B".to_string(), "LAT-9".to_string());
+
+        let missing = rebind_tmp_ids(&mut doc, &map);
+        assert!(missing.is_empty(), "两个都绑上了：{missing:?}");
+
+        let err = validate_unique_ids(&doc).expect_err("重绑定后的撞 id 必须被拦住");
+        assert!(err.contains("LAT-9"), "错误信息要点名冲突的 id：{err}");
+    }
+
+    #[test]
+    fn new_child_renders_valid_node() {
+        let node = OutlineNode::new_child("LAT-9".to_string(), "新模块".to_string(), true, 3);
+        let doc = OutlineDoc {
+            task_id: "LAT-1".to_string(),
+            title: "T".to_string(),
+            preamble: "---\nschema: 1\ntask_id: LAT-1\ntitle: T\n---\n".to_string(),
+            root: node.clone(),
+        };
+
+        let rendered = render_outline(&doc);
+        assert!(
+            rendered.contains("### 新模块"),
+            "层级要写进标题行：{rendered}"
+        );
+        assert!(rendered.contains("needs_split"), "标记要带上：{rendered}");
+
+        let reparsed = parse_outline(&rendered).expect("构造出来的节点必须能被解析回来");
+        assert_eq!(reparsed.root, node, "渲染再解析必须得到同一个节点");
+        assert_eq!(reparsed.root.heading_level, 3);
+        assert!(validate_unique_ids(&reparsed).is_ok());
+    }
+
+    #[test]
+    fn title_starting_with_hash_survives_round_trip() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:LAT-1 -->
+### ## 二级井号标题
+<!-- children:start -->
+<!-- node:LAT-2 -->
+#### #tag 开头的标题
+<!-- children:end -->
+";
+        let doc = parse_outline(md).expect("解析失败");
+        assert_eq!(doc.root.title, "## 二级井号标题", "只吃掉一个空格后的井号");
+        assert_eq!(doc.root.heading_level, 3);
+        let child = &doc.root.children[0];
+        assert_eq!(child.title, "#tag 开头的标题");
+        assert_eq!(child.heading_level, 4);
+        assert_eq!(render_outline(&doc), md);
+    }
+
+    #[test]
+    fn deep_nesting_round_trips() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: 深层
+---
+<!-- node:LAT-1 -->
+<!-- section:body:start -->
+根正文
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-2 -->
+## 第一章
+<!-- section:body:start -->
+一章正文
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-3 -->
+### 第一节
+<!-- section:body:start -->
+一节正文
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-4 -->
+#### 子目
+<!-- section:body:start -->
+子目正文
+<!-- section:body:end -->
+<!-- children:end -->
+<!-- children:end -->
+<!-- children:end -->
+";
+        let doc = parse_outline(md).expect("解析失败");
+
+        assert_eq!(doc.root.heading_raw, None);
+        assert_eq!(doc.root.heading_level, 0, "没有标题行就没有层级");
+        assert_eq!(doc.root.body, "根正文\n");
+
+        let l1 = &doc.root.children[0];
+        assert_eq!((l1.title.as_str(), l1.heading_level), ("第一章", 2));
+        assert_eq!(l1.body, "一章正文\n");
+
+        let l2 = &l1.children[0];
+        assert_eq!((l2.title.as_str(), l2.heading_level), ("第一节", 3));
+        assert_eq!(l2.body, "一节正文\n");
+
+        let l3 = &l2.children[0];
+        assert_eq!((l3.title.as_str(), l3.heading_level), ("子目", 4));
+        assert_eq!(l3.body, "子目正文\n");
+        assert!(l3.children.is_empty());
+
+        assert_eq!(render_outline(&doc), md);
+    }
+
+    #[test]
+    fn apply_board_fields_preserves_levels() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: 总纲
+---
+# 总纲
+
+<!-- node:LAT-1 -->
+<!-- section:body:start -->
+根正文
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-2 -->
+### 旧一
+<!-- section:body:start -->
+一章正文
+<!-- section:body:end -->
+<!-- children:start -->
+<!-- node:LAT-3 -->
+##### 旧二
+<!-- section:body:start -->
+二节正文
+<!-- section:body:end -->
+<!-- children:end -->
+<!-- children:end -->
+";
+        let mut doc = parse_outline(md).expect("解析失败");
+
+        let good = vec![
+            TaskBrief {
+                id: "LAT-1".to_string(),
+                title: "新总纲".to_string(),
+                parent_id: None,
+                needs_split: false,
+            },
+            TaskBrief {
+                id: "LAT-2".to_string(),
+                title: "新一".to_string(),
+                parent_id: Some("LAT-1".to_string()),
+                needs_split: false,
+            },
+            TaskBrief {
+                id: "LAT-3".to_string(),
+                title: "新二".to_string(),
+                parent_id: Some("LAT-2".to_string()),
+                needs_split: false,
+            },
+        ];
+
+        // 父不一致：整体中止，一个字段都不许改。
+        let mut bad = good.clone();
+        bad[2].parent_id = Some("LAT-99".to_string());
+        let snapshot = doc.clone();
+        let err = apply_board_fields(&mut doc, &bad).expect_err("父不一致必须报错");
+        assert!(err.contains("LAT-3") && err.contains("LAT-99"), "{err}");
+        assert_eq!(doc, snapshot, "冲突时不能留下改了一半的文档");
+
+        apply_board_fields(&mut doc, &good).expect("同步失败");
+
+        // 文档标题（前言里人手写的 `# 总纲`）不归同步管。
+        assert_eq!(doc.title, "总纲");
+        assert!(doc.preamble.contains("# 总纲"));
+
+        assert_eq!(doc.root.heading_raw, None, "根节点不该被塞上标题行");
+        assert_eq!(doc.root.title, "新总纲");
+
+        let l1 = &doc.root.children[0];
+        assert_eq!(l1.heading_raw.as_deref(), Some("### 新一"));
+        assert_eq!(l1.heading_level, 3);
+        let l2 = &l1.children[0];
+        assert_eq!(l2.heading_raw.as_deref(), Some("##### 新二"));
+        assert_eq!(l2.heading_level, 5);
+
+        // 正文一个字都不许动。
+        assert_eq!(doc.root.body, "根正文\n");
+        assert_eq!(l1.body, "一章正文\n");
+        assert_eq!(l2.body, "二节正文\n");
+
+        let rendered = render_outline(&doc);
+        assert!(rendered.contains("##### 新二"), "{rendered}");
     }
 }
