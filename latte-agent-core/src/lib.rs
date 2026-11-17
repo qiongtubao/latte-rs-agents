@@ -74,6 +74,8 @@ pub mod learn_novice;
 pub mod md_lint;
 pub mod mermaid_lint;
 pub mod model_resolver;
+/// 大纲文档：任务树的第二权威（结构与叙述），靠 node id 与看板对齐。
+pub mod outline;
 pub mod pause_gate;
 /// 阻塞 ask 挂起项的跨进程落盘（服务器重启后用户回答仍能驱动续跑）。
 pub mod pending_ask;
