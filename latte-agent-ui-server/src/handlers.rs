@@ -1307,8 +1307,9 @@ pub(crate) async fn dispatch_task(
 /// `POST /api/tasks/:id/refine` —— 拆分子任务：新建 session 跑
 /// task_refine workflow，plan 提案导入后成为该任务的子任务。
 ///
-/// 叶子任务（`needs_split=false`）不可再拆：`tasks::check_refine_allowed` 给出
-/// 409，这里把它映射成 `CONFLICT`——请求本身合法，是任务状态不允许。
+/// 叶子任务（`needs_split=false`）被 `tasks::check_refine_allowed` 以
+/// `ApiError { status: 409 }` 拒绝；状态码由 `ApiError` 的 `From` 实现保真
+/// 映射成 `CONFLICT`（同本文件其它端点，不在这里二次判断）。
 pub(crate) async fn refine_task(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<AppState>,
@@ -1316,10 +1317,7 @@ pub(crate) async fn refine_task(
     crate::tasks::refine_task(&state.backend, &id)
         .await
         .map(Json)
-        .map_err(|e| match e.status {
-            s if s == StatusCode::CONFLICT.as_u16() => (StatusCode::CONFLICT, e.message),
-            _ => e.into(),
-        })
+        .map_err(Into::into)
 }
 
 /// `POST /api/tasks/:id/abort` —— 中止执行（走现有 chat/abort 机制）。

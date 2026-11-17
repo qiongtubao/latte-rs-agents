@@ -5698,6 +5698,101 @@ mod tests {
         );
     }
 
+    /// 同一个导入**既发布草案、又往父任务大纲插锚点**（两条写入路径撞在同一份
+    /// 文档上）。这是最容易出错的一档：发布时把 `tmp:` 绑成真实 id，插入时又
+    /// 看见同一个 id，必须走幂等更新——多插一份就是同一任务在大纲里出现两次;
+    /// 回滚时也必须先撤插入、再撤发布，否则会留下一份"该被删掉的"文档。
+    #[test]
+    fn import_draft_and_parent_id_share_one_outline() {
+        fn draft_body(parent_id: &str) -> String {
+            format!(
+                "---\nschema: 1\ntask_id: {parent_id}\ntitle: shared demo\n---\n\
+                 <!-- node:{parent_id} needs_split -->\n\
+                 ### 大任务\n\
+                 <!-- section:body:start -->\n## 概述\n父任务正文\n<!-- section:body:end -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:tmp:甲 -->\n### 甲\n\
+                 <!-- children:end -->\n"
+            )
+        }
+
+        // ── 正常路径：草案发布 = 父任务大纲，子锚点落在同一份文档里 ──
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let parent = make_task(&mut store, "大任务");
+        write_draft(cwd, "pc2", &draft_body(&parent.id));
+        let req = import_req(serde_json::json!({
+            "plan_id": "pc2",
+            "parent_id": parent.id,
+            "tasks": [{ "title": "甲", "description": "甲要做的事" }]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("草案与父任务大纲都要落地");
+        assert_eq!(created.len(), 1);
+        let child_id = created[0].clone();
+
+        let rel = "docs/outlines/shared-demo.md";
+        let text = std::fs::read_to_string(cwd.join(rel)).expect("草案必须发布成大纲");
+        assert!(!text.contains("tmp:"), "终稿不许留临时锚：\n{text}");
+        assert_eq!(
+            text.matches(&format!("node:{child_id}")).count(),
+            1,
+            "子任务必须恰好出现一次（发布绑 id 之后插入走幂等更新，不能再插一份）：\n{text}"
+        );
+        assert_eq!(text.matches("### 甲").count(), 1, "标题也不许有两份：\n{text}");
+        assert!(
+            text.contains("甲要做的事"),
+            "插入路径确实跑过：空正文由任务描述补全：\n{text}"
+        );
+        assert_eq!(
+            store
+                .get(&parent.id)
+                .expect("父任务在")
+                .outline_path
+                .as_deref(),
+            Some(rel),
+            "父任务必须指向这份大纲"
+        );
+        let doc = parse_outline(&text).expect("终稿可解析");
+        assert_eq!(doc.root.body, "## 概述\n父任务正文\n", "父节点正文不许被改");
+        assert_eq!(doc.root.children.len(), 1, "父节点下只有一个子节点");
+
+        // ── 回滚路径：同一请求 + marker 阻断 → 文档与 outline_path 一起撤销 ──
+        let (dir2, mut store2) = tmp_store();
+        let cwd2 = dir2.path();
+        let parent2 = make_task(&mut store2, "大任务");
+        write_draft(cwd2, "pc3", &draft_body(&parent2.id));
+        std::fs::create_dir_all(store2.imported_plans_dir().join("pc3")).expect("blocker dir");
+        let req2 = import_req(serde_json::json!({
+            "plan_id": "pc3",
+            "parent_id": parent2.id,
+            "tasks": [{ "title": "甲", "description": "甲要做的事" }]
+        }));
+        let err = import_tasks_as_todo_into(&mut store2, cwd2, &req2, Some("pc3"))
+            .expect_err("marker 写不进去 → 整单失败");
+        assert!(err.contains("marker"), "报错要点明 marker 落盘失败：{err}");
+
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(cwd2.join("docs/outlines"))
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "发布与插入都在同一份文档上，回滚必须把它清空：{leftovers:?}"
+        );
+        let parent2_id = parent2.id.clone();
+        drop(store2);
+        let reloaded = TaskStore::load(cwd2).expect("reload");
+        assert_eq!(
+            reloaded
+                .get(&parent2_id)
+                .expect("父任务仍在")
+                .outline_path
+                .as_deref(),
+            None,
+            "回滚后父任务不许留下指向已删文档的 outline_path"
+        );
+    }
+
     /// 父任务（祖先链上也没有）没有大纲 = 这次拆分本来就不维护大纲：照常建
     /// 子任务，一条文件都不写、也不报错。
     #[test]
