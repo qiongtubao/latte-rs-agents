@@ -799,6 +799,62 @@ pub fn insert_child(
     Ok(())
 }
 
+/// 学习文档链接行的目标路径（`](…)` 里那一截，去掉可选的 `"标题"` 与 `#锚点`），
+/// 用于"同一篇文档只留一行"的去重判断。
+fn learn_link_target(line: &str) -> Option<&str> {
+    let rest = &line[line.find("](")? + 2..];
+    let target = rest[..rest.find(')')?].trim();
+    let target = target.split_whitespace().next().unwrap_or("");
+    Some(target.split('#').next().unwrap_or(""))
+}
+
+/// 链接行只能占一行：标题/路径里混进换行会把 `learn-links` 区块拆成两半
+/// （下次解析直接把后半截当成结构）。
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// 把学习文档链接写进大纲对应节点的 learn-links 区块（幂等：同 doc 路径去重替换）。
+/// 节点不存在 → Err 点名 id（学习文档挂不上去必须声响，不能静默丢链接）。
+///
+/// `doc_path` 由调用方先换算成**相对大纲文件所在目录**的路径——本函数只负责
+/// 写文件字节，不做路径推导。节点原本没有 `learn-links` 区块时就地建一个：
+/// 链接必须落在一个区块里，否则下次解析会把它当正文。
+pub fn link_outline(
+    doc: &mut OutlineDoc,
+    node_id: &str,
+    title: &str,
+    doc_path: &str,
+    task_id: &str,
+) -> Result<(), String> {
+    let Some(node) = find_node_mut(&mut doc.root, node_id) else {
+        return Err(format!(
+            "大纲里找不到节点 `{node_id}`：学习文档链接没有写进大纲"
+        ));
+    };
+    let line = format!(
+        "- [{}]({})（task {}）",
+        one_line(title),
+        one_line(doc_path),
+        one_line(task_id)
+    );
+    let key = learn_link_target(&line).unwrap_or("").to_string();
+    match node
+        .learn_links
+        .iter()
+        .position(|existing| learn_link_target(existing) == Some(key.as_str()))
+    {
+        Some(pos) => node.learn_links[pos] = line,
+        None => node.learn_links.push(line),
+    }
+    node.has_learn_links_block = true;
+    Ok(())
+}
+
 /// 在子树里按 id 找节点（可变）。递归到底，找不到返回 `None`。
 fn find_node_mut<'a>(node: &'a mut OutlineNode, id: &str) -> Option<&'a mut OutlineNode> {
     if node.id == id {
@@ -1021,6 +1077,68 @@ title: 总纲
             rendered, FIXTURE,
             "\n渲染结果必须与原文逐字节相同\n{rendered:#?}"
         );
+    }
+
+    /// 挂链接用的大纲：节点原本没有 `learn-links` 区块（引擎要就地建一个）。
+    const LINK_FIXTURE: &str = "\
+---
+schema: 1
+task_id: LAT-100
+title: 总纲
+---
+<!-- node:LAT-100 -->
+<!-- children:start -->
+<!-- node:LAT-110 -->
+### slab
+<!-- children:end -->
+";
+
+    #[test]
+    fn link_outline_appends_and_replaces() {
+        let mut doc = parse_outline(LINK_FIXTURE).expect("解析失败");
+        let first = "- [slab 分配](../learn/slab.md)（task LAT-110）";
+        link_outline(&mut doc, "LAT-110", "slab 分配", "../learn/slab.md", "LAT-110")
+            .expect("节点存在");
+        let node = &doc.root.children[0];
+        assert!(node.has_learn_links_block, "没有区块时要就地建一个");
+        assert_eq!(node.learn_links, vec![first.to_string()]);
+
+        // 同一篇文档再挂一次（标题更新）：还是只有一行，内容被替换。
+        let renamed = "- [slab 分配（第 2 版）](../learn/slab.md)（task LAT-110）";
+        link_outline(
+            &mut doc,
+            "LAT-110",
+            "slab 分配（第 2 版）",
+            "../learn/slab.md",
+            "LAT-110",
+        )
+        .expect("节点存在");
+        assert_eq!(doc.root.children[0].learn_links, vec![renamed.to_string()]);
+
+        // 另一篇文档 → 追加第二行。
+        let second = "- [页表](../learn/page.md)（task LAT-111）";
+        link_outline(&mut doc, "LAT-110", "页表", "../learn/page.md", "LAT-111")
+            .expect("节点存在");
+        assert_eq!(doc.root.children[0].learn_links.len(), 2);
+
+        let rendered = render_outline(&doc);
+        assert!(
+            rendered.contains(&format!(
+                "<!-- learn-links:start -->\n{renamed}\n{second}\n<!-- learn-links:end -->"
+            )),
+            "{rendered}"
+        );
+        assert_eq!(parse_outline(&rendered).expect("往返解析"), doc);
+    }
+
+    #[test]
+    fn link_outline_errors_on_missing_node() {
+        let mut doc = parse_outline(LINK_FIXTURE).expect("解析失败");
+        let before = render_outline(&doc);
+        let err = link_outline(&mut doc, "LAT-999", "t", "../learn/x.md", "LAT-999")
+            .expect_err("节点不存在必须报错");
+        assert!(err.contains("LAT-999"), "错误要点名 id：{err}");
+        assert_eq!(render_outline(&doc), before, "失败时不能改文档");
     }
 
     #[test]

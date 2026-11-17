@@ -9785,6 +9785,18 @@ fn finalize_learn_doc(cwd: &Path, base: &Path, slug: &str) -> Result<String, Str
     let plan = read_learn_json(&base.join("plan.json")).unwrap_or_default();
     let topic = plan["topic"].as_str().unwrap_or(slug).trim();
     let name = crate::learn_doc::publish_name(slug);
+    // 归属只能在这里抓：`lat-<编号>-` 前缀发布时会被剥掉，剥完就再也认不出
+    // 这篇文档属于哪个看板任务。
+    let task_id = learn_slug_task_id(slug);
+    let (parent_doc, order) = match task_id.as_deref() {
+        Some(id) => crate::learn_doc::read_parent_doc_and_order(cwd, id),
+        None => (None, 0),
+    };
+    // 大纲可能是挂在祖先任务上的（只有被拆的大任务记得 outline_path），
+    // 所以沿父链找最近的那一份。
+    let outline_rel = task_id
+        .as_deref()
+        .and_then(|id| crate::learn_doc::read_outline_path(cwd, id));
 
     // draft 的链接已在装配时改成相对工作区根（`sections/k1.md`、`img/…`）；
     // 手写/旧版 draft 里的 `(k1.md)` 按 sections/ 兜底解析。
@@ -9817,7 +9829,18 @@ fn finalize_learn_doc(cwd: &Path, base: &Path, slug: &str) -> Result<String, Str
     let rel = format!("docs/learn/{name}.md");
     let path = cwd.join(&rel);
     std::fs::create_dir_all(&docs_dir).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &out).map_err(|e| format!("写 {rel} 失败：{e}"))?;
+    // frontmatter 必须在落盘前拼上：读者拿到的就是 `docs/learn/<name>.md` 这一份，
+    // 归属信息只写在内存里等于没写。
+    let published = format!(
+        "{}{out}",
+        crate::learn_doc::learn_frontmatter(
+            task_id.as_deref(),
+            parent_doc.as_deref(),
+            outline_rel.as_deref(),
+            order,
+        )
+    );
+    std::fs::write(&path, &published).map_err(|e| format!("写 {rel} 失败：{e}"))?;
     validate_learn_final(cwd, base, slug)?;
     // 发布后的死链/破图：多半是引擎侧的问题（旧 plan 留下的章节、被清掉的图），
     // 重写定稿修不好，所以不打回，只在结果里点名，让人看得见。
@@ -9838,12 +9861,94 @@ fn finalize_learn_doc(cwd: &Path, base: &Path, slug: &str) -> Result<String, Str
     } else {
         String::new()
     };
+    // 挂大纲、记 doc_path 都是"锦上添花"：定稿已经落盘并通过校验，这里失败只
+    // 记一句警告。但警告必须点名"链接没写进去"——静默丢链接比报错更难查。
+    let outline_note = match (task_id.as_deref(), outline_rel.as_deref()) {
+        (Some(id), Some(outline)) => link_learn_doc_into_outline(cwd, outline, id, topic, &rel),
+        _ => String::new(),
+    };
+    let board_note = match task_id.as_deref() {
+        Some(id) => match crate::learn_doc::write_task_doc_path(cwd, id, &rel) {
+            Ok(()) => String::new(),
+            Err(e) => format!(
+                "\n⚠️ 学习文档路径没写回看板任务 {id}（`doc_path`）：{e}；定稿本身已发布。"
+            ),
+        },
+        None => String::new(),
+    };
     Ok(format!(
-        "定稿已写入 `{rel}`：{chapters} 个一级小节，{} 张图，{} 字。{assets}学习过程存档留在会话目录 `{}`。{dead_note}",
+        "定稿已写入 `{rel}`：{chapters} 个一级小节，{} 张图，{} 字。{assets}学习过程存档留在会话目录 `{}`。{dead_note}{outline_note}{board_note}",
         mermaid_blocks(&out) + image_links(&out),
         out.chars().count(),
         base.strip_prefix(cwd).unwrap_or(base).display()
     ))
+}
+
+/// slug 里的看板任务编号：`lat-110-jemalloc-size-class` → `LAT-110`。
+/// 没有该前缀 → `None`（手写 slug 的学习文档不冒充任何任务）。
+fn learn_slug_task_id(slug: &str) -> Option<String> {
+    let slug = slug.trim();
+    let b = slug.as_bytes();
+    let letters = b.iter().take_while(|c| c.is_ascii_alphabetic()).count();
+    if !(1..=10).contains(&letters) || b.get(letters) != Some(&b'-') {
+        return None;
+    }
+    let digits = b[letters + 1..]
+        .iter()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    let end = letters + 1 + digits;
+    if digits == 0 || b.get(end) != Some(&b'-') || end + 1 >= slug.len() {
+        return None;
+    }
+    Some(slug[..end].to_ascii_uppercase())
+}
+
+/// 把刚发布的定稿挂到大纲节点上。返回一句警告（空串 = 一切正常）；
+/// 绝不返回 `Err`——挂不上链接不该让一份已经写好的学习文档消失。
+///
+/// `doc_rel` 是项目相对的定稿路径，这里换算成相对大纲文件所在目录再交给
+/// [`crate::outline::link_outline`]。
+fn link_learn_doc_into_outline(
+    cwd: &Path,
+    outline_rel: &str,
+    task_id: &str,
+    title: &str,
+    doc_rel: &str,
+) -> String {
+    let path = cwd.join(outline_rel);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) => {
+            return format!(
+                "\n⚠️ 学习文档链接没有写进大纲：读不到 `{outline_rel}`（{e}）；定稿本身已发布。"
+            );
+        }
+    };
+    let mut doc = match crate::outline::parse_outline(&raw) {
+        Ok(doc) => doc,
+        Err(e) => {
+            return format!(
+                "\n⚠️ 学习文档链接没有写进大纲：`{outline_rel}` 解析失败（{e}）；定稿本身已发布。"
+            );
+        }
+    };
+    let outline_dir = outline_rel.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let link = crate::learn_doc::relative_to(doc_rel, outline_dir);
+    if let Err(e) = crate::outline::link_outline(&mut doc, task_id, title, &link, task_id) {
+        return format!("\n⚠️ 学习文档链接没有写进大纲：{e}；定稿本身已发布。");
+    }
+    let rendered = crate::outline::render_outline(&doc);
+    if rendered == raw {
+        return String::new();
+    }
+    let tmp = path.with_extension("md.tmp");
+    match std::fs::write(&tmp, &rendered).and_then(|()| std::fs::rename(&tmp, &path)) {
+        Ok(()) => String::new(),
+        Err(e) => format!(
+            "\n⚠️ 学习文档链接没有写进大纲：写 `{outline_rel}` 失败（{e}）；定稿本身已发布。"
+        ),
+    }
 }
 
 /// 正文里本地 SVG/PNG 图片引用数（memlayout 渲染出的图算在内）。
@@ -31637,6 +31742,139 @@ max_retries = 2
         .is_err());
     }
 
+    /// 最小学习工作区 + 看板：父任务 LAT-100 挂大纲 `docs/outlines/mem.md` 且
+    /// 已经发布过学习文档；子任务 LAT-110 的学习 slug 是 `lat-110-slab`。
+    fn write_learn_ownership_ws(cwd: &std::path::Path) -> std::path::PathBuf {
+        let base = cwd.join(".latte/learn/lat-110-slab");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(
+            base.join("draft.md"),
+            "# slab 分配\n\n## 怎么切页\n\n一页 4 KiB 切成 512 个 8 B。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("plan.json"),
+            serde_json::json!({"topic": "slab 分配"}).to_string(),
+        )
+        .unwrap();
+
+        let tasks = cwd.join(".latte/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        // 父任务：发布过学习文档（doc_path 有值），大纲也挂在它身上——子任务
+        // 自己没有 outline_path，只能沿祖先链解析。
+        std::fs::write(
+            tasks.join("LAT-100.json"),
+            serde_json::json!({
+                "id": "LAT-100",
+                "title": "内存分配",
+                "state": "todo",
+                "parent_id": null,
+                "sub_order": 0,
+                "outline_path": "docs/outlines/mem.md",
+                "doc_path": "docs/learn/parent.md",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".latte/tasks/LAT-110.json"),
+            serde_json::json!({
+                "id": "LAT-110",
+                "title": "slab",
+                "state": "todo",
+                "parent_id": "LAT-100",
+                "sub_order": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        base
+    }
+
+    /// 大纲文档：`nodes` 是根 LAT-100 下的 `(id, 标题)`。
+    fn write_outline_with_nodes(cwd: &std::path::Path, nodes: &[(&str, &str)]) {
+        let outlines = cwd.join("docs/outlines");
+        std::fs::create_dir_all(&outlines).unwrap();
+        let mut md =
+            String::from("---\nschema: 1\ntask_id: LAT-100\ntitle: 总纲\n---\n<!-- node:LAT-100 -->\n");
+        if !nodes.is_empty() {
+            md.push_str("<!-- children:start -->\n");
+            for (id, title) in nodes {
+                md.push_str(&format!("<!-- node:{id} -->\n### {title}\n"));
+            }
+            md.push_str("<!-- children:end -->\n");
+        }
+        std::fs::write(cwd.join("docs/outlines/mem.md"), md).unwrap();
+    }
+
+    /// 发布后的归属：定稿带 frontmatter、大纲节点挂上（去重的）链接、
+    /// 任务 JSON 记下 doc_path。大纲挂在祖先任务上，子任务靠祖先链找到它。
+    #[test]
+    fn finalize_learn_doc_writes_frontmatter_and_links_outline() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let base = write_learn_ownership_ws(cwd);
+        write_outline_with_nodes(cwd, &[("LAT-110", "slab")]);
+
+        let note = finalize_learn_doc(cwd, &base, "lat-110-slab").expect("定稿应成功");
+        assert!(!note.contains("没有写进大纲"), "{note}");
+
+        let final_text = std::fs::read_to_string(cwd.join("docs/learn/slab.md")).unwrap();
+        assert!(
+            final_text.starts_with(
+                "---\ntask_id: LAT-110\noutline_node_id: LAT-110\n\
+                 parent_doc: docs/learn/parent.md\norder: 2\n\
+                 outline: docs/outlines/mem.md\n---\n\n# slab 分配\n"
+            ),
+            "{final_text}"
+        );
+
+        let link = "- [slab 分配](../learn/slab.md)（task LAT-110）";
+        let outline = std::fs::read_to_string(cwd.join("docs/outlines/mem.md")).unwrap();
+        assert_eq!(outline.matches(link).count(), 1, "{outline}");
+
+        let task: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cwd.join(".latte/tasks/LAT-110.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["doc_path"], "docs/learn/slab.md");
+        assert_eq!(task["sub_order"], 2, "其余字段要原样保留：{task}");
+
+        // 重跑（返工后重新定稿）：同一篇文档只留一行链接。
+        finalize_learn_doc(cwd, &base, "lat-110-slab").expect("重跑应成功");
+        let outline = std::fs::read_to_string(cwd.join("docs/outlines/mem.md")).unwrap();
+        assert_eq!(outline.matches(link).count(), 1, "{outline}");
+    }
+
+    /// 大纲里没有这个节点：链接挂不上必须点名，但定稿绝不能跟着失败
+    /// （学习文档是交付物，缺一个大纲节点不该把它一起埋掉）。
+    #[test]
+    fn finalize_learn_doc_warns_but_keeps_doc_when_outline_has_no_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let base = write_learn_ownership_ws(cwd);
+        write_outline_with_nodes(cwd, &[("LAT-999", "别的任务")]);
+
+        let note = finalize_learn_doc(cwd, &base, "lat-110-slab").expect("定稿应成功");
+        assert!(
+            note.contains("没有写进大纲") && note.contains("LAT-110"),
+            "链接没写进去必须在状态里点名：{note}"
+        );
+
+        let final_text = std::fs::read_to_string(cwd.join("docs/learn/slab.md")).unwrap();
+        assert!(final_text.starts_with("---\ntask_id: LAT-110\n"), "{final_text}");
+        assert!(final_text.contains("# slab 分配"), "定稿内容要完整：{final_text}");
+        // 大纲一个字都没动。
+        let outline = std::fs::read_to_string(cwd.join("docs/outlines/mem.md")).unwrap();
+        assert!(!outline.contains("learn/slab.md"), "{outline}");
+        // doc_path 照写：后面拆出来的子任务要靠它指 parent_doc。
+        let task: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cwd.join(".latte/tasks/LAT-110.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(task["doc_path"], "docs/learn/slab.md");
+    }
+
     /// merge 由引擎确定性完成：不调模型，定稿 = 标题 + 目录 + draft 原文 + 副本索引。
     /// （实测 4 章 9 节的 draft 已 191KB，让模型整篇重写必然撞输出上限。）
     #[tokio::test]
@@ -31725,8 +31963,11 @@ max_retries = 2
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1, "只有 doc 调模型，merge 由引擎完成");
         let final_text = std::fs::read_to_string(dir.path().join("docs/learn/own.md")).unwrap();
+        // 定稿以归属 frontmatter 开头：slug `own` 没有任务编号前缀，字段全为 null。
         assert!(
-            final_text.starts_with("# 所有权\n\n## 目录\n"),
+            final_text.starts_with(
+                "---\ntask_id: null\noutline_node_id: null\nparent_doc: null\norder: 0\noutline: null\n---\n\n# 所有权\n\n## 目录\n"
+            ),
             "{final_text}"
         );
         assert!(final_text.contains("src/borrow.rs:5-9") && final_text.contains("```mermaid"));

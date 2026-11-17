@@ -1338,6 +1338,106 @@ pub fn prune_memlayout_images(base: &Path, referenced_by: &[&str]) -> usize {
     n
 }
 
+// ─── 5. 定稿归属（frontmatter + 看板元数据）─────────────────────────
+
+/// 学习文档的归属 frontmatter。归属靠字段，不靠 slug 前缀（slug 发布时会被剥）。
+///
+/// `task_id` 与 `outline_node_id` 是同一个值：大纲节点与看板任务按 id 一一对应。
+/// 缺值写裸 `null`（不写引号也不写空串）：`docs/learn/<name>.md` 脱离看板后，
+/// 读者/工具要能一眼分出差集"没有归属"与"归属是空字符串"。
+pub fn learn_frontmatter(
+    task_id: Option<&str>,
+    parent_doc: Option<&str>,
+    outline: Option<&str>,
+    order: i64,
+) -> String {
+    fn value(v: Option<&str>) -> &str {
+        v.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("null")
+    }
+    let task_id = value(task_id);
+    format!(
+        "---\ntask_id: {task_id}\noutline_node_id: {task_id}\nparent_doc: {}\norder: {order}\noutline: {}\n---\n\n",
+        value(parent_doc),
+        value(outline)
+    )
+}
+
+/// 看板任务文件：`<cwd>/.latte/tasks/<id>.json`。id 形状不对（含分隔符、
+/// `..`）一律当作不存在——这张表被 slug/父链驱动，别让它拼出目录外的路径。
+fn task_json_path(cwd: &Path, id: &str) -> Option<PathBuf> {
+    let id = id.trim();
+    (!id.is_empty() && !id.contains('/') && !id.contains('\\') && !id.contains(".."))
+        .then(|| cwd.join(".latte").join("tasks").join(format!("{id}.json")))
+}
+
+/// 读一份任务 JSON。文件不存在/不是合法 JSON → `None`（学习文档照常发布：
+/// 看板元数据只是归属信息，读不到不该把定稿也一起打掉）。
+fn read_task_json(cwd: &Path, id: &str) -> Option<serde_json::Value> {
+    let raw = std::fs::read_to_string(task_json_path(cwd, id)?).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 任务 JSON 里某个字符串字段（去空白，空串当缺值）。
+fn task_str(task: &serde_json::Value, key: &str) -> Option<String> {
+    task.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// 读 `.latte/tasks/<id>.json` 取父任务的学习文档路径与排序。
+/// 父任务的 doc_path 只有它已经发布过学习文档时才有值——此时才知道
+/// 真正的父文档路径；绝不从 id 伪造成 `docs/learn/<id>.md`。
+pub fn read_parent_doc_and_order(cwd: &Path, id: &str) -> (Option<String>, i64) {
+    let Some(task) = read_task_json(cwd, id) else {
+        return (None, 0);
+    };
+    let order = task.get("sub_order").and_then(|v| v.as_i64()).unwrap_or(0);
+    let parent_doc = task_str(&task, "parent_id")
+        .and_then(|parent| read_task_json(cwd, &parent))
+        .and_then(|parent| task_str(&parent, "doc_path"));
+    (parent_doc, order)
+}
+
+/// 沿 `parent_id` 祖先链找最近的 `outline_path`（项目相对），与 ui-server 的
+/// `TaskStore::effective_outline_path` 同一语义——core 不能依赖 ui-server，
+/// 所以这里自己走一遍 JSON 链。防环：最多 64 跳，数据成环时返回 `None`。
+pub fn read_outline_path(cwd: &Path, id: &str) -> Option<String> {
+    let mut cur = id.trim().to_string();
+    for _ in 0..64 {
+        let task = read_task_json(cwd, &cur)?;
+        if let Some(path) = task_str(&task, "outline_path") {
+            return Some(path);
+        }
+        cur = task_str(&task, "parent_id")?;
+    }
+    None
+}
+
+/// 把发布后的文档路径写回任务 JSON（`doc_path`）：子任务之后要靠它把
+/// `parent_doc` 指过来。只改这一个键、其余字段原样保留（最小编辑），
+/// 落盘先写 `.tmp` 再 rename，避免半个 JSON 挡住看板加载。
+pub fn write_task_doc_path(cwd: &Path, id: &str, doc_path: &str) -> Result<(), String> {
+    let path = task_json_path(cwd, id)
+        .ok_or_else(|| format!("任务 id「{id}」拼不出任务文件路径（`{id}.json`）"))?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读 {} 失败：{e}", path.display()))?;
+    let mut json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("{} 不是合法 JSON：{e}", path.display()))?;
+    let Some(obj) = json.as_object_mut() else {
+        return Err(format!("{} 的顶层不是对象，写不进 doc_path", path.display()));
+    };
+    obj.insert(
+        "doc_path".to_string(),
+        serde_json::Value::String(doc_path.to_string()),
+    );
+    let data = serde_json::to_vec_pretty(&json).map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, &data).map_err(|e| format!("写 {} 失败：{e}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {} 失败：{e}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1368,6 +1468,125 @@ mod tests {
         assert_eq!(publish_name("lat-110"), "lat-110");
         assert_eq!(publish_name("lat-110-ab"), "lat-110-ab");
         assert_eq!(publish_name("x86-64-abi"), "x86-64-abi");
+    }
+
+    #[test]
+    fn learn_frontmatter_matches_parser_expectations() {
+        let fm = learn_frontmatter(
+            Some("LAT-101"),
+            Some("docs/learn/p.md"),
+            Some("docs/outlines/o.md"),
+            2,
+        );
+        assert_eq!(
+            fm,
+            "---\ntask_id: LAT-101\noutline_node_id: LAT-101\nparent_doc: docs/learn/p.md\norder: 2\noutline: docs/outlines/o.md\n---\n\n"
+        );
+        // 缺值写裸 null（不是空串、不带引号）。
+        assert_eq!(
+            learn_frontmatter(None, None, None, 0),
+            "---\ntask_id: null\noutline_node_id: null\nparent_doc: null\norder: 0\noutline: null\n---\n\n"
+        );
+        // 与大纲的 frontmatter 解析器同一形状：每行都是 `key: value`，键不重复。
+        let block = fm.trim_end().strip_prefix("---\n").unwrap();
+        let block = block.strip_suffix("---").unwrap();
+        let mut keys = Vec::new();
+        for line in block.lines() {
+            let (key, value) = line.split_once(':').expect("frontmatter 行必须是 key: value");
+            assert!(!value.trim().is_empty(), "值不能为空：{line}");
+            keys.push(key.trim().to_string());
+        }
+        assert_eq!(
+            keys,
+            ["task_id", "outline_node_id", "parent_doc", "order", "outline"]
+        );
+    }
+
+    #[test]
+    fn read_parent_doc_and_order_reads_task_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let tasks = cwd.join(".latte/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("LAT-100.json"),
+            r#"{"id":"LAT-100","title":"模块","parent_id":null,"sub_order":0,"doc_path":"docs/learn/parent.md"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tasks.join("LAT-101.json"),
+            r#"{"id":"LAT-101","parent_id":"LAT-100","sub_order":2}"#,
+        )
+        .unwrap();
+        // 父任务还没发布过学习文档：没有 doc_path 就没有 parent_doc。
+        std::fs::write(
+            tasks.join("LAT-102.json"),
+            r#"{"id":"LAT-102","parent_id":"LAT-103","sub_order":1}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tasks.join("LAT-103.json"),
+            r#"{"id":"LAT-103","parent_id":null,"sub_order":0}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_parent_doc_and_order(cwd, "LAT-101"),
+            (Some("docs/learn/parent.md".to_string()), 2)
+        );
+        // 绝不从 id 伪造 parent_doc。
+        assert_eq!(read_parent_doc_and_order(cwd, "LAT-102"), (None, 1));
+        // 根任务：没有父任务。
+        assert_eq!(read_parent_doc_and_order(cwd, "LAT-100"), (None, 0));
+        // 任务文件不存在 / id 形状越界 → 缺省值。
+        assert_eq!(read_parent_doc_and_order(cwd, "LAT-999"), (None, 0));
+        assert_eq!(read_parent_doc_and_order(cwd, "../etc/passwd"), (None, 0));
+    }
+
+    #[test]
+    fn write_task_doc_path_keeps_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let tasks = cwd.join(".latte/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("LAT-110.json"),
+            r#"{"id":"LAT-110","state":"todo","sub_order":3,"paths":["src/a.rs"]}"#,
+        )
+        .unwrap();
+        write_task_doc_path(cwd, "LAT-110", "docs/learn/slab.md").expect("写回成功");
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tasks.join("LAT-110.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["doc_path"], "docs/learn/slab.md");
+        assert_eq!(json["state"], "todo");
+        assert_eq!(json["paths"][0], "src/a.rs");
+        assert!(!tasks.join("LAT-110.json.tmp").exists());
+        // 任务文件不存在 → Err（调用方据此记警告）。
+        assert!(write_task_doc_path(cwd, "LAT-999", "docs/learn/x.md").is_err());
+    }
+
+    #[test]
+    fn read_outline_path_walks_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let tasks = cwd.join(".latte/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            tasks.join("LAT-100.json"),
+            r#"{"id":"LAT-100","parent_id":null,"outline_path":"docs/outlines/mem.md"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tasks.join("LAT-110.json"),
+            r#"{"id":"LAT-110","parent_id":"LAT-100"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_outline_path(cwd, "LAT-110").as_deref(),
+            Some("docs/outlines/mem.md")
+        );
+        assert_eq!(read_outline_path(cwd, "LAT-999"), None);
     }
 
     #[test]
