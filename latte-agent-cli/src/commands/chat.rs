@@ -4109,6 +4109,7 @@ mod tests {
             labels: vec!["core".into()],
             task_type: Some("feature".into()),
             workflow: None,
+            needs_split: false,
             paths: vec!["src/".into()],
             artifact_paths: Some(vec!["src/".into()]),
             // 依赖引用写的是同批任务的标题（新任务还没有 id）。
@@ -4120,6 +4121,7 @@ mod tests {
                 labels: vec![],
                 task_type: None,
                 workflow: None,
+                needs_split: false,
                 paths: vec![],
                 artifact_paths: Some(vec![]),
                 depends_on: vec![],

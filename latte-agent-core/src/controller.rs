@@ -901,6 +901,9 @@ pub struct PlanTask {
     /// 仅当确需偏离类型默认流程时才显式填写。空则不序列化。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
+    /// 是否仍需继续拆分。规划字段，与 subtasks 是否为空解耦。
+    #[serde(default)]
+    pub needs_split: bool,
     /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
     /// 任务会被任务看板拒绝派发（409）。空则不序列化（视作未声明）。
     ///
@@ -7443,6 +7446,7 @@ const PLAN_TASK_KNOWN_KEYS: &[&str] = &[
     "labels",
     "task_type",
     "workflow",
+    "needs_split",
     "paths",
     "artifact_paths",
     "output_paths",
@@ -7543,6 +7547,14 @@ fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty 
         ("labels".into(), string_array_property("Task labels.")),
         ("task_type".into(), task_type),
         ("workflow".into(), workflow),
+        (
+            "needs_split".into(),
+            input_property(
+                PropertyType::Boolean,
+                "REQUIRED for split plans: true if this task must be broken down further \
+                 before it is executable, false if it is a leaf. Independent of subtasks.",
+            ),
+        ),
         (
             "paths".into(),
             string_array_property(
@@ -11157,6 +11169,7 @@ pub(crate) mod tests {
             labels: labels.iter().map(|s| s.to_string()).collect(),
             task_type: None,
             workflow: None,
+            needs_split: false,
             paths: paths.iter().map(|s| s.to_string()).collect(),
             artifact_paths: None,
             depends_on: vec![],
@@ -11239,6 +11252,32 @@ pub(crate) mod tests {
         assert!(
             unknown_plan_task_keys(&arr).is_empty(),
             "全合法键不应有回执"
+        );
+    }
+
+    #[test]
+    fn plan_task_needs_split_round_trips_and_is_known_key() {
+        // extract_plan_tasks 收 &str（controller.rs:6697），且只认 ```json
+        // 代码块，所以这里套一层围栏；body 单独留一份给未知键断言。
+        let body = r#"{"tasks":[{"title":"a","needs_split":true,"subtasks":[{"title":"b","needs_split":false}]}]}"#;
+        let summary = format!("```json\n{body}\n```");
+        let parsed = extract_plan_tasks(&summary).expect("解析");
+        assert!(parsed[0].needs_split);
+        assert!(!parsed[0].subtasks[0].needs_split);
+        let v: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert!(
+            !unknown_plan_task_keys(v["tasks"].as_array().unwrap())
+                .iter()
+                .any(|k| k == "needs_split"),
+            "needs_split 必须是已知键"
+        );
+        // schema 侧：字段可被模型填写，但不在 required 里（规划字段，非必填）。
+        let schema = serde_json::to_value(plan_task_input_property()).expect("serialize schema");
+        assert_eq!(schema["properties"]["needs_split"]["type"], "boolean");
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["title"]),
+            "needs_split 必须是可选字段"
         );
     }
 
@@ -12379,6 +12418,7 @@ pub(crate) mod tests {
                     labels: vec!["core".into()],
                     task_type: Some("feature".into()),
                     workflow: Some("tdd_development".into()),
+                    needs_split: false,
                     paths: vec!["src/ringbuf".into()],
                     artifact_paths: Some(vec!["src/ringbuf".into()]),
                     depends_on: vec![],
@@ -12391,6 +12431,7 @@ pub(crate) mod tests {
                     labels: vec![],
                     task_type: None,
                     workflow: None,
+                    needs_split: false,
                     paths: vec![],
                     artifact_paths: None,
                     depends_on: vec![],
