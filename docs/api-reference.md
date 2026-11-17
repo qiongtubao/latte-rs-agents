@@ -826,10 +826,12 @@ UI 上就是「保存到项目 / 保存到全局」两个按钮，共用这一�
 
 批量导入任务（plan 工具批准后调用）。导入的任务一律进 `todo`，是否派发由用户在任务看板手动操作（不做自动调度）。
 
-**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?`）。
+**请求体：** `ImportTasksRequest`（`tasks` / `plan_id?` / `parent_id?` / `session_id?` / `outline_draft_path?`）。
 item 的 `depends_on` 既可写已存在的任务 id，也可写**同一批任务的标题**（新任务此时还没有 id）；
 解析在全部任务创建完成后统一进行，所以前向引用（依赖清单里后面才出现的任务）同样有效。
 解析不到或标题歧义 → 整单 `400` 并点名该引用（不静默丢弃）。`parent_id` 三态：任务 id = 显式指定父任务（任意深度任务树：父任务本身也可以是子任务，item 的 `subtasks` 也可继续嵌套）；空串 = 显式「无父任务」；缺省 = 按 `session_id` 查拆分会话映射（`/api/tasks/<id>/refine` 登记，页面刷新不丢）
+
+**大纲定稿：** 拆分类 workflow 在提交 plan 时把大纲草案落在 `.latte/outline-drafts/<plan_id>.md`（锚点是 `tmp:<标题>`，此时还没有真实 id）。导入时若显式给了 `outline_draft_path`（项目相对路径，`..`/绝对路径一律拒绝）就用它，否则 `plan_id` 命中同布局的草案文件即自动取用；两者都没有 = 这次导入没有大纲（照常成功，不是错误）。定稿过程：`tmp:<标题>` 绑成真实 id（标题按小写比较，与导入的标题索引一致）→ 校验 id 唯一 → 发布 `docs/outlines/<slug>.md`（slug 由草案 frontmatter 的 `title` 派生，路径分隔符/空白折叠成 `-`，绝不逃出该目录）→ 给挂载任务写 `outline_path`。有锚点绑不上（`tmp:` 对应标题不在本批任务里）→ 整单 `400` 并点名未绑定的锚，任务与文档都不落盘。
 
 **响应 `200`：** `ImportTasksResponse`（含 `created`）
 
