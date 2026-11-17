@@ -221,3 +221,19 @@ export function repairNestedMarkdownFences(text: string): string {
 export function renderMarkdown(text: string, opts: RenderOptions = {}): string {
   return md.render(repairNestedMarkdownFences(text), { ...opts });
 }
+
+/** 取 MD 大纲 → 渲染成自包含只读 HTML → 新窗口打开（MD 权威，HTML 只读）。 */
+export async function exportOutlineHtml(path: string): Promise<void> {
+  const res = await fetch(`/api/doc?path=${encodeURIComponent(path)}`);
+  if (!res.ok) throw new Error(`读大纲失败：${res.status}`);
+  const md = await res.text();
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>任务大纲（导出）</title><style>
+body{max-width:960px;margin:40px auto;padding:0 24px;font-family:-apple-system,"PingFang SC",sans-serif;
+line-height:1.8;color:#1f2328}h1,h2,h3{border-bottom:1px solid #d0d7de;padding-bottom:6px}
+pre{background:#f6f8fa;padding:12px;border-radius:6px;overflow:auto}table{border-collapse:collapse}
+td,th{border:1px solid #d0d7de;padding:6px 10px}</style></head><body>${renderMarkdown(md)}</body></html>`;
+  const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+  window.open(url, "_blank");
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}

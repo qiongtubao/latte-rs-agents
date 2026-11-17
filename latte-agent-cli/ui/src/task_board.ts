@@ -14,6 +14,7 @@ import {
   getTaskWorktreeDiff, listTaskWorkflowRuns, getTaskWorkflowRun,
 } from "./api";
 import type { TaskView, TaskState, WorkflowSummary, TaskTypeEntry, DispatchReadyResponse, WorktreeDiff, TaskWorkflowRunSummary, TaskWorkflowRunDetail } from "./api";
+import { exportOutlineHtml } from "./markdown";
 
 // ─── 看板任务快照（供看板外的展示层联动消费）─────────────────────
 // refresh() 每次轮询成功后发布一份快照；chat_impl 的 todo dock 据此
@@ -575,6 +576,23 @@ export function mountTaskBoard(opts: {
     if (task.labels.length > 0) {
       propSec.appendChild(kv("标签", task.labels.join(", ")));
     }
+    if (task.effective_outline_path) {
+      const row = el("div", "tb-kv");
+      row.appendChild(el("span", "tb-k", "任务大纲"));
+      const v = el("span", "tb-v");
+      const link = el("a", "doc-link", "打开大纲 ↗") as HTMLAnchorElement;
+      link.dataset.docPath = task.effective_outline_path;
+      v.appendChild(link);
+      const exp = el("button", "tb-btn tb-btn-ghost tb-btn-sm", "导出 HTML") as HTMLButtonElement;
+      exp.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        await exportOutlineHtml(task.effective_outline_path!);
+      });
+      v.appendChild(exp);
+      row.appendChild(v);
+      propSec.appendChild(row);
+    }
+    propSec.appendChild(kv("需再拆", task.needs_split ? "是" : "否（叶子）"));
     body.appendChild(propSec);
 
     // 隔离工作树的改动预览：批准 = 合并回 base，批之前得先看得见改的是什么。
@@ -1623,6 +1641,9 @@ export function mountTaskBoard(opts: {
       if (tt?.default_workflow) {
         meta.appendChild(el("span", "tb-chip tb-chip-workflow hint", `↳ ${tt.default_workflow}`));
       }
+    }
+    if (task.needs_split) {
+      meta.appendChild(el("span", "tb-chip tb-chip-split", "🪓 待拆"));
     }
     if (task.scheduled_at != null && task.state === "todo") {
       const due = task.scheduled_at <= Date.now();

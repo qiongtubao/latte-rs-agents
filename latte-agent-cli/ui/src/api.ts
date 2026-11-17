@@ -1471,6 +1471,14 @@ export interface TaskView {
   workflow: string | null;
   /** 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；null=走 manager） */
   effective_workflow: string | null;
+  /** 规划判定：是否仍需继续拆分（false=叶子，禁止再拆）。 */
+  needs_split: boolean;
+  /** 大纲文档路径（仅根任务，项目相对）；子孙用 effective_outline_path。 */
+  outline_path: string | null;
+  /** 学习任务发布后的文档路径。 */
+  doc_path: string | null;
+  /** 生效的大纲路径（服务端沿祖先链解析）。 */
+  effective_outline_path: string | null;
   /** 子任务聚合（父任务用）：总数 / 终态数 / 各状态计数。 */
   sub_total: number;
   sub_done: number;
