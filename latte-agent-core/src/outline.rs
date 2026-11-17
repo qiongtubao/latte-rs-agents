@@ -50,12 +50,6 @@ pub struct OutlineNode {
     /// `learn-links` 区块内的原始行（不含换行符）。区块为空时这里是空数组。
     pub learn_links: Vec<String>,
     pub has_learn_links_block: bool,
-    /// 该节点是否带 `children` 区块。
-    ///
-    /// 为什么需要这个标志：叶子节点的 `children` 为空，但"空 children 区块"
-    /// 和"根本没有 children 区块"在文件里长得不一样；渲染必须照抄原样，
-    /// 否则往返就对不上。
-    pub has_children_block: bool,
     pub children: Vec<OutlineNode>,
 }
 
@@ -69,11 +63,6 @@ pub struct OutlineDoc {
     /// 以换行结尾（锚点在第 0 字节时为空串），渲染时直接拼在最前面即可原样还原。
     pub preamble: String,
     pub root: OutlineNode,
-    /// 根节点结构结束之后剩下的原文（通常只有一个空串，即文件末尾的换行）。
-    ///
-    /// 为什么保留：允许人手在文件末尾留空行/备注，机器不该悄悄吃掉它们；
-    /// 出现受控标记则报错（那种情况下"谁拥有这段结构"是无法确定的）。
-    pub trailing: String,
 }
 
 /// 看板任务的精简视图：让 core 不依赖 ui-server 的类型。
@@ -107,6 +96,18 @@ impl Marker {
             CHILDREN_START => Some(Marker::ChildrenStart),
             CHILDREN_END => Some(Marker::ChildrenEnd),
             _ => None,
+        }
+    }
+
+    /// 标记的原文，用于错误信息里点名"是哪一个标记出了问题"。
+    fn text(self) -> &'static str {
+        match self {
+            Marker::BodyStart => BODY_START,
+            Marker::BodyEnd => BODY_END,
+            Marker::LearnStart => LEARN_START,
+            Marker::LearnEnd => LEARN_END,
+            Marker::ChildrenStart => CHILDREN_START,
+            Marker::ChildrenEnd => CHILDREN_END,
         }
     }
 }
@@ -162,11 +163,14 @@ fn parse_frontmatter(md: &str) -> Result<(String, String), String> {
     let mut title: Option<String> = None;
     let mut closed = false;
     let mut lineno = 1usize;
+    // 缺键时报"结尾 `---` 那一行"：出错位置就是这个键本该出现的地方。
+    let mut close_lineno = 1usize;
     for line in lines {
         lineno += 1;
         let t = line.trim();
         if t == "---" {
             closed = true;
+            close_lineno = lineno;
             break;
         }
         if t.is_empty() {
@@ -193,10 +197,13 @@ fn parse_frontmatter(md: &str) -> Result<(String, String), String> {
         }
     }
     if !closed {
-        return Err("frontmatter 未闭合：找不到结尾的 `---`".to_string());
+        return Err(format!(
+            "第 {lineno} 行: frontmatter 未闭合：找不到结尾的 `---`"
+        ));
     }
-    let task_id = task_id.ok_or_else(|| "frontmatter 缺少 `task_id`".to_string())?;
-    let title = title.ok_or_else(|| "frontmatter 缺少 `title`".to_string())?;
+    let task_id = task_id
+        .ok_or_else(|| format!("第 {close_lineno} 行: frontmatter 缺少 `task_id`"))?;
+    let title = title.ok_or_else(|| format!("第 {close_lineno} 行: frontmatter 缺少 `title`"))?;
     Ok((task_id, title))
 }
 
@@ -256,12 +263,12 @@ impl<'a> Parser<'a> {
             has_body_block: false,
             learn_links: Vec::new(),
             has_learn_links_block: false,
-            has_children_block: false,
             children: Vec::new(),
         };
 
-        // 标题 = 锚点之后第一个非空行，且它必须不是区块标记。锚点后直接跟区块
-        // （或文件结束）就意味着"这个节点没有自己的标题行"——绝不凭空补一个。
+        // 标题只可能是"锚点之后、任何区块开始之前"的第一个内容行：
+        // 渲染时标题永远落在所有区块前面，所以只有这个位置的 `#` 行能往返；
+        // 接受别处的 `#` 行会让 render(parse(x)) 把标题挪位置。
         let mut j = self.i;
         while j < self.lines.len() && self.lines[j].trim().is_empty() {
             j += 1;
@@ -275,13 +282,12 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // 空 children 区块会被丢弃（见 render_node），但仍然不该重复出现。
+        let mut saw_children_block = false;
         loop {
-            // 区块之间的空行不保留（正文必须显式写进 body 区块）；但保持文件末尾
-            // 的与原文一致，否则"文件以换行结尾"这个最常见的情况都会往返失败。
-            let before_blanks = self.i;
+            // 区块之间的空行不保留（正文必须显式写进 body 区块）。
             self.skip_blank();
             if self.i >= self.lines.len() {
-                self.i = before_blanks;
                 break;
             }
             let cur = self.lines[self.i];
@@ -311,17 +317,16 @@ impl<'a> Parser<'a> {
                         self.i = next;
                     }
                     Marker::ChildrenStart => {
-                        if node.has_children_block {
+                        if saw_children_block {
                             return Err(self.err(self.i, "重复的 `children` 区块"));
                         }
+                        saw_children_block = true;
                         let start_i = self.i;
                         node.children = self.parse_children(start_i)?;
-                        node.has_children_block = true;
                     }
                     Marker::ChildrenEnd => {
                         // 本节点的区块都结束了：这个 `children:end` 属于外面那个
                         // children 区块（"最近的开着的父节点"由这个游标位置决定）。
-                        self.i = before_blanks;
                         break;
                     }
                     Marker::BodyEnd => {
@@ -336,19 +341,20 @@ impl<'a> Parser<'a> {
 
             if is_anchor(cur) {
                 // 兄弟锚点：交回给外层的 children 循环。
-                self.i = before_blanks;
                 break;
             }
 
             if cur.trim_start().starts_with('#') {
-                if node.heading_raw.is_some() {
-                    return Err(self.err(self.i, "节点内出现第二个标题行"));
-                }
-                // 标题写在正文区块之后的少见写法：接受并按标准顺序重新渲染。
-                node.heading_raw = Some(cur.to_string());
-                node.title = heading_title(cur);
-                self.i += 1;
-                continue;
+                // 标题已经收过（见前面那个唯一合法位置）——区块之后再冒出来的
+                // `#` 行在这个格式里无家可归：不能当标题（渲染会把它挪到区块前，
+                // 往返就变了），也不能当正文（它没有 body 区块）。
+                return Err(self.err(
+                    self.i,
+                    format!(
+                        "标题行出现在区块之后：一个节点只能有一条紧跟锚点的标题行，其余标题文字必须写进 `<!-- section:body:start -->` 区块：{}",
+                        cur.trim()
+                    ),
+                ));
             }
 
             return Err(self.err(
@@ -396,6 +402,9 @@ impl<'a> Parser<'a> {
     }
 
     /// 收集一个区块的内部原始行，返回 `(内部行, 结束标记之后的游标)`。
+    ///
+    /// 区块内部只允许本区块自己的结束标记：混进别的受控标记说明结构写崩了
+    /// （某个 `start` 忘了配对），当正文吞下去会把它永久藏起来。
     fn collect_block(
         &self,
         start_i: usize,
@@ -410,11 +419,12 @@ impl<'a> Parser<'a> {
             if t == end_marker {
                 return Ok((inner, k + 1));
             }
-            if t == start_marker {
+            if let Some(marker) = Marker::of(self.lines[k]) {
                 return Err(self.err(
                     k,
                     format!(
-                        "`{name}` 区块嵌套（上一个开始标记在第 {} 行），结束标记无法配对",
+                        "`{name}` 区块里出现了 `{}`：区块内部只允许正文和 `{end_marker}`（开始标记在第 {} 行）",
+                        marker.text(),
                         self.line_no(start_i)
                     ),
                 ));
@@ -453,17 +463,10 @@ pub fn parse_outline(md: &str) -> Result<OutlineDoc, String> {
     // 归属无法确定。这种歧义必须报错，不能猜。
     for (idx, line) in preamble.split('\n').enumerate() {
         if let Some(marker) = Marker::of(line) {
-            let raw = match marker {
-                Marker::BodyStart => BODY_START,
-                Marker::BodyEnd => BODY_END,
-                Marker::LearnStart => LEARN_START,
-                Marker::LearnEnd => LEARN_END,
-                Marker::ChildrenStart => CHILDREN_START,
-                Marker::ChildrenEnd => CHILDREN_END,
-            };
             return Err(format!(
-                "第 {} 行: 根锚点之前出现了区块标记 `{raw}`，第一个 node 锚点归属不明",
-                idx + 1
+                "第 {} 行: 根锚点之前出现了区块标记 `{}`，第一个 node 锚点归属不明",
+                idx + 1,
+                marker.text()
             ));
         }
     }
@@ -476,27 +479,25 @@ pub fn parse_outline(md: &str) -> Result<OutlineDoc, String> {
     };
     let root = parser.parse_node()?;
 
-    // 根节点之外还剩下的东西：一般只是文件末尾的换行，原样保留；一旦又出现
-    // 受控标记就说明结构归属不明（例如第二个根锚点、多余的 children:end）。
-    let rest: Vec<&str> = parser.lines[parser.i..].to_vec();
-    for (k, line) in rest.iter().enumerate() {
-        if is_anchor(line) || Marker::of(line).is_some() {
-            return Err(format!(
-                "第 {} 行: 根节点 `{}` 已经结束，这里又出现了 `{}`，无法确定它属于谁",
-                parser.line_no(parser.i + k),
-                root.id,
-                line.trim()
-            ));
-        }
+    // 根节点之外还能剩下的只有文件末尾的空行（`split('\n')` 的产物，渲染时
+    // 已经由最后一行的换行覆盖）。再冒出锚点或标记就说明结构归属不明，
+    // 例如第二个根锚点、多余的 `children:end`。
+    parser.skip_blank();
+    if parser.i < parser.lines.len() {
+        let line = parser.lines[parser.i];
+        return Err(format!(
+            "第 {} 行: 根节点 `{}` 已经结束，这里又出现了 `{}`，无法确定它属于谁",
+            parser.line_no(parser.i),
+            root.id,
+            line.trim()
+        ));
     }
-    let trailing = rest.join("\n");
 
     Ok(OutlineDoc {
         task_id,
         title,
         preamble,
         root,
-        trailing,
     })
 }
 
@@ -505,7 +506,6 @@ pub fn render_outline(doc: &OutlineDoc) -> String {
     let mut out = String::new();
     out.push_str(&doc.preamble);
     render_node(&doc.root, &mut out);
-    out.push_str(&doc.trailing);
     out
 }
 
@@ -540,9 +540,9 @@ fn render_node(node: &OutlineNode, out: &mut String) {
         out.push_str(LEARN_END);
         out.push('\n');
     }
-    // `!children.is_empty()` 是为了程序化构造出来的节点：有子节点就必然要有
-    // children 区块，否则子节点会被渲染成一串没人认领的锚点。
-    if node.has_children_block || !node.children.is_empty() {
+    // 只在有子节点时输出 children 区块：内容为空的标记对读者零价值，留着只会
+    // 让文件越来越吵，所以解析出的空区块在渲染时被丢掉（规范化）。
+    if !node.children.is_empty() {
         out.push_str(CHILDREN_START);
         out.push('\n');
         for child in &node.children {
@@ -712,7 +712,6 @@ title: 总纲
         assert!(doc.root.has_body_block);
         assert_eq!(doc.root.body, "## 概述\n正文一段。\n");
         assert!(!doc.root.has_learn_links_block, "根节点没有 learn-links 区块");
-        assert!(doc.root.has_children_block);
         assert_eq!(doc.root.children.len(), 1);
 
         let child = &doc.root.children[0];
@@ -723,7 +722,6 @@ title: 总纲
         assert_eq!(child.body, "子正文。\n");
         assert!(child.has_learn_links_block);
         assert!(child.learn_links.is_empty());
-        assert!(!child.has_children_block);
         assert!(child.children.is_empty());
 
         let rendered = render_outline(&doc);
@@ -792,14 +790,14 @@ title: T
 <!-- children:end -->
 ";
         let doc = parse_outline(md).expect("解析失败");
-        assert!(doc.root.has_children_block);
+        assert_eq!(doc.root.children.len(), 1);
         assert!(!doc.root.has_body_block, "没写 body 区块就不该被解析出来");
         assert!(!doc.root.has_learn_links_block);
         let child = &doc.root.children[0];
         assert_eq!(child.title, "子");
         assert!(!child.has_body_block);
         assert!(!child.has_learn_links_block);
-        assert!(!child.has_children_block);
+        assert!(child.children.is_empty());
 
         let rendered = render_outline(&doc);
         assert!(
@@ -827,6 +825,84 @@ title: T
             "错误信息要指出缺哪个标记：{err}"
         );
         assert!(err.contains("第 7 行"), "错误信息要带行号：{err}");
+    }
+
+    #[test]
+    fn parse_rejects_heading_after_block() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:LAT-1 -->
+<!-- section:body:start -->
+正文
+<!-- section:body:end -->
+### 迟到的标题
+";
+        let err = parse_outline(md).expect_err("区块之后的标题行没有合法归属，必须报错");
+        assert!(
+            err.contains("标题") && err.contains("第 10 行"),
+            "错误信息要点明标题位置并带行号：{err}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_foreign_marker_inside_body() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:LAT-1 -->
+<!-- section:body:start -->
+正文
+<!-- learn-links:start -->
+<!-- section:body:end -->
+";
+        let err = parse_outline(md).expect_err("body 区块里的外来标记必须报错");
+        assert!(
+            err.contains("learn-links:start") && err.contains("第 9 行"),
+            "错误信息要点名标记并带行号：{err}"
+        );
+    }
+
+    #[test]
+    fn leaf_with_empty_children_block_renders_without_it() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-7
+title: T
+---
+<!-- node:LAT-7 -->
+### 叶子
+<!-- children:start -->
+<!-- children:end -->
+";
+        let doc = parse_outline(md).expect("解析失败");
+        assert!(doc.root.children.is_empty(), "空 children 区块解析出空数组");
+
+        let rendered = render_outline(&doc);
+        assert!(
+            !rendered.contains("children:"),
+            "空的 children 区块不该被渲染出来：\n{rendered}"
+        );
+        assert_eq!(
+            rendered,
+            "\
+---
+schema: 1
+task_id: LAT-7
+title: T
+---
+<!-- node:LAT-7 -->
+### 叶子
+",
+            "丢弃空区块后其余内容照旧"
+        );
     }
 
     #[test]
