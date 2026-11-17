@@ -311,6 +311,21 @@ pub struct TaskStore {
     /// 取走并 PUT，成功删盘标记。重启/离线由盘标记兜底恢复，不漏推。
     /// 详见 `crate::notion_sync`。
     notion_dirty: crate::notion_sync::DirtySet,
+    /// 本次导入事务已发布的大纲文档 + 撤销信息（纯内存态，不落盘）。
+    ///
+    /// 为什么需要：`docs/outlines/<slug>.md` 是导入唯一落在任务文件之外、
+    /// 事务边界管不到的产物。大纲在 `import_tasks_into_inner` 里就发布了，
+    /// 而后续（todo 状态落盘、plan marker）仍可能失败回滚任务——不记下这份
+    /// 文档，回滚后就会留下没有任何任务指向的孤儿大纲。成功提交时清空，
+    /// 否则下一次失败的导入会拿旧记录去删上一份文档。
+    import_published_outline: Option<PublishedOutline>,
+}
+
+/// 导入期发布的大纲文档的撤销信息。
+struct PublishedOutline {
+    path: PathBuf,
+    /// 发布前同名文档的原文；`None` = 发布前不存在（回滚时删掉即可）。
+    previous: Option<String>,
 }
 
 /// 导入事务开始前的内存快照。导入只会新增任务并推进 `next_seq`，但保存
@@ -422,6 +437,7 @@ impl TaskStore {
                 }
                 s
             },
+            import_published_outline: None,
         })
     }
 
@@ -513,6 +529,25 @@ impl TaskStore {
 
         if let Err(error) = write_atomic_json(&self.dir.join("board.json"), &snapshot.meta) {
             errors.push(format!("restore board.json: {error}"));
+        }
+        // 大纲文档是导入唯一落在任务文件之外的产物：回滚时必须一起撤掉，
+        // 否则板上一条任务都没有、`docs/outlines/` 里却躺着一份指向不存在
+        // 任务的终稿。发布前就有同名文档时按原文还原（那是上一轮的成果，
+        // 不能被这次失败的导入连坐删除）。
+        if let Some(published) = self.import_published_outline.take() {
+            let result = match &published.previous {
+                Some(previous) => std::fs::write(&published.path, previous),
+                None => match std::fs::remove_file(&published.path) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                    _ => Ok(()),
+                },
+            };
+            if let Err(error) = result {
+                errors.push(format!(
+                    "restore outline {}: {error}",
+                    published.path.display()
+                ));
+            }
         }
         self.meta = snapshot.meta;
         self.tasks = snapshot.tasks;
@@ -1721,7 +1756,7 @@ fn import_tasks_into_inner(
     }
     // 第三趟：把 workflow 落下的大纲草案定稿（必须在 `created` / `by_title`
     // 都齐了之后——草案的锚点是 `tmp:<标题>`，真实 id 此刻才存在）。
-    finalize_outline_from_draft(store, cwd, req, &created, &by_title)?;
+    finalize_outline_from_draft(store, cwd, req, &created)?;
     Ok(created)
 }
 
@@ -1731,14 +1766,13 @@ const OUTLINE_ROOT_SENTINEL: &str = "LAT-ROOT";
 /// 导入收尾：把 workflow 提交 plan 时落下的大纲草案定稿。
 ///
 /// 为什么必须在这里：草案里的锚点是 `tmp:<标题>`，真实 task id 只有在整批
-/// 任务建完（`created` / `by_title` 齐备）之后才存在。为什么必须在事务内：
-/// 发布一份锚点错乱的大纲、或者留下半个看板，都比整单失败难收拾。
+/// 任务建完（`created` 齐备）之后才存在。为什么必须在事务内：发布一份锚点
+/// 错乱的大纲、或者留下半个看板，都比整单失败难收拾。
 fn finalize_outline_from_draft(
     store: &mut TaskStore,
     cwd: &Path,
     req: &ImportTasksRequest,
     created: &[String],
-    by_title: &HashMap<String, Vec<String>>,
 ) -> Result<(), String> {
     let Some(draft_path) = resolve_outline_draft(cwd, req)? else {
         return Ok(());
@@ -1750,19 +1784,21 @@ fn finalize_outline_from_draft(
         format!("大纲草案 {} 解析失败：{e}", draft_path.display())
     })?;
 
-    // `by_title` 是 `import_one` 用 `title.to_lowercase()` 建的索引，而
-    // `rebind_tmp_ids` 查表用的是锚点里 trim 过的 `tmp:<标题>`。两边都按小写
-    // 比较——英文标题在大纲里大小写不一致（`tmp:API Layer` vs 任务标题
-    // "Api Layer"）也必须绑上，因为导入侧的索引本来就是大小写无关的。
-    let title_to_id: HashMap<String, String> = by_title
-        .iter()
-        .map(|(title, ids)| {
-            // 同名标题多条时取先创建的那条：清单重名在 plan 机械校验阶段
-            // 就被拒了，能走到这里只可能是历史数据，按声明顺序取第一条
-            // 最可预期（绑错的风险由下面的唯一性校验兜住）。
-            (title.clone(), ids[0].clone())
-        })
-        .collect();
+    // 标题按**逐字**比较，键取任务落库后的真实标题（`Task.title`），不能用
+    // `by_title`——那张表是 `import_one` 用小写折叠过的（依赖解析要用），
+    // 拿它建表会让 `tmp:api layer` 悄悄绑到 "API Layer"，把本该被拒的错锚
+    // 放进来。大纲门（`require_outline_against_plan`）要求锚点标题与任务
+    // 标题逐字相同，所以大小写不同就是真实的不匹配，必须报错让用户改。
+    let mut title_to_id: HashMap<String, String> = HashMap::new();
+    for id in created {
+        let Some(task) = store.get(id) else { continue };
+        // 同名标题只留先创建的那条：清单重名在 plan 机械校验阶段就被拒了，
+        // 能走到这里只可能是历史数据，按创建顺序取第一条最可预期（绑错的
+        // 风险由下面的唯一性校验兜住）。
+        title_to_id
+            .entry(task.title.clone())
+            .or_insert_with(|| id.clone());
+    }
     let unbound = rebind_tmp_ids(&mut doc, &title_to_id);
     if !unbound.is_empty() {
         // 绑不上就整单失败：带着 `tmp:` 发布出去，下游同步/学习链接会把
@@ -1832,6 +1868,12 @@ fn finalize_outline_from_draft(
         .parent()
         .ok_or_else(|| format!("大纲发布路径 {} 没有父目录", final_path.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    // 发布前就有的同名文档（上一轮的成果）要能原样还原：回滚不能连坐删掉
+    // 它，也不该把这次失败的内容留在盘上。
+    let previous = final_path
+        .is_file()
+        .then(|| std::fs::read_to_string(&final_path).ok())
+        .flatten();
     let tmp = final_path.with_extension("md.tmp");
     std::fs::write(&tmp, render_outline(&doc))
         .map_err(|e| format!("write {}: {e}", tmp.display()))?;
@@ -1850,6 +1892,12 @@ fn finalize_outline_from_draft(
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("rename {}: {e}", final_path.display()));
     }
+    // 登记撤销信息：后续步骤（todo 状态落盘、plan marker）失败时由
+    // `rollback_import` 把这份文档删掉/还原，避免留下孤儿大纲。
+    store.import_published_outline = Some(PublishedOutline {
+        path: final_path,
+        previous,
+    });
     Ok(())
 }
 
@@ -1951,8 +1999,19 @@ fn run_import_transaction<T>(
 ) -> Result<T, String> {
     let snapshot = store.import_snapshot();
     match operation(store) {
-        Ok(value) => Ok(value),
-        Err(error) if store.meta.next_seq == snapshot.meta.next_seq => Err(error),
+        Ok(value) => {
+            // 提交成功：已发布的大纲就是最终产物，清掉撤销信息——否则下一次
+            // 失败的导入会拿这条旧记录去删上一份好好的文档。
+            store.import_published_outline = None;
+            Ok(value)
+        }
+        // 没有任何落盘副作用（next_seq 未推进、也没发布过大纲）时不必回滚。
+        Err(error)
+            if store.meta.next_seq == snapshot.meta.next_seq
+                && store.import_published_outline.is_none() =>
+        {
+            Err(error)
+        }
         Err(error) => match store.rollback_import(snapshot) {
             Ok(()) => Err(format!("{error}（本次导入已回滚）")),
             Err(rollback_error) => Err(format!("{error}；导入回滚未完全成功：{rollback_error}")),
@@ -5191,6 +5250,101 @@ mod tests {
         assert!(
             !cwd.join("../etc/x.md").exists(),
             "不得在项目外写出文件"
+        );
+    }
+
+    /// 锚点标题与任务标题**逐字**比较（大纲门的契约）：大小写写得对就必须绑上。
+    /// 回归：曾用导入内部的"小写折叠"标题索引建表，`tmp:API Layer` 永远绑不上，
+    /// 整单被拒，而任务其实就在清单里。
+    #[test]
+    fn import_binds_mixed_case_anchor_when_titles_match_exactly() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p4",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: api demo\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:API Layer -->\n### API Layer\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p4",
+            "tasks": [{ "title": "API Layer" }]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("标题逐字相同就必须绑上");
+        let text =
+            std::fs::read_to_string(cwd.join("docs/outlines/api-demo.md")).expect("必须发布大纲");
+        assert!(!text.contains("tmp:"), "终稿不许留临时锚：\n{text}");
+        assert!(text.contains(&created[0]), "锚点必须是真实 id：\n{text}");
+    }
+
+    /// 只差大小写是**真实的不匹配**：大纲门要求锚点标题与任务标题逐字相同，
+    /// 所以导入必须点名报错，不能按小写折叠悄悄绑上——那样一处错锚会被静默
+    /// 接受，后续同步/学习链接认错节点。
+    #[test]
+    fn import_reports_case_only_title_mismatch() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p6",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: case demo\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:api layer -->\n### api layer\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p6",
+            "tasks": [{ "title": "API Layer" }]
+        }));
+        let err = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect_err("大小写不同必须报错");
+        assert!(err.contains("tmp:api layer"), "报错要点名这个锚：{err}");
+        assert!(store.list().is_empty(), "回滚后看板必须为空");
+        assert!(
+            !cwd.join("docs/outlines").exists(),
+            "未绑定的锚不得发布任何文档"
+        );
+    }
+
+    /// 大纲发布**发生在** planner marker 之前，而 marker 之后仍可能失败：
+    /// 回滚必须把已发布的 `docs/outlines/` 文档一起撤掉，否则板上一条任务都
+    /// 没有、盘上却躺着一份指向不存在 id 的终稿（孤儿文档没有任何任务能认领，
+    /// 下次同步还会把它当成看板的镜像）。
+    #[test]
+    fn import_rollback_removes_published_outline() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p5",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: rollback demo\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:模块一 -->\n### 模块一\n\
+             <!-- children:end -->\n",
+        );
+        // 让 plan marker 写不进去：marker 路径上先放一个**目录**，
+        // `mark_plan_imported` 的 rename 必然失败 → 事务在大纲发布之后回滚。
+        std::fs::create_dir_all(store.imported_plans_dir().join("p5")).expect("blocker dir");
+        let req = import_req(serde_json::json!({
+            "plan_id": "p5",
+            "tasks": [{ "title": "模块一" }]
+        }));
+        let err = import_tasks_as_todo_into(&mut store, cwd, &req, Some("p5"))
+            .expect_err("marker 写不进去 → 整单失败");
+        assert!(err.contains("marker"), "报错要点明 marker 落盘失败：{err}");
+        assert!(store.list().is_empty(), "回滚后看板必须为空：{:?}", store.list());
+        let leftovers: Vec<PathBuf> = std::fs::read_dir(cwd.join("docs/outlines"))
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "回滚必须删掉已发布的大纲，实际残留：{leftovers:?}"
         );
     }
 
