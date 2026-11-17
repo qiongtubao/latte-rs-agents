@@ -35,6 +35,25 @@
 - **Markdown 渲染**：前端 markdown-it 栈（`latte-agent-cli/ui/package.json:19-24`、`markdown.ts:16-24`）。
 - **导入/提交管线**：workflow → `PlanProposed` → 用户勾选 → `POST /api/tasks/import`（`handlers.rs:1243-1252`）；`submit_plan_from` 机械提交步（`workflow.rs:13625-13640`）。
 
+### 2.5 问题 → 解决方案对照（审查补充）
+
+把原始需求里的每件事、现状缺口对应的解法、落地位置集中列清，便于逐条核对"问题是否真的被解决"。
+
+| # | 要解决的问题 | 现状缺口（证据见 §2） | 解决方案 | 落地位置 |
+|---|---|---|---|---|
+| P1 | 大任务导入要产出一份**总纲文档**，可选 HTML 或 MD | 通用拆分只出 JSON，无独立大纲（`implementation_plan.toml:50-57`） | 新增 `outline_split` workflow 产出 `docs/outlines/<slug>.md`；MD 为权威源，HTML 为导出视图 | §5 文档格式、§7.1 流程、§8 导出 |
+| P2 | 任务必须**标记是否需要拆分** | 无 `needs_split` 字段，空 `subtasks` 是隐式叶子（全仓零匹配） | `Task`/`PlanTask` 新增显式 `needs_split: bool`；拆分产物必填；看板显示 chip；`false` 时禁止 refine | §4.1/§4.2 数据模型、§7.2 子拆分 |
+| P3 | 导入到**任务看板**，代码模块与核心流程要清楚 | 导入管线已有，但缺新字段透传 | 复用 `PlanProposed` → `POST /api/tasks/import`，逐节点写入 `needs_split`；模块划分单列 | §6 模块划分、§4.1 导入改动点 |
+| P4 | 看板可**点击打开大纲** | 看板未接文档查看器（`doc_viewer.ts` 只接 chat） | 任务抽屉渲染 `<a class="doc-link" data-doc-path>`，复用 `installDocLinkHandler()` + `/api/doc` | §8 HTML 导出节末的打开按钮 |
+| P5 | 子任务拆分要**根据任务和大纲**，并**同时更新看板与大纲** | 现有 `task_refine` 只写看板，不碰任何大纲 | 加 `outline_patch` 步：同一提交里写看板子任务 + 插入大纲子锚 + `rebind_tmp_ids` 回填 id，按 id 对账 | §7.2 子任务拆分 |
+| P6 | 大纲与看板**双向同步、各管一段**要明确规则 | 无同步机制、无冲突规则 | 定义权威划分 + 3 类触发 + 4 条冲突规则（删除胜、时间戳定序、trash 保留） | §7.3 双向同步与冲突规则 |
+| P7 | 学习任务**根据任务内容和大纲写文档并关联大纲** | 学习文档无 frontmatter、无关联（`learn_doc.rs:56` 剥前缀） | `finalize_learn_doc` 写 `task_id`/`outline_node_id`/`parent_doc`/`order` frontmatter，归属不靠 slug | §7.4 学习 workflow |
+| P8 | 子任务文档挂到大任务下**也是一棵树** | 文档全平铺，唯一"树"是手写 index | 文档 frontmatter 的 `parent_doc`/`order` 镜像任务树；大纲 `learn-links` 区块 + 父目录 index 自动生成 | §7.4 末段、§4.1 `doc_path` |
+| P9 | 大纲要**可选 HTML 和 MD**，但要好看 | `/api/doc` 只认 `.md`，无 HTML 大纲 | MD 权威、前端 markdown-it 导出只读 HTML（Blob 新窗口），零双写；审核文档本身也提供 HTML 阅读版 | §8 HTML 导出、D3 |
+| P10 | 拆分阶段没有真实 task.id，锚点怎么写 | 看板 id 由 `next_seq` 在导入时才分配 | 两阶段 id：`tmp:<标题>` 临时锚 → 导入后 `rebind_tmp_ids` 换成真实 id | §4.3 node-id 约定、§5.2 示例 |
+
+对照表用法：实现计划阶段每条 P 至少对应一个测试用例（见 §9 验证计划），确保"列得出问题"就能"验得到修复"。
+
 ## 3. 已定决策（本设计的约束）
 
 | 编号 | 决策 | 含义 |

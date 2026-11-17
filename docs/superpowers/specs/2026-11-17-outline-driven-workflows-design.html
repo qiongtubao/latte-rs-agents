@@ -2078,7 +2078,10 @@ window.addEventListener('load',function(){mermaid.run({querySelector:'.mermaid'}
 <ul>
 <li><a href="#_1">大纲驱动的任务拆分与学习工作流 — 设计规格</a><ul>
 <li><a href="#1">1. 目标与范围</a></li>
-<li><a href="#2">2. 现状基线（含证据）</a></li>
+<li><a href="#2">2. 现状基线（含证据）</a><ul>
+<li><a href="#25">2.5 问题 → 解决方案对照（审查补充）</a></li>
+</ul>
+</li>
 <li><a href="#3">3. 已定决策（本设计的约束）</a></li>
 <li><a href="#4">4. 数据模型</a><ul>
 <li><a href="#41-task">4.1 看板 Task 新增字段</a></li>
@@ -2163,6 +2166,92 @@ window.addEventListener('load',function(){mermaid.run({querySelector:'.mermaid'}
 <li><strong>Markdown 渲染</strong>：前端 markdown-it 栈（<code>latte-agent-cli/ui/package.json:19-24</code>、<code>markdown.ts:16-24</code>）。</li>
 <li><strong>导入/提交管线</strong>：workflow → <code>PlanProposed</code> → 用户勾选 → <code>POST /api/tasks/import</code>（<code>handlers.rs:1243-1252</code>）；<code>submit_plan_from</code> 机械提交步（<code>workflow.rs:13625-13640</code>）。</li>
 </ul>
+<h3 id="25">2.5 问题 → 解决方案对照（审查补充）</h3>
+<p>把原始需求里的每件事、现状缺口对应的解法、落地位置集中列清，便于逐条核对"问题是否真的被解决"。</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>要解决的问题</th>
+<th>现状缺口（证据见 §2）</th>
+<th>解决方案</th>
+<th>落地位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P1</td>
+<td>大任务导入要产出一份<strong>总纲文档</strong>，可选 HTML 或 MD</td>
+<td>通用拆分只出 JSON，无独立大纲（<code>implementation_plan.toml:50-57</code>）</td>
+<td>新增 <code>outline_split</code> workflow 产出 <code>docs/outlines/&lt;slug&gt;.md</code>；MD 为权威源，HTML 为导出视图</td>
+<td>§5 文档格式、§7.1 流程、§8 导出</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>任务必须<strong>标记是否需要拆分</strong></td>
+<td>无 <code>needs_split</code> 字段，空 <code>subtasks</code> 是隐式叶子（全仓零匹配）</td>
+<td><code>Task</code>/<code>PlanTask</code> 新增显式 <code>needs_split: bool</code>；拆分产物必填；看板显示 chip；<code>false</code> 时禁止 refine</td>
+<td>§4.1/§4.2 数据模型、§7.2 子拆分</td>
+</tr>
+<tr>
+<td>P3</td>
+<td>导入到<strong>任务看板</strong>，代码模块与核心流程要清楚</td>
+<td>导入管线已有，但缺新字段透传</td>
+<td>复用 <code>PlanProposed</code> → <code>POST /api/tasks/import</code>，逐节点写入 <code>needs_split</code>；模块划分单列</td>
+<td>§6 模块划分、§4.1 导入改动点</td>
+</tr>
+<tr>
+<td>P4</td>
+<td>看板可<strong>点击打开大纲</strong></td>
+<td>看板未接文档查看器（<code>doc_viewer.ts</code> 只接 chat）</td>
+<td>任务抽屉渲染 <code>&lt;a class="doc-link" data-doc-path&gt;</code>，复用 <code>installDocLinkHandler()</code> + <code>/api/doc</code></td>
+<td>§8 HTML 导出节末的打开按钮</td>
+</tr>
+<tr>
+<td>P5</td>
+<td>子任务拆分要<strong>根据任务和大纲</strong>，并<strong>同时更新看板与大纲</strong></td>
+<td>现有 <code>task_refine</code> 只写看板，不碰任何大纲</td>
+<td>加 <code>outline_patch</code> 步：同一提交里写看板子任务 + 插入大纲子锚 + <code>rebind_tmp_ids</code> 回填 id，按 id 对账</td>
+<td>§7.2 子任务拆分</td>
+</tr>
+<tr>
+<td>P6</td>
+<td>大纲与看板<strong>双向同步、各管一段</strong>要明确规则</td>
+<td>无同步机制、无冲突规则</td>
+<td>定义权威划分 + 3 类触发 + 4 条冲突规则（删除胜、时间戳定序、trash 保留）</td>
+<td>§7.3 双向同步与冲突规则</td>
+</tr>
+<tr>
+<td>P7</td>
+<td>学习任务<strong>根据任务内容和大纲写文档并关联大纲</strong></td>
+<td>学习文档无 frontmatter、无关联（<code>learn_doc.rs:56</code> 剥前缀）</td>
+<td><code>finalize_learn_doc</code> 写 <code>task_id</code>/<code>outline_node_id</code>/<code>parent_doc</code>/<code>order</code> frontmatter，归属不靠 slug</td>
+<td>§7.4 学习 workflow</td>
+</tr>
+<tr>
+<td>P8</td>
+<td>子任务文档挂到大任务下<strong>也是一棵树</strong></td>
+<td>文档全平铺，唯一"树"是手写 index</td>
+<td>文档 frontmatter 的 <code>parent_doc</code>/<code>order</code> 镜像任务树；大纲 <code>learn-links</code> 区块 + 父目录 index 自动生成</td>
+<td>§7.4 末段、§4.1 <code>doc_path</code></td>
+</tr>
+<tr>
+<td>P9</td>
+<td>大纲要<strong>可选 HTML 和 MD</strong>，但要好看</td>
+<td><code>/api/doc</code> 只认 <code>.md</code>，无 HTML 大纲</td>
+<td>MD 权威、前端 markdown-it 导出只读 HTML（Blob 新窗口），零双写；审核文档本身也提供 HTML 阅读版</td>
+<td>§8 HTML 导出、D3</td>
+</tr>
+<tr>
+<td>P10</td>
+<td>拆分阶段没有真实 task.id，锚点怎么写</td>
+<td>看板 id 由 <code>next_seq</code> 在导入时才分配</td>
+<td>两阶段 id：<code>tmp:&lt;标题&gt;</code> 临时锚 → 导入后 <code>rebind_tmp_ids</code> 换成真实 id</td>
+<td>§4.3 node-id 约定、§5.2 示例</td>
+</tr>
+</tbody>
+</table>
+<p>对照表用法：实现计划阶段每条 P 至少对应一个测试用例（见 §9 验证计划），确保"列得出问题"就能"验得到修复"。</p>
 <h2 id="3">3. 已定决策（本设计的约束）</h2>
 <table>
 <thead>
