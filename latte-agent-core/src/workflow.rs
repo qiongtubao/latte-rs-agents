@@ -1536,6 +1536,68 @@ fn plan_submitted(stage: Option<&crate::controller::SharedPlanStage>) -> bool {
         .unwrap_or(false)
 }
 
+/// 大纲草案的落盘路径：`<cwd>/.latte/outline-drafts/<plan_id>.md`。
+///
+/// **这是 `latte-agent-core` 与 `latte-agent-ui-server` 的落盘契约**：真实
+/// task id 要到用户点「导入任务看板」那一刻才分配，所以 `outline_split` 的
+/// 提交步只能把大纲草案按 **plan_id** 存下来；导入端（`POST /api/tasks/import`
+/// 本来就是按 plan_id 处理一次导入）用同一份布局找回草案，把 `tmp:<标题>`
+/// 锚回填成真实 id 后再发布。两边必须共用这一份路径构造——ui-server 侧直接
+/// 调用本函数，不要自己拼 `.latte/outline-drafts/<id>.md`：改布局时漏改一边
+/// 就是导入端静默找不到草案（用户拿到没有大纲的任务树）。
+///
+/// `plan_id` 来自 `controller::next_plan_id`（`plan-<role>-<seq>`，role 里可能
+/// 有 `:`）或前端回传，拼进路径前过 [`safe_plan_id`]：只允许单一的普通路径
+/// 分量，且不得以 `.` 开头（`.hidden` 是隐藏文件，导入端按 `<plan_id>.md`
+/// 这种直白文件名取用时容易漏）。
+pub fn outline_draft_path(cwd: &Path, plan_id: &str) -> Result<PathBuf, String> {
+    Ok(cwd
+        .join(".latte/outline-drafts")
+        .join(format!("{}.md", safe_plan_id(plan_id)?)))
+}
+
+/// plan_id 当文件名的安全判定，与 `TaskStore::imported_plan_marker`
+/// （`latte-agent-ui-server/src/tasks.rs`）同一条规则：`Path::components`
+/// 恰好一个 `Normal` 分量——`..`、`a/b`、`/abs`、空串全落到 `_` 分支；
+/// 额外禁掉 `.<name>`（隐藏文件）。
+///
+/// 返回**规范化后的名字**（`"a/"` 的尾部分隔符在这里被去掉），调用方只能拿
+/// 它拼路径，不能拿原串。
+fn safe_plan_id(plan_id: &str) -> Result<&str, String> {
+    let mut components = Path::new(plan_id).components();
+    match (components.next(), components.next()) {
+        // 只认恰好一个普通分量，且**要求原串等于该分量**：`"a/"` 的
+        // components 也只剩一个 Normal（尾部分隔符被忽略），放过去就会拼出
+        // `a/.md` 这种畸形路径。`starts_with('.')` 额外挡住 `.hidden`。
+        (Some(std::path::Component::Normal(name)), None)
+            if name.to_str() == Some(plan_id) && !plan_id.starts_with('.') =>
+        {
+            Ok(plan_id)
+        }
+        _ => Err(format!("plan_id {plan_id:?} 不是安全的文件名")),
+    }
+}
+
+/// 把大纲草案原子写到 [`outline_draft_path`]：先写 `<name>.md.tmp` 再 rename，
+/// 导入端永远读不到半截文件（它只按 `<plan_id>.md` 取名，tmp 名对不上）。
+/// 目录按需创建；任何 I/O 失败都返回错误——草案静默缺失 = 用户导入了任务
+/// 却永远拿不到大纲，比 step 失败难发现得多。
+fn write_outline_draft(cwd: &Path, plan_id: &str, draft: &str) -> Result<PathBuf, String> {
+    let path = outline_draft_path(cwd, plan_id)?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("outline draft path {} 没有父目录", path.display()))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| format!("create outline-draft dir {}: {e}", dir.display()))?;
+    let tmp = path.with_extension("md.tmp");
+    std::fs::write(&tmp, draft.as_bytes())
+        .map_err(|e| format!("write outline draft {}: {e}", tmp.display()))?;
+    if let Err(error) = std::fs::rename(&tmp, &path) {
+        return Err(format!("rename outline draft {}: {error}", path.display()));
+    }
+    Ok(path)
+}
+
 /// 未成功提交 plan 时拼进重试 prompt 的批注。
 ///
 /// 必须把**上次产出整段**带过去：每次尝试都是全新 subagent（无跨次
@@ -3158,6 +3220,21 @@ pub struct WorkflowStepDef {
     /// 本身曾引入增删改漂移（`task_refine.toml` 头部实录）。
     #[serde(default)]
     pub submit_plan_from: Option<String>,
+    /// 与 `submit_plan_from` 配合：提交成功后把该 output_key 的大纲草案写到
+    /// `<cwd>/.latte/outline-drafts/<plan_id>.md`。真实 task id 要到用户导入时才
+    /// 分配，所以这里只存草案；导入端按 plan_id 找它，回填 id 后再发布。
+    ///
+    /// 为什么需要它：大纲终稿的锚点是 `<cwd>/.latte/tasks/<task_id>` 里的真实
+    /// id，而 id 只有「用户勾选导入」那一刻才存在。不在提交时把草案按 plan_id
+    /// 落盘，导入端就只剩 plan 快照里的任务清单，大纲正文（模块划分、正文段落）
+    /// 整个丢失——要么重新让模型写一遍，要么用户拿到没有大纲的任务树。
+    ///
+    /// 校验（`WorkflowDef::validate`）：必须与本步的 `submit_plan_from` 同时
+    /// 存在（plan_id 由那次提案产出），且源 key 必须是**更早** step 的
+    /// `output_key`——同 step / 未来 step 在串行执行下永远是空串。
+    /// 落盘失败 = step 失败：草案静默缺失等于用户导入后永远拿不到大纲。
+    #[serde(default)]
+    pub outline_draft_from: Option<String>,
     /// 学习类清单的**章节号机械校验**（需配合 `require_plan_tasks`）：
     /// 章任务标题必须以稳定全局章号 `chNN` 开头、全书连续递增；
     /// `depends_on` 只能指向编号更小的章；description 里引用其他章一律写
@@ -3928,12 +4005,13 @@ impl WorkflowDef {
                     step.id
                 ));
             }
-            // patch_from / submit_plan_from 必须指向**更早** step 的
-            // output_key——指向自己或未来 step 在串行执行下永远拿到空串，
-            // 是静默失效类错误。
+            // patch_from / submit_plan_from / outline_draft_from 必须指向
+            // **更早** step 的 output_key——指向自己或未来 step 在串行执行下
+            // 永远拿到空串，是静默失效类错误。
             for (attr, src) in [
                 ("patch_from", step.patch_from.as_deref()),
                 ("submit_plan_from", step.submit_plan_from.as_deref()),
+                ("outline_draft_from", step.outline_draft_from.as_deref()),
             ] {
                 let Some(src) = src else { continue };
                 if src.trim().is_empty() {
@@ -3956,6 +4034,16 @@ impl WorkflowDef {
             {
                 return Err(format!(
                     "step '{}': `submit_plan_from` 是零模型调用的机械步，与 role/speakers 互斥",
+                    step.id
+                ));
+            }
+            // 草案落盘按 plan_id 取名，而 plan_id 只由本步的机械提交产出：
+            // 没有 `submit_plan_from` 就没有可写的目标（真跑起来只能报「不知道
+            // 写哪个 plan_id」），属配置期就该拦下的组合。
+            if step.outline_draft_from.is_some() && step.submit_plan_from.is_none() {
+                return Err(format!(
+                    "step '{}': `outline_draft_from` 需要同一步的 `submit_plan_from`\
+                     （草案按该次提交产出的 plan_id 落盘）",
                     step.id
                 ));
             }
@@ -13987,15 +14075,20 @@ async fn run_workflow_serial(
             // 已两道硬校验，这里失败说明有未知路径，响亮报错不静默。
             if let Some(src_key) = &step.submit_plan_from {
                 let src = vars.get(src_key).cloned().unwrap_or_default();
+                // stage 自己持有再传进去：`submit_plan_proposal` 成功时把
+                // `PendingApproval { plan_id }` 写进这个 handle，而它的返回值
+                // 只是给人看的摘要、不含 plan_id——大纲草案要按 plan_id 取名，
+                // 只能从这里读。
+                let plan_stage: crate::controller::SharedPlanStage = Arc::new(
+                    parking_lot::RwLock::new(crate::controller::PlanStage::Normal),
+                );
                 let result = find_tasks_fence(&src).and_then(|(_, tasks)| {
                     crate::controller::submit_plan_proposal(
                         &serde_json::json!({ "tasks": tasks }),
                         // 本步没有 speaker；role_id 只用于 plan_id 与
                         // 前端展示，用 workflow 名标识来源。
                         &format!("workflow:{}", wf.name),
-                        &Arc::new(parking_lot::RwLock::new(
-                            crate::controller::PlanStage::Normal,
-                        )),
+                        &plan_stage,
                         &ctx.cwd,
                         ctx.session_id.as_deref().unwrap_or(""),
                         &ctx.event_tx,
@@ -14003,6 +14096,40 @@ async fn run_workflow_serial(
                 });
                 match result {
                     Ok(summary) => {
+                        // 大纲草案落盘（`outline_draft_from`）：真实 task id 要
+                        // 等用户导入才分配，所以这里只按 plan_id 存草案，导入端
+                        // 回填 id 后再发布（布局见 `outline_draft_path`）。
+                        // 写失败必须让 step 失败——草案静默缺失 = 用户导入了任务
+                        // 却永远拿不到大纲。
+                        if let Some(draft_key) = &step.outline_draft_from {
+                            let plan_id = match &*plan_stage.read() {
+                                crate::controller::PlanStage::PendingApproval { plan_id } => {
+                                    plan_id.clone()
+                                }
+                                other => {
+                                    return WfOutcome::step_failed(
+                                        &step.id,
+                                        format!(
+                                            "step '{}': 机械提交返回成功，但 plan 阶段不是 \
+                                             PendingApproval（实为 {other:?}），无法按 plan_id \
+                                             落盘大纲草案",
+                                            step.id
+                                        ),
+                                    )
+                                }
+                            };
+                            let draft = vars.get(draft_key).cloned().unwrap_or_default();
+                            if let Err(e) = write_outline_draft(&ctx.cwd, &plan_id, &draft) {
+                                return WfOutcome::step_failed(
+                                    &step.id,
+                                    format!(
+                                        "step '{}': 大纲草案（{draft_key}，plan_id={plan_id}）\
+                                         落盘失败：{e}",
+                                        step.id
+                                    ),
+                                );
+                            }
+                        }
                         let _ = ctx.event_tx.send(ChatEvent::WorkflowTurn {
                             wf_id: wf_id.to_string(),
                             step_id: step.id.clone(),
@@ -19837,7 +19964,10 @@ task = "t"
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["breakdown", "outline_draft", "gate", "submit"]);
         // 两条门禁必须各自落在该落的步上：清单形状管草案，大纲对账管大纲步。
-        assert!(wf.steps[0].require_needs_split, "breakdown 必须校验 needs_split");
+        assert!(
+            wf.steps[0].require_needs_split,
+            "breakdown 必须校验 needs_split"
+        );
         assert!(
             wf.steps[1].require_outline_against_plan,
             "outline_draft 必须与清单对账"
@@ -19848,6 +19978,149 @@ task = "t"
             wf.steps[1].tools.is_empty(),
             "outline_draft 不该自己声明 tools（否则盖掉角色的 read）"
         );
+        // 提交步必须把大纲草案按 plan_id 落盘：真实 task id 要到导入才分配，
+        // 少了这一步导入端就只剩任务清单、大纲正文整个丢失。
+        assert_eq!(
+            wf.steps[3].outline_draft_from.as_deref(),
+            Some("outline"),
+            "submit 必须声明 outline_draft_from = \"outline\""
+        );
+    }
+
+    /// 验收：`outline_draft_from` 的配置期约束——必须与本步
+    /// `submit_plan_from` 成对出现（plan_id 由那次提案产出），且源 key 只能
+    /// 指向**更早** step 的 output_key（同 step / 未来 step 在串行执行下永远
+    /// 是空串，落盘的会是一份空大纲）。
+    ///
+    /// 为什么这就够了（不跑 runner）：真正落盘只依赖两个纯函数——
+    /// [`outline_draft_path`]（下面单独测）与 `write_outline_draft`（顺手测
+    /// 原子写）；runner 分支只是「读 vars → 读 plan_stage → 调 helper」。
+    /// 起一条完整 workflow 需要 mock provider，收益全在测 mock 上。
+    #[test]
+    fn outline_draft_from_requires_submit_and_earlier_source() {
+        let wf = |body: &str| -> WorkflowDef { toml::from_str(body).expect("解析") };
+        // draft → outline_doc → submit：submit 的正常源 `outline` 确实更早。
+        let three_steps = |submit_extra: &str| {
+            format!(
+                r#"
+name = "t"
+[[steps]]
+id = "draft"
+speakers = ["pm"]
+output_key = "draft"
+[[steps]]
+id = "outline_doc"
+speakers = ["pm"]
+output_key = "outline"
+[[steps]]
+id = "submit"
+submit_plan_from = "draft"
+{submit_extra}"#
+            )
+        };
+
+        // 正常组合：源是更早 step 的 output_key。
+        wf(&three_steps("outline_draft_from = \"outline\"\n"))
+            .validate()
+            .expect("合法组合");
+
+        // 少了 submit_plan_from：没有 plan_id 可写。
+        let err = wf(r#"
+name = "t"
+[[steps]]
+id = "draft"
+speakers = ["pm"]
+output_key = "outline"
+[[steps]]
+id = "submit"
+outline_draft_from = "outline"
+"#)
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("outline_draft_from"), "{err}");
+        assert!(err.contains("submit_plan_from"), "{err}");
+
+        // 指向更晚的 step：串行执行到这里时它还没跑，拿到的是空串。
+        let err = wf(r#"
+name = "t"
+[[steps]]
+id = "draft"
+speakers = ["pm"]
+output_key = "draft"
+[[steps]]
+id = "submit"
+submit_plan_from = "draft"
+outline_draft_from = "outline"
+[[steps]]
+id = "outline_doc"
+speakers = ["pm"]
+output_key = "outline"
+"#)
+        .validate()
+        .unwrap_err();
+        assert!(err.contains("outline_draft_from"), "{err}");
+        assert!(err.contains("更早"), "{err}");
+    }
+
+    /// 验收：草案路径布局固定为 `<cwd>/.latte/outline-drafts/<plan_id>.md`，
+    /// 且 plan_id 不能带路径分量（`../x`、`a/b`、`.hidden` 全拒）——导入端
+    /// 会拿同一个 plan_id 拼同一个路径，穿越的名字等于把草案写/读到别处。
+    ///
+    /// 与 `TaskStore::imported_plan_marker` 同规则（单一 Normal 分量）再加一条
+    /// 「不得以 `.` 开头」：`.hidden` 是隐藏文件，导入端按 `<plan_id>.md` 取用
+    /// 时最容易漏。
+    #[test]
+    fn outline_draft_path_rejects_unsafe_plan_id() {
+        let cwd = std::path::Path::new("/tmp/proj");
+        for bad in ["../x", "a/b", ".hidden", "..", "", "/abs", "a/"] {
+            assert!(
+                outline_draft_path(cwd, bad).is_err(),
+                "plan_id {bad:?} 必须被拒"
+            );
+        }
+        assert_eq!(
+            outline_draft_path(cwd, "plan-1").expect("安全 id"),
+            std::path::PathBuf::from("/tmp/proj/.latte/outline-drafts/plan-1.md")
+        );
+        // 引擎真实的 plan_id 形状（`next_plan_id` = plan-<role>-<seq>，workflow
+        // 来源的 role 里带 `:`）必须照样安全：Unix 下 `:` 不是路径分隔符。
+        assert_eq!(
+            outline_draft_path(cwd, "plan-workflow:outline_split-7").expect("安全 id"),
+            std::path::PathBuf::from(
+                "/tmp/proj/.latte/outline-drafts/plan-workflow:outline_split-7.md"
+            )
+        );
+    }
+
+    /// 验收：草案落盘是原子的——写完后文件可读、目录里不残留 `.md.tmp`，
+    /// 重复写同一 plan_id 覆盖而不是追加。
+    #[test]
+    fn write_outline_draft_is_atomic_and_rerunnable() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = write_outline_draft(dir.path(), "plan-1", "第一版\n").expect("写");
+        assert_eq!(
+            path,
+            dir.path().join(".latte/outline-drafts/plan-1.md"),
+            "落盘位置就是导入端要读的位置"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("读"), "第一版\n");
+
+        // 第二次写：覆盖，不追加，也不留 tmp。
+        write_outline_draft(dir.path(), "plan-1", "第二版\n").expect("重写");
+        assert_eq!(std::fs::read_to_string(&path).expect("读"), "第二版\n");
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path().join(".latte/outline-drafts"))
+            .expect("读目录")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "不该残留 tmp 文件：{leftovers:?}");
+
+        // 非法 plan_id 不落任何文件。
+        assert!(write_outline_draft(dir.path(), "../escape", "x").is_err());
+        assert!(!dir
+            .path()
+            .join(".latte/outline-drafts/../escape.md")
+            .exists());
     }
 
     /// 验收：task_refine 是「草案 → 评审 → 终审门 → important 定向修补

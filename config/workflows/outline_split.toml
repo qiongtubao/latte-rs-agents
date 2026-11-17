@@ -82,3 +82,7 @@ require = ["VERDICT:"]
 id = "submit"
 description = "引擎机械提交：抽 tasks JSON 提 plan，用户勾选后导入看板"
 submit_plan_from = "draft"
+# 真实 task id 要到用户导入时才分配，所以提交成功后把大纲草案按 plan_id
+# 落盘（`<cwd>/.latte/outline-drafts/<plan_id>.md`）；导入端凭 plan_id 找回
+# 草案、把 tmp: 锚回填成真实 id 后再发布。布局见 `workflow::outline_draft_path`。
+outline_draft_from = "outline"

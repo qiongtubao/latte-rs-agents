@@ -346,6 +346,9 @@ pub fn def_from_form(form: &WorkflowForm) -> WorkflowDef {
                 require_citations_observed: false,
                 patch_from: None,
                 submit_plan_from: None,
+                // 大纲草案按 plan_id 落盘同样只在 TOML 权威版可配；
+                // 表单编辑器的试运行不写草案（None = 现状行为）。
+                outline_draft_from: None,
                 // 学习章节号校验 / 结构化裁决 / 机械终审门 / 收敛度量 /
                 // 历史反馈同样只在 TOML 权威版可配（零值 = 现状行为）。
                 require_learn_chapters: false,
