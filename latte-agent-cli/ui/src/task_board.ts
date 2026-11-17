@@ -586,7 +586,11 @@ export function mountTaskBoard(opts: {
       const exp = el("button", "tb-btn tb-btn-ghost tb-btn-sm", "导出 HTML") as HTMLButtonElement;
       exp.addEventListener("click", async (e) => {
         e.stopPropagation();
-        await exportOutlineHtml(task.effective_outline_path!);
+        try {
+          await exportOutlineHtml(task.effective_outline_path!);
+        } catch (err) {
+          toast(`导出大纲失败: ${(err as Error).message}`);
+        }
       });
       v.appendChild(exp);
       row.appendChild(v);
