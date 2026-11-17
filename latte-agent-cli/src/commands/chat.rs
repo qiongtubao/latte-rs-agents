@@ -2682,6 +2682,7 @@ async fn cli_plan_proposed_import(
         plan_id: Some(plan_id.to_string()),
         parent_id: None,
         session_id: None,
+        outline_draft_path: None,
     };
     match latte_agent_ui_server::tasks::import_tasks_standalone(&cwd, &req) {
         Ok(created) => {

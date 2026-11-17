@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use latte_agent_core::outline::{parse_outline, rebind_tmp_ids, render_outline, validate_unique_ids};
 use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
 use latte_ai::params::GenerateParams;
 use serde::{Deserialize, Serialize};
@@ -1181,6 +1182,11 @@ pub struct ImportTasksRequest {
     /// （看板「拆分子任务」创建的 session → 父任务）。
     #[serde(default)]
     pub session_id: Option<String>,
+    /// 大纲草案路径（相对项目根）。缺省时若 `plan_id` 命中
+    /// `.latte/outline-drafts/<plan_id>.md` 则自动取用——那是 workflow 提交
+    /// plan 时落下的草案，导入时才有真实 id 可回填。
+    #[serde(default)]
+    pub outline_draft_path: Option<String>,
 }
 
 /// 导入的单个任务：除 `title` 外全部可选；`subtasks` 可任意深度嵌套。
@@ -1713,7 +1719,230 @@ fn import_tasks_into_inner(
             ));
         }
     }
+    // 第三趟：把 workflow 落下的大纲草案定稿（必须在 `created` / `by_title`
+    // 都齐了之后——草案的锚点是 `tmp:<标题>`，真实 id 此刻才存在）。
+    finalize_outline_from_draft(store, cwd, req, &created, &by_title)?;
     Ok(created)
+}
+
+/// 大纲草案里"还没有真实 id 的根"的哨兵（见 `prompts/outline_writer.md`）。
+const OUTLINE_ROOT_SENTINEL: &str = "LAT-ROOT";
+
+/// 导入收尾：把 workflow 提交 plan 时落下的大纲草案定稿。
+///
+/// 为什么必须在这里：草案里的锚点是 `tmp:<标题>`，真实 task id 只有在整批
+/// 任务建完（`created` / `by_title` 齐备）之后才存在。为什么必须在事务内：
+/// 发布一份锚点错乱的大纲、或者留下半个看板，都比整单失败难收拾。
+fn finalize_outline_from_draft(
+    store: &mut TaskStore,
+    cwd: &Path,
+    req: &ImportTasksRequest,
+    created: &[String],
+    by_title: &HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let Some(draft_path) = resolve_outline_draft(cwd, req)? else {
+        return Ok(());
+    };
+    let raw = std::fs::read_to_string(&draft_path)
+        .map_err(|e| format!("读取大纲草案 {} 失败：{e}", draft_path.display()))?;
+    let mut doc = parse_outline(&raw).map_err(|e| {
+        // 解析错误必须带上路径和行号：用户手改过大纲时，只有这两样能定位。
+        format!("大纲草案 {} 解析失败：{e}", draft_path.display())
+    })?;
+
+    // `by_title` 是 `import_one` 用 `title.to_lowercase()` 建的索引，而
+    // `rebind_tmp_ids` 查表用的是锚点里 trim 过的 `tmp:<标题>`。两边都按小写
+    // 比较——英文标题在大纲里大小写不一致（`tmp:API Layer` vs 任务标题
+    // "Api Layer"）也必须绑上，因为导入侧的索引本来就是大小写无关的。
+    let title_to_id: HashMap<String, String> = by_title
+        .iter()
+        .map(|(title, ids)| {
+            // 同名标题多条时取先创建的那条：清单重名在 plan 机械校验阶段
+            // 就被拒了，能走到这里只可能是历史数据，按声明顺序取第一条
+            // 最可预期（绑错的风险由下面的唯一性校验兜住）。
+            (title.clone(), ids[0].clone())
+        })
+        .collect();
+    let unbound = rebind_tmp_ids(&mut doc, &title_to_id);
+    if !unbound.is_empty() {
+        // 绑不上就整单失败：带着 `tmp:` 发布出去，下游同步/学习链接会把
+        // 锚点认成不存在的任务，而"半个看板"比没有更糟。
+        return Err(format!(
+            "大纲里有未绑定的临时锚：{}（对应标题在本次导入的任务里不存在）",
+            unbound
+                .iter()
+                .map(|t| format!("tmp:{t}"))
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    // 契约：rebind 之后必查唯一性（两个临时标题可能绑到同一个真实 id）。
+    validate_unique_ids(&doc).map_err(|e| {
+        format!(
+            "大纲草案 {} 绑定真实 id 后不唯一：{e}",
+            draft_path.display()
+        )
+    })?;
+
+    let rel = format!("docs/outlines/{}.md", outline_slug(&doc.title)?);
+    // 谁挂 `outline_path`：大纲的根就是"被拆的那个大任务"。
+    // - 根锚是已有任务 id（拆分前就存在的那个任务）→ **只挂它**：它的子孙
+    //   全部靠 `effective_outline_path` 的祖先链解析，多挂反而让"这份大纲
+    //   属于谁"变含糊；
+    // - 根锚是 `LAT-ROOT`，或是一个本项目里根本不存在的 id（拆分从一条
+    //   描述起步，没有可挂的根）→ 没有单一根，必须给**每个顶层新任务**都
+    //   挂上，否则各子树沿祖先链都走不到这份大纲。
+    let root_anchor = doc.task_id.trim();
+    let existing_root = if root_anchor == OUTLINE_ROOT_SENTINEL {
+        None
+    } else {
+        store.get(root_anchor).map(|_| root_anchor.to_string())
+    };
+    let owners: Vec<String> = match existing_root {
+        Some(id) => vec![id],
+        None => {
+            let mut owners: Vec<String> = created
+                .iter()
+                .filter(|id| store.get(id).is_some_and(|t| t.parent_id.is_none()))
+                .cloned()
+                .collect();
+            if owners.is_empty() {
+                // 拆分导入（`req.parent_id` 已指定）时新任务全是那个父任务的
+                // 子任务，"顶层新任务"为空；这时挂父任务才对——整棵子树靠
+                // 祖先链解析，否则刚发布的大纲没有任何任务指向它。
+                let parent = req
+                    .parent_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty());
+                if let Some(parent) = parent {
+                    if store.get(parent).is_some() {
+                        owners.push(parent.to_string());
+                    }
+                }
+            }
+            owners
+        }
+    };
+
+    // 先写 tmp、最后 rename：中途失败不会留下"已发布但锚点是临时/旧 id"的
+    // 大纲（同 `TaskStore::persist` 的 tmp+rename 约定）。
+    let final_path = cwd.join(&rel);
+    let dir = final_path
+        .parent()
+        .ok_or_else(|| format!("大纲发布路径 {} 没有父目录", final_path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let tmp = final_path.with_extension("md.tmp");
+    std::fs::write(&tmp, render_outline(&doc))
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    for id in &owners {
+        // 草案是最新的权威：已有 `outline_path`（上一轮拆分留下的）也要覆盖，
+        // 否则任务会一直指向那份旧文档。
+        if let Some(task) = store.get_mut(id) {
+            task.outline_path = Some(rel.clone());
+        }
+        if let Err(e) = store.persist(id) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("任务 {id} 的 outline_path 落盘失败：{e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename {}: {e}", final_path.display()));
+    }
+    Ok(())
+}
+
+/// 本次导入要定稿的大纲草案；`None` = 这次导入没有大纲（正常路径）。
+fn resolve_outline_draft(cwd: &Path, req: &ImportTasksRequest) -> Result<Option<PathBuf>, String> {
+    if let Some(rel) = req
+        .outline_draft_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let path = resolve_project_relative(cwd, rel)?;
+        if !path.is_file() {
+            // 显式点名了文件却读不到：静默跳过等于把"大纲丢了"藏起来。
+            return Err(format!(
+                "大纲草案路径 {rel:?} 不存在（解析为 {}）",
+                path.display()
+            ));
+        }
+        return Ok(Some(path));
+    }
+    let Some(plan_id) = req
+        .plan_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    else {
+        return Ok(None);
+    };
+    // 路径构造复用 core 的落盘契约（workflow 提交 plan 时用同一份布局）；
+    // plan_id 不安全（`..`、`a/b`、隐藏文件）时那边直接拒绝——那种 id 本来
+    // 就不会有草案文件，按"没有大纲"处理，不必让导入失败。
+    let Ok(path) = latte_agent_core::workflow::outline_draft_path(cwd, plan_id) else {
+        return Ok(None);
+    };
+    Ok(path.is_file().then_some(path))
+}
+
+/// 项目相对路径 → 绝对路径。绝对路径、`..`、根前缀一律拒绝：草案内容会被
+/// 原样发布成项目文档，路径不受限等于任意文件读取 + 任意位置写入。
+fn resolve_project_relative(cwd: &Path, rel: &str) -> Result<PathBuf, String> {
+    let path = Path::new(rel);
+    if path.is_absolute() {
+        return Err(format!(
+            "大纲草案路径 {rel:?} 必须是项目根下的相对路径（不允许绝对路径）"
+        ));
+    }
+    for comp in path.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(format!(
+                    "大纲草案路径 {rel:?} 不允许 `..`（必须留在项目根内）"
+                ))
+            }
+        }
+    }
+    Ok(cwd.join(path))
+}
+
+/// 由大纲 title 派生 `docs/outlines/<slug>.md` 的文件名。
+///
+/// 只折**危险/难用**的字符：路径分隔符与空白 → `-`。中文标题必须原样保留，
+/// 所以不能照搬"非字母数字 → -"那种 slug 规则（整条中文标题会被抹成 `-`）。
+/// 其余情况（空串、`.`、`..`、结果还带分隔符）一律拒绝——title 是模型写的，
+/// 原样拼进路径就能把 `docs/outlines/` 变成可穿越的前缀。
+fn outline_slug(title: &str) -> Result<String, String> {
+    let mut slug = String::with_capacity(title.len());
+    for ch in title.trim().chars() {
+        if ch == '/' || ch == '\\' || ch.is_whitespace() {
+            // 连续空白/多个分隔符折叠成一个 `-`，免得出现 `a---b.md`。
+            if !slug.ends_with('-') {
+                slug.push('-');
+            }
+        } else if ch.is_control() {
+            // 控制字符在文件名里不可见，NUL 还会让写盘直接失败。
+            continue;
+        } else {
+            slug.push(ch);
+        }
+    }
+    let mut slug = slug.trim_matches('-');
+    // 前导 `.`/`-` 全部剥掉：剥完还以 `.` 开头就是隐藏文件（或 `..`），
+    // 而 `docs/outlines/` 里的文档是给人看的，不该藏起来。
+    while let Some(rest) = slug.strip_prefix(|c| c == '.' || c == '-') {
+        slug = rest;
+    }
+    if slug.is_empty() || slug == "." || slug == ".." || slug.contains('/') || slug.contains('\\') {
+        return Err(format!(
+            "大纲 title {title:?} 无法生成安全的文件名（slug 为空 / `.` / 含路径分隔符）"
+        ));
+    }
+    Ok(slug.to_string())
 }
 
 fn run_import_transaction<T>(
@@ -4765,6 +4994,203 @@ mod tests {
                 .outline_path,
             None,
             "重载后也不得凭空出现大纲路径"
+        );
+    }
+
+    /// 写一份 `.latte/outline-drafts/<plan_id>.md`（workflow 提交 plan 时落盘的
+    /// 位置），返回它的路径。
+    fn write_draft(cwd: &Path, plan_id: &str, body: &str) -> PathBuf {
+        let path = cwd
+            .join(".latte/outline-drafts")
+            .join(format!("{plan_id}.md"));
+        std::fs::create_dir_all(path.parent().expect("父目录")).expect("create draft dir");
+        std::fs::write(&path, body).expect("write draft");
+        path
+    }
+
+    fn import_req(v: serde_json::Value) -> ImportTasksRequest {
+        serde_json::from_value(v).expect("请求体可解析")
+    }
+
+    /// 大纲草案必须**在导入时定稿**：`tmp:<标题>` 锚换成真实 id、发布到
+    /// `docs/outlines/<slug>.md`、并把挂载任务的 `outline_path` 指过去。
+    /// 缺了这一步，用户勾选导入后拿到的是「有任务树、没有大纲」——草案随
+    /// session 一起烂在 `.latte/outline-drafts/` 里。
+    #[test]
+    fn import_finalizes_outline_from_plan_draft() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p1",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: outline demo\n---\n\
+             # outline demo\n\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- section:body:start -->\n## 概述\n总纲\n<!-- section:body:end -->\n\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:模块一 needs_split -->\n\
+             ### 模块一\n\
+             <!-- section:body:start -->\n模块一的说明\n<!-- section:body:end -->\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p1",
+            "tasks": [{ "title": "模块一", "needs_split": true }]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("导入成功");
+        assert_eq!(created.len(), 1);
+        let id = created[0].clone();
+        assert!(id.starts_with("LAT-"), "真实 id 形状：{id}");
+
+        // slug 由草案 frontmatter 的 title 派生。
+        let published = cwd.join("docs/outlines/outline-demo.md");
+        let text = std::fs::read_to_string(&published).expect("大纲必须发布到 docs/outlines/");
+        assert!(!text.contains("tmp:"), "终稿里不许留临时锚：\n{text}");
+        assert!(text.contains(&id), "锚点必须换成真实 id：\n{text}");
+        assert_eq!(
+            store.get(&id).expect("任务存在").outline_path.as_deref(),
+            Some("docs/outlines/outline-demo.md"),
+            "LAT-ROOT 草案 → 每个顶层新任务都挂上 outline_path"
+        );
+    }
+
+    /// 有锚点绑不上就是**整单拒绝**：发布一份还带 `tmp:` 的大纲等于把失效
+    /// 锚点交给下游（同步、学习链接都会认错节点），而半个看板比没有更糟。
+    #[test]
+    fn import_rejects_unbound_tmp_anchor() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p2",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: 未绑定\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:模块二 -->\n### 模块二\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p2",
+            "tasks": [{ "title": "模块一" }]
+        }));
+        let err = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect_err("未绑定锚必须整单失败");
+        assert!(err.contains("tmp:模块二"), "报错要点名未绑定的锚：{err}");
+        assert!(store.list().is_empty(), "回滚后看板必须为空：{:?}", store.list());
+        assert!(
+            !cwd.join("docs/outlines").exists(),
+            "失败路径不得碰 docs/outlines/"
+        );
+    }
+
+    /// 没有草案（手工导入 / 旧版 workflow）是正常路径：照常建任务，只是没有大纲。
+    #[test]
+    fn import_without_draft_leaves_no_outline() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let req = import_req(serde_json::json!({
+            "plan_id": "no-such-plan",
+            "tasks": [{ "title": "plain" }]
+        }));
+        run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("缺草案不该让导入失败");
+        let all = store.list();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].outline_path, None, "没有草案就不该有 outline_path");
+        assert!(
+            !cwd.join("docs/outlines").exists(),
+            "没有草案就不该创建 docs/outlines/"
+        );
+    }
+
+    /// 显式 `outline_draft_path`：项目相对路径可用，绝对路径 / `..` 一律拒绝
+    /// （草案内容会被原样发布成项目文档，路径不受限等于任意文件读取）。
+    #[test]
+    fn import_outline_explicit_draft_path_is_confined_to_project() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("scratch")).expect("dir");
+        std::fs::write(
+            cwd.join("scratch/draft.md"),
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: explicit\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:子项 -->\n### 子项\n\
+             <!-- children:end -->\n",
+        )
+        .expect("write");
+        let req = import_req(serde_json::json!({
+            "outline_draft_path": "scratch/draft.md",
+            "tasks": [{ "title": "子项" }]
+        }));
+        let created = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("显式路径导入成功");
+        assert_eq!(
+            store
+                .get(&created[0])
+                .expect("任务存在")
+                .outline_path
+                .as_deref(),
+            Some("docs/outlines/explicit.md")
+        );
+
+        // 绝对路径与 `..` 穿越都必须在读文件之前被拒。
+        let (dir2, mut store2) = tmp_store();
+        let cwd2 = dir2.path();
+        for bad in ["/etc/passwd", "../outside.md", "scratch/../../outside.md"] {
+            let req = import_req(serde_json::json!({
+                "outline_draft_path": bad,
+                "tasks": [{ "title": "x" }]
+            }));
+            let err = run_import_transaction(&mut store2, |s| {
+                import_tasks_into_inner(s, cwd2, &req)
+            })
+            .expect_err("越界路径必须被拒");
+            assert!(err.contains("大纲草案路径"), "报错要说明是草案路径问题：{err}");
+        }
+        assert!(store2.list().is_empty(), "越界路径不得留下任何任务");
+    }
+
+    /// slug 只能是一个普通文件名：草案的 title 是模型写的，`../..` 之类
+    /// 一旦原样拼进路径，发布就变成了往项目外写文件。
+    #[test]
+    fn outline_draft_slug_is_path_safe() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p3",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: ../../etc/x\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:项的 -->\n### 项的\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p3",
+            "tasks": [{ "title": "项的" }]
+        }));
+        run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect("导入成功");
+
+        let out_dir = cwd.join("docs/outlines");
+        let written: Vec<PathBuf> = std::fs::read_dir(&out_dir)
+            .expect("docs/outlines/ 必须存在")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(written.len(), 1, "只该发布一份大纲：{written:?}");
+        let canonical_dir = out_dir.canonicalize().expect("canonical");
+        let canonical_file = written[0].canonicalize().expect("canonical");
+        assert_eq!(
+            canonical_file.parent(),
+            Some(canonical_dir.as_path()),
+            "发布路径不得逃出 docs/outlines/：{}",
+            canonical_file.display()
+        );
+        assert!(
+            !cwd.join("../etc/x.md").exists(),
+            "不得在项目外写出文件"
         );
     }
 
