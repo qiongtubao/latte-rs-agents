@@ -319,6 +319,13 @@ pub struct TaskStore {
     /// 文档，回滚后就会留下没有任何任务指向的孤儿大纲。成功提交时清空，
     /// 否则下一次失败的导入会拿旧记录去删上一份文档。
     import_published_outline: Option<PublishedOutline>,
+    /// 本次导入改写过的**已存在**任务的 `(id, 导入前 outline_path)`。
+    ///
+    /// 为什么单独记：拆分时大纲挂在"被拆的那个大任务"上，它比本次导入更早
+    /// 存在，不在 `rollback_import` 的 seq 区间里——只靠 seq 回滚，它的
+    /// `<id>.json` 会一直指向一份已被删掉的文档（重启后板上是个打不开的
+    /// 大纲链接）。必须在改动任何任务之前记下来，回滚时原地还原。
+    import_outline_owners: Vec<(String, Option<String>)>,
 }
 
 /// 导入期发布的大纲文档的撤销信息。
@@ -438,6 +445,7 @@ impl TaskStore {
                 s
             },
             import_published_outline: None,
+            import_outline_owners: Vec::new(),
         })
     }
 
@@ -552,6 +560,24 @@ impl TaskStore {
         self.meta = snapshot.meta;
         self.tasks = snapshot.tasks;
         self.notion_dirty = snapshot.notion_dirty;
+
+        // 已存在的挂载任务（拆分前就有的大任务）不在上面的 seq 区间里：它的
+        // `outline_path` 被本次导入改写并向盘落过，必须按快照值原地还原**并
+        // 重写盘**，否则重启后板上留着一个指向已删除文档的悬空链接。放在恢复
+        // `self.tasks` 之后：本次新建的任务此刻已不在索引里，自然跳过（它们的
+        // 文件上面已删掉）。
+        for (id, previous) in std::mem::take(&mut self.import_outline_owners) {
+            let Some(task) = self.tasks.get_mut(&id) else {
+                continue;
+            };
+            task.outline_path = previous;
+            let restored = self.tasks.get(&id).cloned().expect("上面刚改");
+            // 用 `save_task` 而不是 `persist`：回滚是把状态退回导入前，不需要
+            // 向 Notion 推一遍（推了等于把"没发生过的变更"发出去）。
+            if let Err(error) = self.save_task(&restored) {
+                errors.push(format!("restore {id} outline_path: {error}"));
+            }
+        }
 
         if errors.is_empty() {
             Ok(())
@@ -1789,22 +1815,34 @@ fn finalize_outline_from_draft(
     // 拿它建表会让 `tmp:api layer` 悄悄绑到 "API Layer"，把本该被拒的错锚
     // 放进来。大纲门（`require_outline_against_plan`）要求锚点标题与任务
     // 标题逐字相同，所以大小写不同就是真实的不匹配，必须报错让用户改。
+    //
+    // 同名任务先拒：一个锚点绑到"第一个同名任务"并不会产生重复 id，下面的
+    // `validate_unique_ids` 抓不到，结果是用户勾了三个「模块一」却只有第一个
+    // 拿到大纲节点——静默绑错的典型形态。清单里的重名本该在 plan 机械校验
+    // 阶段被拒，能走到这里也要响亮失败而不是猜。
+    let mut title_counts: HashMap<&str, usize> = HashMap::new();
+    for id in created {
+        if let Some(task) = store.get(id) {
+            *title_counts.entry(task.title.as_str()).or_default() += 1;
+        }
+    }
+    if let Some((title, count)) = title_counts.iter().find(|(_, n)| **n > 1) {
+        return Err(format!(
+            "本次导入有 {count} 个同名任务「{title}」，大纲锚点无法唯一绑定——请先改成唯一标题"
+        ));
+    }
     let mut title_to_id: HashMap<String, String> = HashMap::new();
     for id in created {
-        let Some(task) = store.get(id) else { continue };
-        // 同名标题只留先创建的那条：清单重名在 plan 机械校验阶段就被拒了，
-        // 能走到这里只可能是历史数据，按创建顺序取第一条最可预期（绑错的
-        // 风险由下面的唯一性校验兜住）。
-        title_to_id
-            .entry(task.title.clone())
-            .or_insert_with(|| id.clone());
+        if let Some(task) = store.get(id) {
+            title_to_id.insert(task.title.clone(), id.clone());
+        }
     }
     let unbound = rebind_tmp_ids(&mut doc, &title_to_id);
     if !unbound.is_empty() {
         // 绑不上就整单失败：带着 `tmp:` 发布出去，下游同步/学习链接会把
         // 锚点认成不存在的任务，而"半个看板"比没有更糟。
         return Err(format!(
-            "大纲里有未绑定的临时锚：{}（对应标题在本次导入的任务里不存在）",
+            "大纲里的临时锚没有对应任务：{}（锚点标题与任务标题需逐字匹配，注意大小写/空格）",
             unbound
                 .iter()
                 .map(|t| format!("tmp:{t}"))
@@ -1861,8 +1899,11 @@ fn finalize_outline_from_draft(
         }
     };
 
-    // 先写 tmp、最后 rename：中途失败不会留下"已发布但锚点是临时/旧 id"的
-    // 大纲（同 `TaskStore::persist` 的 tmp+rename 约定）。
+    // 发布顺序：**先**把文档 rename 到位，**再**让任务指向它。
+    // - 文档在、没有任务指向 = 只是多一份会被下次导入覆盖的文件，可恢复；
+    // - 反过来（任务先指向、rename 失败）就是悬空链接，板上永远打不开大纲。
+    // 写盘本身走 tmp+rename（同 `TaskStore::persist` 的约定），中途失败不会
+    // 留下半篇文档。
     let final_path = cwd.join(&rel);
     let dir = final_path
         .parent()
@@ -1874,9 +1915,26 @@ fn finalize_outline_from_draft(
         .is_file()
         .then(|| std::fs::read_to_string(&final_path).ok())
         .flatten();
+    // 记下挂载任务导入前的 `outline_path`（包含"原本指向另一份大纲"的情况），
+    // 必须在改动任何任务**之前**记：已存在的挂载任务（拆分前就有的大任务）
+    // 不在回滚的 seq 区间里，只有这份快照能让它退回原值。
+    store.import_outline_owners = owners
+        .iter()
+        .filter_map(|id| store.get(id).map(|t| (id.clone(), t.outline_path.clone())))
+        .collect();
     let tmp = final_path.with_extension("md.tmp");
     std::fs::write(&tmp, render_outline(&doc))
         .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("rename {}: {e}", final_path.display()));
+    }
+    // 登记撤销信息放在 rename 之后、persist 之前：从这一刻起"文档已发布"，
+    // 后续任何失败都必须由 `rollback_import` 把它删掉/还原。
+    store.import_published_outline = Some(PublishedOutline {
+        path: final_path,
+        previous,
+    });
     for id in &owners {
         // 草案是最新的权威：已有 `outline_path`（上一轮拆分留下的）也要覆盖，
         // 否则任务会一直指向那份旧文档。
@@ -1884,20 +1942,9 @@ fn finalize_outline_from_draft(
             task.outline_path = Some(rel.clone());
         }
         if let Err(e) = store.persist(id) {
-            let _ = std::fs::remove_file(&tmp);
             return Err(format!("任务 {id} 的 outline_path 落盘失败：{e}"));
         }
     }
-    if let Err(e) = std::fs::rename(&tmp, &final_path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("rename {}: {e}", final_path.display()));
-    }
-    // 登记撤销信息：后续步骤（todo 状态落盘、plan marker）失败时由
-    // `rollback_import` 把这份文档删掉/还原，避免留下孤儿大纲。
-    store.import_published_outline = Some(PublishedOutline {
-        path: final_path,
-        previous,
-    });
     Ok(())
 }
 
@@ -1927,12 +1974,13 @@ fn resolve_outline_draft(cwd: &Path, req: &ImportTasksRequest) -> Result<Option<
     else {
         return Ok(None);
     };
-    // 路径构造复用 core 的落盘契约（workflow 提交 plan 时用同一份布局）；
-    // plan_id 不安全（`..`、`a/b`、隐藏文件）时那边直接拒绝——那种 id 本来
-    // 就不会有草案文件，按"没有大纲"处理，不必让导入失败。
-    let Ok(path) = latte_agent_core::workflow::outline_draft_path(cwd, plan_id) else {
-        return Ok(None);
-    };
+    // 路径构造复用 core 的落盘契约（workflow 提交 plan 时用同一份布局）。
+    // plan_id 不安全（`..`、`a/b`、隐藏文件）时必须报错而不是当成"没有大纲"：
+    // workflow 在**写**草案时对同一个 id 是响亮拒绝的，读的一端静默跳过会让
+    // 用户拿到"任务进板了、大纲凭空消失"的谎——两个端点对同一个 id 必须同一
+    // 个态度。
+    let path = latte_agent_core::workflow::outline_draft_path(cwd, plan_id)
+        .map_err(|e| format!("plan_id 不能安全地作为文件名：{e}"))?;
     Ok(path.is_file().then_some(path))
 }
 
@@ -1986,8 +2034,10 @@ fn outline_slug(title: &str) -> Result<String, String> {
         slug = rest;
     }
     if slug.is_empty() || slug == "." || slug == ".." || slug.contains('/') || slug.contains('\\') {
+        // 把算出来的 slug 也带上：光看 title 有时看不出为什么被拒
+        // （例如 title 全是分隔符/空白，slug 直接空了）。
         return Err(format!(
-            "大纲 title {title:?} 无法生成安全的文件名（slug 为空 / `.` / 含路径分隔符）"
+            "大纲 title {title:?} 无法生成安全的文件名：算出的 slug {slug:?} 为空、是 `.`/`..` 或含路径分隔符"
         ));
     }
     Ok(slug.to_string())
@@ -2001,14 +2051,18 @@ fn run_import_transaction<T>(
     match operation(store) {
         Ok(value) => {
             // 提交成功：已发布的大纲就是最终产物，清掉撤销信息——否则下一次
-            // 失败的导入会拿这条旧记录去删上一份好好的文档。
+            // 失败的导入会拿这条旧记录去删上一份好好的文档 / 把这条记录的
+            // outline_path 退回旧值。
             store.import_published_outline = None;
+            store.import_outline_owners.clear();
             Ok(value)
         }
-        // 没有任何落盘副作用（next_seq 未推进、也没发布过大纲）时不必回滚。
+        // 没有任何落盘副作用（next_seq 未推进、也没发布过大纲/改过挂载任务）
+        // 时不必回滚。
         Err(error)
             if store.meta.next_seq == snapshot.meta.next_seq
-                && store.import_published_outline.is_none() =>
+                && store.import_published_outline.is_none()
+                && store.import_outline_owners.is_empty() =>
         {
             Err(error)
         }
@@ -5346,6 +5400,120 @@ mod tests {
             leftovers.is_empty(),
             "回滚必须删掉已发布的大纲，实际残留：{leftovers:?}"
         );
+    }
+
+    /// 大纲挂在**已存在**的任务上（拆分前就有的大任务）时，回滚必须把这个
+    /// 任务的 `outline_path` 原地还原**并落盘**：它不在导入的 seq 区间里，
+    /// 原来的回滚逻辑管不到，重启后板上会留一个指向已删除文档的悬空链接。
+    /// 两个场景：原本没有大纲（还原成 None）、原本指向另一份大纲（还原成
+    /// 那一份，不是清空）。
+    #[test]
+    fn import_rollback_restores_existing_owner_outline_path() {
+        fn run_case(before: Option<&str>) {
+            let (dir, mut store) = tmp_store();
+            let cwd = dir.path();
+            let root = make_task(&mut store, "大任务");
+            if let Some(before) = before {
+                store.get_mut(&root.id).expect("刚建").outline_path = Some(before.to_string());
+                store.persist(&root.id).expect("落盘");
+            }
+            write_draft(
+                cwd,
+                "p7",
+                &format!(
+                    "---\nschema: 1\ntask_id: {}\ntitle: rollback owner\n---\n\
+                     <!-- node:{} -->\n\
+                     <!-- children:start -->\n\
+                     <!-- node:tmp:模块一 -->\n### 模块一\n\
+                     <!-- children:end -->\n",
+                    root.id, root.id
+                ),
+            );
+            // marker 路径上是目录 → `mark_plan_imported` 必然失败，事务在
+            // 大纲发布并挂到 root 之后回滚。
+            std::fs::create_dir_all(store.imported_plans_dir().join("p7")).expect("blocker dir");
+            let req = import_req(serde_json::json!({
+                "plan_id": "p7",
+                "tasks": [{ "title": "模块一" }]
+            }));
+            let err = import_tasks_as_todo_into(&mut store, cwd, &req, Some("p7"))
+                .expect_err("marker 写不进去 → 整单失败");
+            assert!(err.contains("marker"), "报错要点明 marker 落盘失败：{err}");
+            assert_eq!(store.list().len(), 1, "新建任务必须回滚，只剩原来那个大任务");
+            let leftovers: Vec<PathBuf> = std::fs::read_dir(cwd.join("docs/outlines"))
+                .map(|it| it.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            assert!(leftovers.is_empty(), "已发布的大纲必须删掉：{leftovers:?}");
+            assert_eq!(
+                store.get(&root.id).expect("root").outline_path.as_deref(),
+                before,
+                "内存里的 outline_path 要还原"
+            );
+            let id = root.id.clone();
+            drop(store);
+            // 盘上才是真相：重启后读到的不能是悬空链接。
+            let reloaded = TaskStore::load(cwd).expect("reload");
+            assert_eq!(
+                reloaded.get(&id).expect("root 必须落盘").outline_path.as_deref(),
+                before,
+                "重载后 outline_path 也必须是导入前的值"
+            );
+        }
+        run_case(None);
+        run_case(Some("docs/outlines/old.md"));
+    }
+
+    /// 同名任务无法唯一绑定锚点（一个锚点绑到"第一个同名任务"并不会产生重复
+    /// id，`validate_unique_ids` 抓不到）：必须硬失败，而不是让后两个同任务
+    /// 静默拿不到大纲。
+    #[test]
+    fn import_rejects_duplicate_titles_when_finalising_outline() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        write_draft(
+            cwd,
+            "p9",
+            "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: dup demo\n---\n\
+             <!-- node:LAT-ROOT -->\n\
+             <!-- children:start -->\n\
+             <!-- node:tmp:模块一 -->\n### 模块一\n\
+             <!-- children:end -->\n",
+        );
+        let req = import_req(serde_json::json!({
+            "plan_id": "p9",
+            "tasks": [{ "title": "模块一" }, { "title": "模块一" }]
+        }));
+        let err = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect_err("同名任务必须整单拒绝");
+        assert!(
+            err.contains("同名任务") && err.contains("模块一"),
+            "报错要点名重复的标题：{err}"
+        );
+        assert!(store.list().is_empty(), "回滚后看板必须为空");
+        assert!(
+            !cwd.join("docs/outlines").exists(),
+            "失败路径不得发布任何文档"
+        );
+    }
+
+    /// `plan_id` 不能安全当文件名时**不能**当成"没有大纲"静默放过：workflow
+    /// 写草案时对同一个 id 是响亮拒绝的，读的一端静默跳过会让用户拿到
+    /// "任务进板了、大纲凭空消失"的结果。
+    #[test]
+    fn import_rejects_unsafe_plan_id_when_outline_expected() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let req = import_req(serde_json::json!({
+            "plan_id": "../x",
+            "tasks": [{ "title": "模块一" }]
+        }));
+        let err = run_import_transaction(&mut store, |s| import_tasks_into_inner(s, cwd, &req))
+            .expect_err("不安全的 plan_id 必须报错");
+        assert!(
+            err.contains("plan_id 不能安全地作为文件名"),
+            "报错要说明是 plan_id 的问题：{err}"
+        );
+        assert!(store.list().is_empty(), "失败后不得留下任务");
     }
 
     /// 只有拆分的根任务携带 `outline_path`；读模型必须替前端走完祖先链，
