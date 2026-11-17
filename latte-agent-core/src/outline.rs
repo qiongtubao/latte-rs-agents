@@ -54,13 +54,20 @@ pub struct OutlineNode {
     /// 标题行原文（含 `### ` 前缀）。`None` = 锚点后没有标题行（根节点常见）。
     ///
     /// 保留原文是为了排版信息不丢：标题的 `#` 层级、奇怪的空白都按原样写回。
+    ///
+    /// **外部只读；改标题请走 [`OutlineNode::set_title`]**。直接改它会让
+    /// [`OutlineNode::heading_level`] 与标题行脱节，重新渲染就换了层级。
     pub heading_raw: Option<String>,
     /// 标题层级（`#` 的个数）：`### 标题` → 3；没有标题行时为 0。
     ///
     /// 为什么显式存一份而不是每次从 [`OutlineNode::heading_raw`] 数：
     /// 之后要在大纲里插入子节点（Task 7）时需要"父层级 + 1"这种算术，
     /// 让调用方去解析标题文本既脆又容易数错。
-    pub heading_level: u8,
+    ///
+    /// 私有：读走 [`OutlineNode::heading_level`]，改标题走
+    /// [`OutlineNode::set_title`]——层级与标题行只能由这一处一起维护，
+    /// 外部能写的话两者迟早会互相矛盾。
+    heading_level: u8,
     /// `section:body` 区块内的正文，机器同步时原样保留。
     ///
     /// 内容含结尾换行（区块非空时必然是 `...\n`），这样渲染时可以直接拼回去。
@@ -100,6 +107,31 @@ impl OutlineNode {
             learn_links: Vec::new(),
             has_learn_links_block: true,
             children: Vec::new(),
+        }
+    }
+
+    /// 标题层级（`#` 的个数）；没有标题行时是 0。
+    pub fn heading_level(&self) -> u8 {
+        self.heading_level
+    }
+
+    /// 改标题文字：`title` 与标题行一起更新，**层级保持不变**。
+    ///
+    /// 这是"改标题"的唯一入口。为什么不让调用方直接写 [`OutlineNode::heading_raw`]：
+    /// 层级是排版信息、文字是内容，两者必须一起动，否则渲染出来的标题会掉级
+    /// （`### 标题` 变成 `标题`），下次解析又是另一个层级。
+    ///
+    /// 没有标题行的节点（根节点常见）只改结构元数据 `title`：文件里没有它对应的
+    /// 那一行文字，绝不凭空补一个标题。
+    pub fn set_title(&mut self, title: &str) {
+        self.title = title.to_string();
+        if self.heading_raw.is_some() {
+            // `heading_level == 0` 却存在标题行是自相矛盾的状态（只可能来自旧数据
+            // 或外部硬改），按 1 兜底而不是写出一行没有 `#` 的"标题"。
+            if self.heading_level == 0 {
+                self.heading_level = 1;
+            }
+            self.heading_raw = Some(make_heading(self.heading_level, title));
         }
     }
 }
@@ -706,8 +738,18 @@ fn rebind_node(
 /// 直接报错——静默丢弃一个带手写正文的节点是不可接受的损失。
 /// 标题行只改文字、保留各自原有的 `#` 层级（层级是排版，看板不管排版）。
 pub fn apply_board_fields(doc: &mut OutlineDoc, tasks: &[TaskBrief]) -> Result<(), String> {
-    let index: HashMap<&str, &TaskBrief> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
-    // 先整体校验再改：中途失败不该留下"改了一半"的文档。
+    // 先整体校验再改：任何一项失败都不该留下"改了一半"的文档。
+    let mut index: HashMap<&str, &TaskBrief> = HashMap::new();
+    for task in tasks {
+        // `collect()` 会静默让后一条覆盖前一条：同一个 id 的两份不同 title 到底
+        // 哪份算数，这里没有依据可判，只能报错。
+        if index.insert(task.id.as_str(), task).is_some() {
+            return Err(format!(
+                "看板任务 id `{}` 在传入列表里重复出现：一份任务列表里 id 必须唯一（否则后者会静默覆盖前者）",
+                task.id
+            ));
+        }
+    }
     // id 唯一性也在这里兜住——身份都不成立时，谈标题是不是最新的没有意义。
     validate_unique_ids(doc)?;
     check_node(&doc.root, None, &index)?;
@@ -778,23 +820,14 @@ fn check_node(
 
 fn apply_node(node: &mut OutlineNode, index: &HashMap<&str, &TaskBrief>) {
     if let Some(task) = index.get(node.id.as_str()) {
-        if node.title != task.title {
-            // 标题是共享字段：文件里那行标题也得跟着变，否则渲染出来的文档会
-            // 和看板互相打架。只保留原有的 `#` 层级（那是排版），文字用看板的。
-            if let Some(raw) = node.heading_raw.as_deref() {
-                let level = if node.heading_level > 0 {
-                    node.heading_level
-                } else {
-                    heading_level_of(raw)
-                };
-                node.heading_level = level;
-                node.heading_raw = Some(make_heading(level, &task.title));
-            }
-            // 根节点、以及锚点后没写标题行的节点，`heading_raw` 为 `None`：
-            // 这时 `title` 只是结构元数据，**展示用**的文档标题在前言/frontmatter
-            // 里（人手写的 `# 总纲`），这里只更新元数据，一个字的文档标题都不改。
-            node.title = task.title.clone();
-        }
+        // 标题是共享字段：文件里那行标题也得跟着变，否则渲染出来的文档会
+        // 和看板互相打架。改标题只走 `set_title`，它保留原有的 `#` 层级（排版）
+        // 并用看板的文字（内容）。
+        //
+        // 根节点、以及锚点后没写标题行的节点，`heading_raw` 为 `None`：
+        // 这时 `title` 只是结构元数据，**展示用**的文档标题在前言/frontmatter
+        // 里（人手写的 `# 总纲`），`set_title` 只更新元数据，一个字的文档标题都不改。
+        node.set_title(&task.title);
         node.needs_split = task.needs_split;
     }
     // body / learn_links 属于人手写的内容，这里刻意不碰。
@@ -809,6 +842,18 @@ mod tests {
 
     /// 设计文档 §5 的规范样例：`render(parse(x)) == x` 必须逐字节成立。
     /// 非规范输入走的是"规范化"契约（见模块文档），不要求逐字节。
+    /// 测试用：把任意节点当成整份文档的根，方便 render→parse 往返。
+    /// 节点本身一律用 [`OutlineNode::new_child`] 造（`heading_level` 私有，
+    /// 外部已经不能写结构体字面量了）。
+    fn doc_with_root(root: OutlineNode) -> OutlineDoc {
+        OutlineDoc {
+            task_id: "LAT-1".to_string(),
+            title: "T".to_string(),
+            preamble: "---\nschema: 1\ntask_id: LAT-1\ntitle: T\n---\n".to_string(),
+            root,
+        }
+    }
+
     const FIXTURE: &str = r#"---
 schema: 1
 task_id: LAT-100
@@ -845,7 +890,7 @@ title: 总纲
         assert_eq!(doc.root.id, "LAT-100");
         assert_eq!(doc.root.title, "");
         assert_eq!(doc.root.heading_raw, None, "根节点不该有标题行");
-        assert_eq!(doc.root.heading_level, 0);
+        assert_eq!(doc.root.heading_level(), 0);
         assert!(doc.root.has_body_block);
         assert_eq!(doc.root.body, "## 概述\n正文一段。\n");
         assert!(
@@ -859,7 +904,7 @@ title: 总纲
         assert_eq!(child.title, "模块一");
         assert!(child.needs_split);
         assert_eq!(child.heading_raw.as_deref(), Some("### 模块一"));
-        assert_eq!(child.heading_level, 3);
+        assert_eq!(child.heading_level(), 3);
         assert_eq!(child.body, "子正文。\n");
         assert!(child.has_learn_links_block);
         assert!(child.learn_links.is_empty());
@@ -1198,12 +1243,7 @@ title: T
     #[test]
     fn new_child_renders_valid_node() {
         let node = OutlineNode::new_child("LAT-9".to_string(), "新模块".to_string(), true, 3);
-        let doc = OutlineDoc {
-            task_id: "LAT-1".to_string(),
-            title: "T".to_string(),
-            preamble: "---\nschema: 1\ntask_id: LAT-1\ntitle: T\n---\n".to_string(),
-            root: node.clone(),
-        };
+        let doc = doc_with_root(node.clone());
 
         let rendered = render_outline(&doc);
         assert!(
@@ -1214,7 +1254,7 @@ title: T
 
         let reparsed = parse_outline(&rendered).expect("构造出来的节点必须能被解析回来");
         assert_eq!(reparsed.root, node, "渲染再解析必须得到同一个节点");
-        assert_eq!(reparsed.root.heading_level, 3);
+        assert_eq!(reparsed.root.heading_level(), 3);
         assert!(validate_unique_ids(&reparsed).is_ok());
     }
 
@@ -1235,10 +1275,10 @@ title: T
 ";
         let doc = parse_outline(md).expect("解析失败");
         assert_eq!(doc.root.title, "## 二级井号标题", "只吃掉一个空格后的井号");
-        assert_eq!(doc.root.heading_level, 3);
+        assert_eq!(doc.root.heading_level(), 3);
         let child = &doc.root.children[0];
         assert_eq!(child.title, "#tag 开头的标题");
-        assert_eq!(child.heading_level, 4);
+        assert_eq!(child.heading_level(), 4);
         assert_eq!(render_outline(&doc), md);
     }
 
@@ -1279,19 +1319,19 @@ title: 深层
         let doc = parse_outline(md).expect("解析失败");
 
         assert_eq!(doc.root.heading_raw, None);
-        assert_eq!(doc.root.heading_level, 0, "没有标题行就没有层级");
+        assert_eq!(doc.root.heading_level(), 0, "没有标题行就没有层级");
         assert_eq!(doc.root.body, "根正文\n");
 
         let l1 = &doc.root.children[0];
-        assert_eq!((l1.title.as_str(), l1.heading_level), ("第一章", 2));
+        assert_eq!((l1.title.as_str(), l1.heading_level()), ("第一章", 2));
         assert_eq!(l1.body, "一章正文\n");
 
         let l2 = &l1.children[0];
-        assert_eq!((l2.title.as_str(), l2.heading_level), ("第一节", 3));
+        assert_eq!((l2.title.as_str(), l2.heading_level()), ("第一节", 3));
         assert_eq!(l2.body, "一节正文\n");
 
         let l3 = &l2.children[0];
-        assert_eq!((l3.title.as_str(), l3.heading_level), ("子目", 4));
+        assert_eq!((l3.title.as_str(), l3.heading_level()), ("子目", 4));
         assert_eq!(l3.body, "子目正文\n");
         assert!(l3.children.is_empty());
 
@@ -1369,10 +1409,10 @@ title: 总纲
 
         let l1 = &doc.root.children[0];
         assert_eq!(l1.heading_raw.as_deref(), Some("### 新一"));
-        assert_eq!(l1.heading_level, 3);
+        assert_eq!(l1.heading_level(), 3);
         let l2 = &l1.children[0];
         assert_eq!(l2.heading_raw.as_deref(), Some("##### 新二"));
-        assert_eq!(l2.heading_level, 5);
+        assert_eq!(l2.heading_level(), 5);
 
         // 正文一个字都不许动。
         assert_eq!(doc.root.body, "根正文\n");
@@ -1381,5 +1421,65 @@ title: 总纲
 
         let rendered = render_outline(&doc);
         assert!(rendered.contains("##### 新二"), "{rendered}");
+    }
+
+    #[test]
+    fn set_title_keeps_level_and_raw_in_sync() {
+        let mut node = OutlineNode::new_child("LAT-9".to_string(), "旧".to_string(), false, 3);
+
+        node.set_title("新");
+
+        assert_eq!(node.title, "新");
+        assert_eq!(node.heading_level(), 3, "改标题不许动层级");
+        assert_eq!(node.heading_raw.as_deref(), Some("### 新"));
+
+        let reparsed =
+            parse_outline(&render_outline(&doc_with_root(node))).expect("渲染结果必须还能解析");
+        assert_eq!(reparsed.root.title, "新");
+        assert_eq!(reparsed.root.heading_level(), 3);
+        assert_eq!(reparsed.root.heading_raw.as_deref(), Some("### 新"));
+    }
+
+    #[test]
+    fn apply_board_fields_rejects_duplicate_task_ids() {
+        let md = "\
+---
+schema: 1
+task_id: LAT-1
+title: T
+---
+<!-- node:LAT-1 -->
+### 旧标题
+<!-- children:start -->
+<!-- node:LAT-2 -->
+### 子
+<!-- children:end -->
+";
+        let mut doc = parse_outline(md).expect("解析失败");
+        let snapshot = doc.clone();
+        let tasks = vec![
+            TaskBrief {
+                id: "LAT-1".to_string(),
+                title: "甲".to_string(),
+                parent_id: None,
+                needs_split: false,
+            },
+            TaskBrief {
+                id: "LAT-1".to_string(),
+                title: "乙".to_string(),
+                parent_id: None,
+                needs_split: true,
+            },
+            TaskBrief {
+                id: "LAT-2".to_string(),
+                title: "子".to_string(),
+                parent_id: Some("LAT-1".to_string()),
+                needs_split: false,
+            },
+        ];
+
+        let err = apply_board_fields(&mut doc, &tasks).expect_err("重复任务 id 必须报错");
+        assert!(err.contains("LAT-1"), "错误信息要点名重复的 id：{err}");
+        assert_eq!(doc, snapshot, "校验失败时不能留下改了一半的文档");
     }
 }
