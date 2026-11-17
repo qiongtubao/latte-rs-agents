@@ -145,6 +145,11 @@ fn bool_is_true(value: &bool) -> bool {
     *value
 }
 
+/// `skip_serializing_if` 辅助：false 不落盘/不下发，缺省即 false。
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn default_output_complete() -> bool {
     true
 }
@@ -902,7 +907,10 @@ pub struct PlanTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
     /// 是否仍需继续拆分。规划字段，与 subtasks 是否为空解耦。
-    #[serde(default)]
+    /// 拆分类 workflow（outline_split / task_refine）的门禁要求每条任务
+    /// 都显式给出该字段；schema 侧仍保持可选（老的产出方照常通过），
+    /// 缺省即 `false`。`false` 不序列化。
+    #[serde(default, skip_serializing_if = "is_false")]
     pub needs_split: bool,
     /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
     /// 任务会被任务看板拒绝派发（409）。空则不序列化（视作未声明）。
@@ -7551,8 +7559,10 @@ fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty 
             "needs_split".into(),
             input_property(
                 PropertyType::Boolean,
-                "REQUIRED for split plans: true if this task must be broken down further \
-                 before it is executable, false if it is a leaf. Independent of subtasks.",
+                "Whether this task must be broken down further before it is executable. \
+                 Splitting workflows (outline_split / task_refine) are required by their \
+                 workflow gate to emit this on every task; the JSON Schema keeps it optional so \
+                 older plan producers still validate. Independent of `subtasks`.",
             ),
         ),
         (
@@ -11278,6 +11288,18 @@ pub(crate) mod tests {
             schema["required"],
             serde_json::json!(["title"]),
             "needs_split 必须是可选字段"
+        );
+        // serde 侧契约：缺省即 false；false 不落盘/不下发；true 必须保留。
+        let missing: PlanTask = serde_json::from_str(r#"{"title":"x"}"#).expect("缺省可解析");
+        assert!(!missing.needs_split, "缺省必须反序列化成 false");
+        assert!(
+            serde_json::to_value(&missing).unwrap().get("needs_split").is_none(),
+            "false 不应序列化（缺省即 false）"
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed[0]).unwrap()["needs_split"],
+            serde_json::json!(true),
+            "true 必须保留，否则拆分类 workflow 的标记会在落盘/下发时丢失"
         );
     }
 

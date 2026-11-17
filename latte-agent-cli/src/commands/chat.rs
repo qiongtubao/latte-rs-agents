@@ -4109,7 +4109,7 @@ mod tests {
             labels: vec!["core".into()],
             task_type: Some("feature".into()),
             workflow: None,
-            needs_split: false,
+            needs_split: true,
             paths: vec!["src/".into()],
             artifact_paths: Some(vec!["src/".into()]),
             // 依赖引用写的是同批任务的标题（新任务还没有 id）。
@@ -4141,6 +4141,11 @@ mod tests {
             vec!["补单测".to_string()],
             "depends_on 必须无损透传到 ImportTask，否则拆分产出的顺序约束在导入时全丢"
         );
+        assert!(
+            it.needs_split,
+            "needs_split 必须无损透传到 ImportTask，否则拆分类 workflow 的标记在导入时丢失"
+        );
+        assert!(!it.subtasks[0].needs_split, "子任务的 false 缺省");
         assert_eq!(it.subtasks.len(), 1);
         assert_eq!(it.subtasks[0].title, "补单测");
         assert_eq!(it.subtasks[0].priority, None);
