@@ -634,31 +634,51 @@ In `workflow.rs`, implement `check_outline_against_plan(plan_json: &str, outline
 /// 每个 plan 任务（含任意深度 subtasks）都必须**显式**声明 needs_split。
 /// 必须查原始 JSON 键：`PlanTask.needs_split` 有 serde(default)，解析后
 /// 「没写」和「写了 false」无法区分。
-fn check_plan_tasks_have_needs_split(plan_json: &str) -> Result<(), String> {
-    fn walk(v: &serde_json::Value, missing: &mut Vec<String>) {
+fn check_plan_task_shape(plan_json: &str) -> Result<(), String> {
+    fn walk(
+        v: &serde_json::Value,
+        missing: &mut Vec<String>,
+        titles: &mut HashMap<String, usize>,
+    ) {
         let Some(obj) = v.as_object() else { return };
         let title = obj.get("title").and_then(|t| t.as_str()).unwrap_or("<无标题>");
         if !obj.contains_key("needs_split") {
             missing.push(title.to_string());
         }
+        *titles.entry(title.to_string()).or_insert(0) += 1;
         if let Some(subs) = obj.get("subtasks").and_then(|s| s.as_array()) {
             for s in subs {
-                walk(s, missing);
+                walk(s, missing, titles);
             }
         }
     }
     let v: serde_json::Value =
         serde_json::from_str(plan_json).map_err(|e| format!("任务清单不是合法 JSON：{e}"))?;
     let mut missing = Vec::new();
+    let mut titles: HashMap<String, usize> = HashMap::new();
     if let Some(arr) = v.get("tasks").and_then(|t| t.as_array()) {
         for t in arr {
-            walk(t, &mut missing);
+            walk(t, &mut missing, &mut titles);
         }
     }
-    if missing.is_empty() {
+    if !missing.is_empty() {
+        return Err(format!(
+            "以下任务缺少 needs_split（拆分类清单必填）：{}",
+            missing.join("、")
+        ));
+    }
+    // 标题是 tmp 锚点的键：重名要么撞锚点（解析器拒），要么被对账判成缺项
+    // （gate 拒）——而模型改不动清单里的标题，于是 refine↔gate 死循环。
+    // 所以在清单阶段就拒，并把要改的标题点名。
+    let mut dup: Vec<&String> = titles.iter().filter(|(_, n)| **n > 1).map(|(t, _)| t).collect();
+    dup.sort();
+    if dup.is_empty() {
         Ok(())
     } else {
-        Err(format!("以下任务缺少 needs_split（拆分类清单必填）：{}", missing.join("、")))
+        Err(format!(
+            "任务标题重复：{}。大纲锚点是 tmp:<标题>，重名会撞锚点并被对账拒绝——请改成唯一标题。",
+            dup.iter().map(|t| t.as_str()).collect::<Vec<_>>().join("、")
+        ))
     }
 }
 ```
@@ -869,7 +889,7 @@ Also add to the `refine` step's header (next to its existing `require_plan_tasks
 require_needs_split = true
 ```
 
-This is what makes the prompt's "必填" true rather than aspirational — `check_plan_tasks_have_needs_split` (Task 6) rejects the draft mechanically. `WorkflowStepDef` already has the field from Task 6, so `deny_unknown_fields` accepts it.
+This is what makes the prompt's "必填" true rather than aspirational — `check_plan_task_shape` (Task 6) rejects the draft mechanically (missing `needs_split` **and** duplicate titles, the latter because `tmp:<标题>` anchors cannot represent two same-titled tasks). `WorkflowStepDef` already has the field from Task 6, so `deny_unknown_fields` accepts it.
 
 - [ ] **Step 5: Insert child anchors mechanically at import (no model step)**
 

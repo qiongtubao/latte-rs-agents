@@ -192,7 +192,7 @@ flowchart TD
 
 workflow 步骤设计（沿用 `task_refine.toml:54-287` 已验证的结构）：
 
-1. **breakdown**：`task_planner`，摘掉 plan 工具，输出"拆分依据 + 恰好一个 `{"tasks":[...]}` JSON fence"，每项含既有字段 + `needs_split`。引擎 `require_plan_tasks` 机械校验（路径存在性、字符串层重叠、workflow/task_type 名）。拆分类 workflow 另开 `require_needs_split`：每个任务（含任意深度 `subtasks`）必须**显式**带 `needs_split`，缺字段整单打回——判据必须查**原始 JSON 键**，因为 `PlanTask.needs_split` 有 `serde(default)`，解析后「没写」和「写了 false」无法区分。
+1. **breakdown**：`task_planner`，摘掉 plan 工具，输出"拆分依据 + 恰好一个 `{"tasks":[...]}` JSON fence"，每项含既有字段 + `needs_split`。引擎 `require_plan_tasks` 机械校验（路径存在性、字符串层重叠、workflow/task_type 名）。拆分类 workflow 另开 `require_needs_split`：每个任务（含任意深度 `subtasks`）必须**显式**带 `needs_split`，缺字段整单打回——判据必须查**原始 JSON 键**，因为 `PlanTask.needs_split` 有 `serde(default)`，解析后「没写」和「写了 false」无法区分。同一道机械门还要拒**重复标题**：锚点是 `tmp:<标题>`，重名要么撞锚点、要么被标题对账判成缺项，而模型改不动清单里的标题，于是 refine↔gate 死循环——必须在清单阶段就点名要求改名。
 2. **outline_draft**：`outline_writer`（新角色），读 `{{draft}}` 的任务树，输出大纲 Markdown（含 `tmp:<标题>` 临时锚、每个节点一段 body、needs_split 标记）。body 从各任务的 `description` 派生。
 3. **gate**：`reviewer`，产出 `VERDICT: ACCEPT/REVISE/REJECT`，`loop_back_to="breakdown"`，`loop_abort_on="VERDICT: REJECT"`（`max_iterations=2`）。机械 gate 追加校验：大纲锚点的**标题集合**与 JSON 任务标题集合一一对应、needs_split 一致、无孤儿锚点（此阶段锚是 `tmp:`，按标题对账）。
 4. **submit**：`submit_plan_from="draft"`（零模型）只**提出** plan；真实 id 要等用户在看板弹窗导入才分配，所以定稿分两段：submit 把大纲草案写到会话级路径并登记 `plan_id → draft_path`；`POST /api/tasks/import` 在创建完任务后用"标题→真实 id"映射跑 `outline.rs::rebind_tmp_ids`，回填锚点并落盘 `docs/outlines/<slug>.md`，同时把根任务的 `outline_path` 指向它。任何 `tmp:` 锚未绑上 = 整单报错，绝不把 `tmp:` 写进正式大纲。用户取消导入则什么也不写。
