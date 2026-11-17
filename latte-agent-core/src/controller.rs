@@ -14618,6 +14618,38 @@ pub(crate) mod tests {
         }
     }
 
+    /// `outline_writer` 的大纲格式是硬契约：提示词一旦漂离
+    /// `outline.rs` 的解析器，`outline_split` 的 gate 会把每一份草案都打回。
+    /// 这里钉住配置可解析、提示词存在且写进了全部解析器关键标记。
+    #[test]
+    fn outline_writer_role_config_parses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../config/agents/outline_writer.toml");
+        let raw = std::fs::read_to_string(&path).expect("outline_writer.toml 必须存在");
+        let v: toml::Value = toml::from_str(&raw).expect("TOML 解析");
+        let role = &v["roles"]["outline_writer"];
+        assert_eq!(role["id"].as_str(), Some("outline_writer"));
+        assert_eq!(
+            role["prompt_file"].as_str(),
+            Some("prompts/outline_writer.md")
+        );
+        let prompt = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../prompts/outline_writer.md"),
+        )
+        .expect("prompt 文件必须存在");
+        // 提示词必须把解析器的硬约束写进去，否则每次拆分都会被 gate 打回。
+        for needle in [
+            "node:",
+            "needs_split",
+            "section:body",
+            "learn-links",
+            "children",
+            "tmp:",
+        ] {
+            assert!(prompt.contains(needle), "prompt 缺少关键约束：{needle}");
+        }
+    }
+
     #[tokio::test]
     async fn ask_blocking_cancel_flag_aborts_wait() {
         let tm = build_tool_manager(&[]).await.expect("tool manager");
