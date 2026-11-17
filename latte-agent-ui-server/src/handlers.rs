@@ -1342,6 +1342,37 @@ pub(crate) async fn resume_task(
         .map_err(Into::into)
 }
 
+/// `POST /api/outlines/:task_id/sync?prune=<bool>` —— 手改大纲后把结构推回看板。
+/// 只同步结构（标题/父链/needs_split），执行状态由看板独占。
+///
+/// - 404：`:task_id` 不存在；409：该任务（含祖先链）没有 `outline_path`，
+///   或者大纲与看板对不上（未知 id / 缺项 / 成环 / 未定稿的 `tmp:` 锚点）——
+///   这些错误都由 [`crate::tasks::sync_outline_structure`] 在**改任何东西之前**
+///   收集齐，看板不会留下半套状态。
+/// - `prune` 缺省关：缺项只报不删。为什么默认不删见上面那个函数的文档注释。
+pub(crate) async fn sync_outline(
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let prune = q
+        .get("prune")
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"));
+    // 路径解析放在只读锁里做完：`outline_abs_path_for_task` 只读一次索引，
+    // 别让这次纯查询占着写锁。
+    let abs = {
+        let store = state.backend.tasks.read();
+        crate::tasks::outline_abs_path_for_task(&store, &task_id)
+            .map_err(Into::<(StatusCode, String)>::into)?
+    };
+    let changed = {
+        let mut store = state.backend.tasks.write();
+        crate::tasks::sync_outline_structure(&mut store, &abs, prune)
+            .map_err(|e| (StatusCode::CONFLICT, e))?
+    };
+    Ok(Json(serde_json::json!({ "changed": changed })))
+}
+
 /// `GET /api/tasks/:id/worktree-diff` —— 隔离任务的改动预览（批准前看一眼）。
 pub(crate) async fn task_worktree_diff(
     axum::extract::Path(id): axum::extract::Path<String>,

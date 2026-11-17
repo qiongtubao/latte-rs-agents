@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use latte_agent_core::outline::{
-    insert_child, parse_outline, rebind_tmp_ids, render_outline, validate_unique_ids,
+    insert_child, parse_outline, rebind_tmp_ids, render_outline, validate_unique_ids, OutlineNode,
 };
 use latte_agent_core::workflow::{load_workflow, run_workflow, WorkflowRunContext};
 use latte_ai::params::GenerateParams;
@@ -2373,6 +2373,250 @@ fn approve_plan_stage(b: &UiBackend, plan_id: &str) {
             });
         }
     }
+}
+
+// ─── 大纲 → 看板：结构同步 ────────────────────────────────────────
+
+/// 大纲节点拍平后的一行：`id` + 文档给出的父 id。
+///
+/// 为什么先拍平：校验要看全树、落地要按文档顺序走，递归两遍不如一次收齐。
+/// 根节点的 `parent_id` 是 `None`——大纲**不表达**「根挂在哪」（它可能就是某个
+/// 子树的大纲，根的父任务在那份文档之外），所以根的父链一律不动。
+struct OutlineSyncNode {
+    id: String,
+    title: String,
+    needs_split: bool,
+    parent_id: Option<String>,
+}
+
+fn flatten_outline_node(node: &OutlineNode, parent: Option<&str>, out: &mut Vec<OutlineSyncNode>) {
+    out.push(OutlineSyncNode {
+        id: node.id.clone(),
+        title: node.title.clone(),
+        needs_split: node.needs_split,
+        parent_id: parent.map(str::to_string),
+    });
+    for child in &node.children {
+        flatten_outline_node(child, Some(&node.id), out);
+    }
+}
+
+/// 任务 → 它生效的大纲文件绝对路径。
+///
+/// 404：任务不存在；409：自身与祖先链上都没有 `outline_path`——这个任务不属于
+/// 任何大纲，没有可同步的东西（409 而不是 404：任务本身在，是它当前的状态不
+/// 支持这个操作）。
+pub fn outline_abs_path_for_task(store: &TaskStore, task_id: &str) -> Result<PathBuf, ApiError> {
+    let task = store
+        .get(task_id)
+        .ok_or_else(|| ApiError::not_found(format!("task {task_id:?} 不存在")))?;
+    let rel = store.effective_outline_path(task).ok_or_else(|| ApiError {
+        status: 409,
+        message: format!(
+            "任务 {task_id} 没有大纲（自身与祖先链上都没有 outline_path）：先为它定稿一份大纲，再同步结构"
+        ),
+    })?;
+    Ok(store.project_root().join(rel))
+}
+
+/// 大纲 → 看板的结构同步。只动 title / needs_split / parent_id；
+/// 执行状态、依赖、路径、调度一律不碰——那些是看板的权威。
+///
+/// 为什么默认不删：大纲里少一行锚点不该等于「删掉整棵子树」。
+/// 设计稿写「删除胜」，但那是给碰撞仲裁的理想规则；落到一个可以手改的
+/// Markdown 文件上，误删的代价远大于多确认一次的代价，所以缺项一律先报，
+/// 要删得显式传 prune=true。
+///
+/// # 规矩（全是"宁可整单失败，也不留半套状态"）
+///
+/// - **先校验、后落地**：未知 id、成环、缺项全部收齐再报，只要有一条错就
+///   一个字节都不写。手改大纲是中段操作（改一半被打断很常见），半个应用的
+///   结构比没应用更难收拾。
+/// - **临时锚点整单拒绝**：`tmp:<标题>` 说明这份文档从未定稿，里面的 id 既不
+///   是看板 id 也不该被当成"未知 id"逐条去猜。
+/// - **根节点的父链不动**：见上面 `OutlineSyncNode::parent_id` 的说明。
+/// - **占位根 `LAT-ROOT` 跳过**：草案从一条描述起步时没有可挂的根，发布后那份
+///   文档的根锚仍是 `LAT-ROOT`。它是占位符不是任务，绝不能被报成"未知 id"；
+///   它下面那一层的父链也保持看板原样（这类大纲有多个顶层任务共享一份文档）。
+/// - **标题为空就不动**：根节点常常没有标题行（`title == ""`），那是"大纲对
+///   标题没有话说"，不是"把任务标题清空"。
+/// - **不写 history**：history 是执行状态变迁的审计线，手改大纲不是一次状态
+///   变迁（看板的 `updated_at` 会动，`history` 不会）。
+/// - **prune 只删"整棵子树里不在本文档中的部分"**：文档里还留着的节点会被改挂
+///   到新的父节点上，不能跟着一起埋掉。
+///
+/// 返回被改动的 id（文档顺序在前，被删的在后）。
+pub fn sync_outline_structure(
+    store: &mut TaskStore,
+    outline_path: &Path,
+    prune: bool,
+) -> Result<Vec<String>, String> {
+    let project_root = store.project_root().to_path_buf();
+    let abs = if outline_path.is_absolute() {
+        outline_path.to_path_buf()
+    } else {
+        project_root.join(outline_path)
+    };
+    // 看板上「属于这份大纲」的判定标准是 `effective_outline_path` 的**原始
+    // 字符串**（项目相对），所以先把绝对路径还原成同一个形状，否则比较永远不等。
+    let rel = abs
+        .strip_prefix(&project_root)
+        .unwrap_or(&abs)
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let raw = std::fs::read_to_string(&abs).map_err(|e| format!("读取大纲 {rel} 失败：{e}"))?;
+    let doc = parse_outline(&raw).map_err(|e| format!("大纲 {rel} 解析失败：{e}"))?;
+
+    let mut nodes: Vec<OutlineSyncNode> = Vec::new();
+    flatten_outline_node(&doc.root, None, &mut nodes);
+
+    // 占位根：草案从一条描述起步时没有可挂的根，大纲的根锚是
+    // `LAT-ROOT`（见 [`OUTLINE_ROOT_SENTINEL`]），发布后它会原样留在文档里。
+    // 它不是任务——跳过它本身，并且它下面那一层的父链保持看板原样（"挂在根下"
+    // 在这里没有对应的看板实体，而这类大纲本来就有多个顶层任务共享一份文档）。
+    // 只对**恰好是占位符**的根这么做：别的不存在 id 一律照常报"未知 id"。
+    if nodes
+        .first()
+        .is_some_and(|n| n.id.trim() == OUTLINE_ROOT_SENTINEL && store.get(&n.id).is_none())
+    {
+        let placeholder = nodes.remove(0).id;
+        for node in nodes.iter_mut() {
+            if node.parent_id.as_deref() == Some(placeholder.as_str()) {
+                node.parent_id = None;
+            }
+        }
+    }
+
+    // 临时锚点：文档从未定稿。直接整单拒绝——不逐条报"未知 id"，那些 id 本来
+    // 就不该被解读成任务 id，逐条报只会把真正的原因埋掉。
+    let drafts: Vec<&OutlineSyncNode> = nodes
+        .iter()
+        .filter(|n| n.id.trim_start().starts_with("tmp:"))
+        .collect();
+    if !drafts.is_empty() {
+        let list = drafts
+            .iter()
+            .map(|n| format!("`{}`（「{}」）", n.id, n.title))
+            .collect::<Vec<_>>()
+            .join("、");
+        return Err(format!(
+            "大纲 {rel} 里还有临时锚点 {list}：这份文档从未定稿（草案里的 `tmp:<标题>` 要在导入时换成真实任务 id），先跑一次导入把锚点定稿，再来同步结构"
+        ));
+    }
+    // 同名 id 出现两次时"该改哪个任务"没有答案，先于任何改动拒绝。
+    validate_unique_ids(&doc).map_err(|e| format!("大纲 {rel} 的节点 id 不唯一：{e}"))?;
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut plans: Vec<OutlineSyncNode> = Vec::new();
+    for node in nodes {
+        if store.get(&node.id).is_none() {
+            errors.push(format!(
+                "大纲 {rel} 里的节点 {}（「{}」）在看板上不存在：请恢复该任务，或删掉这行锚点后重建（同步不会凭空建任务，因为那样建出来的只是空壳）",
+                node.id, node.title
+            ));
+            continue;
+        }
+        if let Some(parent) = &node.parent_id {
+            // 成环检查必须对着**当前**看板跑：校验发生在任何改动之前，所以这里
+            // 看到的还是同步前的父链。文档自己是一棵树（id 唯一），环只可能由
+            // "文档的新父链 + 看板的旧父链"拼出来。
+            if let Err(e) = store.validate_reparent(&node.id, parent) {
+                errors.push(format!(
+                    "大纲 {rel} 里的节点 {} 不能挂到 {} 下：{e}。这次同步没有应用任何改动",
+                    node.id, parent
+                ));
+                continue;
+            }
+        }
+        plans.push(node);
+    }
+
+    // 板上有、文档里没有 = 缺项。默认只报；prune 才删，且只删"不在本文档中"
+    // 的那些后代（文档里还留着的节点会被改挂，不能陪葬）。
+    let doc_ids: std::collections::HashSet<&str> = plans.iter().map(|n| n.id.as_str()).collect();
+    let mut prune_ids: Vec<String> = Vec::new();
+    for task in store.list() {
+        if store.effective_outline_path(&task).as_deref() != Some(rel.as_str()) {
+            continue;
+        }
+        if doc_ids.contains(task.id.as_str()) || prune_ids.iter().any(|id| id == &task.id) {
+            continue;
+        }
+        if !prune {
+            let below = store.descendants_of(&task.id).len();
+            errors.push(format!(
+                "看板任务 {}（「{}」）在大纲 {rel} 里没有对应锚点：同步只改结构不删任务；确认要删就带 ?prune=true（会连同它下面 {below} 个任务一起删）",
+                task.id, task.title
+            ));
+            continue;
+        }
+        prune_ids.push(task.id.clone());
+        for descendant in store.descendants_of(&task.id) {
+            if doc_ids.contains(descendant.as_str()) || prune_ids.iter().any(|id| id == &descendant) {
+                continue;
+            }
+            prune_ids.push(descendant);
+        }
+    }
+
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+
+    let mut changed: Vec<String> = Vec::new();
+    let mut write_errors: Vec<String> = Vec::new();
+    let now = now_ms();
+    for node in plans {
+        let mut diff = false;
+        {
+            let Some(task) = store.get_mut(&node.id) else {
+                continue;
+            };
+            // 空标题 = 大纲对标题没话说（根节点通常没有标题行），不是"清空标题"。
+            if !node.title.trim().is_empty() && task.title != node.title {
+                task.title = node.title.clone();
+                diff = true;
+            }
+            if task.needs_split != node.needs_split {
+                task.needs_split = node.needs_split;
+                diff = true;
+            }
+            if let Some(parent) = &node.parent_id {
+                if task.parent_id.as_deref() != Some(parent.as_str()) {
+                    task.parent_id = Some(parent.clone());
+                    diff = true;
+                }
+            }
+            if !diff {
+                continue;
+            }
+            task.updated_at = now;
+        }
+        // 落盘走 persist 而不是 save_task：persist 顺手把 id 标进 Notion dirty
+        // 集合，只 save_task 的话看板改了、Notion 那份永远还是旧的。
+        if let Err(e) = store.persist(&node.id) {
+            write_errors.push(format!("任务 {} 落盘失败：{e}", node.id));
+            continue;
+        }
+        changed.push(node.id.clone());
+    }
+    for id in prune_ids {
+        match store.delete(&id) {
+            Ok(()) => {
+                store.mark_notion_dirty(&id);
+                changed.push(id);
+            }
+            Err(e) => write_errors.push(format!("删除任务 {id} 失败：{e}")),
+        }
+    }
+    if !write_errors.is_empty() {
+        return Err(format!(
+            "结构同步未完全落地（内存已改，落盘/删除有失败）：{}",
+            write_errors.join("；")
+        ));
+    }
+    Ok(changed)
 }
 
 pub fn update_task(b: &UiBackend, id: &str, patch: TaskPatch) -> Result<TaskView, ApiError> {
@@ -9582,5 +9826,394 @@ mod tests {
         };
         let runs = task_workflow_runs(&b, &task.id).expect("list");
         assert!(runs.is_empty(), "未派发任务不该有流水：{runs:?}");
+    }
+
+    // ─── 大纲 → 看板：结构同步 ────────────────────────────────────
+
+    /// 写一份大纲到 `<cwd>/docs/outlines/<slug>.md`，返回绝对路径。
+    fn write_outline_doc(cwd: &Path, slug: &str, body: &str) -> PathBuf {
+        let path = cwd.join("docs/outlines").join(format!("{slug}.md"));
+        std::fs::create_dir_all(path.parent().expect("父目录")).expect("create outline dir");
+        std::fs::write(&path, body).expect("write outline");
+        path
+    }
+
+    /// 挂上大纲的任务（`outline_path` 只在所有者上落值，子孙靠祖先链解析）。
+    fn make_outline_root(store: &mut TaskStore, title: &str, rel: &str) -> Task {
+        let root = make_task(store, title);
+        store.get_mut(&root.id).expect("刚建").outline_path = Some(rel.to_string());
+        store.persist(&root.id).expect("落盘");
+        store.get(&root.id).expect("读回").clone()
+    }
+
+    /// 同步只动结构三件套：标题 / needs_split / 父链。执行状态、runs、history、
+    /// 依赖、paths 属于看板的权威，一条都不许被大纲改写。
+    #[test]
+    fn outline_sync_updates_structure_only() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "父任务", "docs/outlines/sync.md");
+        let child = make_child(&mut store, &root, "旧标题");
+        let dep = make_task(&mut store, "依赖任务");
+        store
+            .set_depends_on(&child.id, vec![dep.id.clone()])
+            .expect("依赖");
+        // 造一份"有执行痕迹"的任务：状态、run、依赖、paths 都要在同步后原样还在。
+        let (state_before, runs_before, history_before, deps_before, paths_before) = {
+            let t = store.get_mut(&child.id).expect("child");
+            t.set_state("in_progress", "user", Some("开跑".into()), now_ms());
+            t.runs.push(TaskRun {
+                session_id: "s-1".into(),
+                started_at: 1,
+                ended_at: None,
+                result: None,
+            });
+            t.paths = vec!["src/outline".into()];
+            (
+                t.state.clone(),
+                t.runs.len(),
+                t.history.len(),
+                t.depends_on.clone(),
+                t.paths.clone(),
+            )
+        };
+        store.persist(&child.id).expect("落盘");
+
+        let path = write_outline_doc(
+            cwd,
+            "sync",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 同步样例\n---\n\
+                 # 同步样例\n\n前言。\n\n\
+                 <!-- node:{0} -->\n\
+                 <!-- section:body:start -->\n## 概述\n<!-- section:body:end -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} needs_split -->\n### 文档里的新标题\n\
+                 <!-- section:body:start -->\n说明\n<!-- section:body:end -->\n\
+                 <!-- children:end -->\n",
+                root.id, child.id
+            ),
+        );
+        let changed = sync_outline_structure(&mut store, &path, false).expect("同步成功");
+        assert_eq!(changed, vec![child.id.clone()], "只有子任务真的变了");
+
+        let t = store.get(&child.id).expect("child");
+        assert_eq!(t.title, "文档里的新标题");
+        assert!(t.needs_split, "文档里带 needs_split → 看板同步为 true");
+        assert_eq!(t.parent_id.as_deref(), Some(root.id.as_str()));
+        // 结构之外一律原样。
+        assert_eq!(t.state, state_before, "state 归看板独占");
+        assert_eq!(t.runs.len(), runs_before);
+        assert_eq!(
+            t.history.len(),
+            history_before,
+            "手改大纲不是一次状态变迁，不许写 history"
+        );
+        assert_eq!(t.depends_on, deps_before);
+        assert_eq!(t.paths, paths_before);
+        assert_eq!(
+            store.get(&root.id).expect("root").title,
+            "父任务",
+            "根节点没有标题行 → 大纲对标题没话说，不许把标题清空"
+        );
+        // 落盘往返：磁盘 JSON 才是权威，重启后同步结果必须还在。
+        drop(store);
+        let reloaded = TaskStore::load(cwd).expect("reload");
+        let t = reloaded.get(&child.id).expect("child 必须落盘");
+        assert_eq!(t.title, "文档里的新标题");
+        assert!(t.needs_split);
+    }
+
+    /// 文档里的父子关系是结构的唯一来源：改位置就改 `parent_id`。但**成环**必须
+    /// 整单拒绝——校验发生在任何改动之前，所以连同一份文档里本来合法的那半边
+    /// 也不许落地。
+    #[test]
+    fn outline_sync_reparents_within_outline() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/rep.md");
+        let a = make_child(&mut store, &root, "A");
+        let b = make_child(&mut store, &root, "B");
+
+        // 第一次：B 挪到 A 下面（合法移动）。
+        let path = write_outline_doc(
+            cwd,
+            "rep",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 移动\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### A\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{2} -->\n### B\n\
+                 <!-- children:end -->\n\
+                 <!-- children:end -->\n",
+                root.id, a.id, b.id
+            ),
+        );
+        let changed = sync_outline_structure(&mut store, &path, false).expect("合法移动");
+        assert_eq!(changed, vec![b.id.clone()]);
+        assert_eq!(
+            store.get(&b.id).expect("B").parent_id.as_deref(),
+            Some(a.id.as_str()),
+            "文档说 B 在 A 下面 → 看板同步"
+        );
+
+        // 第二次：把两层对调 → A 要挂到它自己的后代 B 下 = 成环。
+        let path = write_outline_doc(
+            cwd,
+            "rep",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 移动\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{2} -->\n### B\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### A\n\
+                 <!-- children:end -->\n\
+                 <!-- children:end -->\n",
+                root.id, a.id, b.id
+            ),
+        );
+        let err = sync_outline_structure(&mut store, &path, false).expect_err("成环必须拒绝");
+        assert!(
+            err.contains(&a.id) && err.contains(&b.id),
+            "报错要点名两个 id：{err}"
+        );
+        assert_eq!(
+            store.get(&a.id).expect("A").parent_id.as_deref(),
+            Some(root.id.as_str()),
+            "A 一条都没动"
+        );
+        assert_eq!(
+            store.get(&b.id).expect("B").parent_id.as_deref(),
+            Some(a.id.as_str()),
+            "B 那条本来合法的改动也不许落地（没有部分应用）"
+        );
+    }
+
+    /// 草案从一条描述起步时大纲没有可挂的根，根锚是占位符 `LAT-ROOT`：它不该被
+    /// 当成"未知 id"，它下面那一层的父链也保持看板原样（这类大纲本来就有多个
+    /// 顶层任务共享同一份文档，根在板上根本不存在）。
+    #[test]
+    fn outline_sync_accepts_placeholder_root() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let a = make_outline_root(&mut store, "A", "docs/outlines/sentinel.md");
+        let b = make_task(&mut store, "B 旧标题");
+        store.get_mut(&b.id).expect("刚建").outline_path =
+            Some("docs/outlines/sentinel.md".to_string());
+        store.persist(&b.id).expect("落盘");
+
+        let path = write_outline_doc(
+            cwd,
+            "sentinel",
+            &format!(
+                "---\nschema: 1\ntask_id: LAT-ROOT\ntitle: 占位根\n---\n\
+                 <!-- node:LAT-ROOT -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{0} -->\n### A\n\
+                 <!-- node:{1} needs_split -->\n### 文档里的 B\n\
+                 <!-- children:end -->\n",
+                a.id, b.id
+            ),
+        );
+        let changed =
+            sync_outline_structure(&mut store, &path, false).expect("占位根不该被当成未知 id");
+        assert_eq!(changed, vec![b.id.clone()], "A 的标题与 needs_split 都没变");
+        let t = store.get(&b.id).expect("B");
+        assert_eq!(t.title, "文档里的 B");
+        assert!(t.needs_split);
+        assert_eq!(t.parent_id, None, "根下面那一层的父链由看板决定");
+    }
+
+    /// 板上多出来的任务默认**只报不删**：大纲里少一行锚点不等于「删掉整棵子树」，
+    /// 误删的代价远大于多确认一次。
+    #[test]
+    fn outline_sync_reports_missing_board_tasks_without_deleting() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/miss.md");
+        let kept = make_child(&mut store, &root, "旧标题");
+        let extra = make_child(&mut store, &root, "大纲里没有的");
+
+        let path = write_outline_doc(
+            cwd,
+            "miss",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 缺项\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### 新标题\n\
+                 <!-- children:end -->\n",
+                root.id, kept.id
+            ),
+        );
+        let err = sync_outline_structure(&mut store, &path, false).expect_err("缺项必须报");
+        assert!(err.contains(&extra.id), "报错要点名缺项 id：{err}");
+        assert!(
+            err.contains("prune=true"),
+            "报错要给出可执行的下一步：{err}"
+        );
+        assert!(store.get(&extra.id).is_some(), "默认不许删任务");
+        assert_eq!(
+            store.get(&kept.id).expect("kept").title,
+            "旧标题",
+            "有错就整单不落地：合格的那条也不许先改"
+        );
+    }
+
+    /// prune=true 才删，删的是**整棵子树**：只删缺项那一行、把它的后代留成孤儿，
+    /// 比不删更难收拾。
+    #[test]
+    fn outline_sync_prune_deletes_when_explicit() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/prune.md");
+        let extra = make_child(&mut store, &root, "多余");
+        let orphan = make_child(&mut store, &extra, "多余的后代");
+
+        let path = write_outline_doc(
+            cwd,
+            "prune",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 剪枝\n---\n<!-- node:{0} -->\n",
+                root.id
+            ),
+        );
+        let changed = sync_outline_structure(&mut store, &path, true).expect("显式 prune");
+        assert!(
+            changed.contains(&extra.id) && changed.contains(&orphan.id),
+            "changed 要列出被删的 id：{changed:?}"
+        );
+        assert!(store.get(&extra.id).is_none(), "缺项整棵子树都要删");
+        assert!(store.get(&orphan.id).is_none(), "后代不许留成孤儿");
+        assert!(store.get(&root.id).is_some(), "文档里还在的任务不许动");
+        // `delete` 是「移入 archive/」而不是真删：误 prune 还能从盘上捞回来。
+        let archived = cwd.join(".latte/tasks/archive");
+        for id in [&extra.id, &orphan.id] {
+            assert!(
+                archived.join(format!("{id}.json")).exists(),
+                "{id} 应移入 archive/"
+            );
+        }
+    }
+
+    /// prune 只对"不在本文档中"的部分生效：文档里还留着的后代要被改挂到新父节点
+    /// 上，不能跟着缺项的父一起埋掉——否则剪掉一行锚点会连累另一棵还活着的子树。
+    #[test]
+    fn outline_sync_prune_keeps_doc_listed_descendant() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/prune2.md");
+        let extra = make_child(&mut store, &root, "多余");
+        let survivor = make_child(&mut store, &extra, "还要留");
+
+        let path = write_outline_doc(
+            cwd,
+            "prune2",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 剪枝二\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### 还要留\n\
+                 <!-- children:end -->\n",
+                root.id, survivor.id
+            ),
+        );
+        let changed = sync_outline_structure(&mut store, &path, true).expect("prune");
+        let mut got = changed.clone();
+        got.sort();
+        let mut want = vec![extra.id.clone(), survivor.id.clone()];
+        want.sort();
+        assert_eq!(got, want, "改挂的 + 被删的都要出现在 changed 里");
+        assert!(store.get(&extra.id).is_none(), "缺项要删");
+        let t = store.get(&survivor.id).expect("文档里还留着的节点不许删");
+        assert_eq!(
+            t.parent_id.as_deref(),
+            Some(root.id.as_str()),
+            "它按文档改挂到根下"
+        );
+    }
+
+    /// 文档里的 id 在看板上不存在：报错并指向"恢复或重建"，绝不凭空建任务
+    /// （空壳任务只会让人以为大纲说了算）。
+    #[test]
+    fn outline_sync_reports_unknown_ids() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/ghost.md");
+        let real = make_child(&mut store, &root, "旧标题");
+
+        let path = write_outline_doc(
+            cwd,
+            "ghost",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 幽灵\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:{1} -->\n### 新标题\n\
+                 <!-- node:LAT-999 -->\n### 幽灵节点\n\
+                 <!-- children:end -->\n",
+                root.id, real.id
+            ),
+        );
+        let err = sync_outline_structure(&mut store, &path, false).expect_err("未知 id 必须报");
+        assert!(err.contains("LAT-999"), "报错要点名未知 id：{err}");
+        assert!(
+            err.contains("恢复") && err.contains("重建"),
+            "报错要给出恢复或重建两条路：{err}"
+        );
+        assert_eq!(
+            store.get(&real.id).expect("real").title,
+            "旧标题",
+            "未知 id 一出现就整单不落地"
+        );
+        assert!(store.get("LAT-999").is_none(), "同步不许凭空建任务");
+    }
+
+    /// 还带 `tmp:` 锚点的文档 = 草案从未定稿：里面的 id 一个都不能当真，直接
+    /// 整单拒绝并说清"先跑导入定稿"。
+    #[test]
+    fn outline_sync_rejects_tmp_anchors() {
+        let (dir, mut store) = tmp_store();
+        let cwd = dir.path();
+        let root = make_outline_root(&mut store, "根", "docs/outlines/draft.md");
+
+        let path = write_outline_doc(
+            cwd,
+            "draft",
+            &format!(
+                "---\nschema: 1\ntask_id: {0}\ntitle: 草案\n---\n\
+                 <!-- node:{0} -->\n\
+                 <!-- children:start -->\n\
+                 <!-- node:tmp:某标题 -->\n### 某标题\n\
+                 <!-- children:end -->\n",
+                root.id
+            ),
+        );
+        let err = sync_outline_structure(&mut store, &path, false).expect_err("草案必须拒绝");
+        assert!(err.contains("tmp:某标题"), "报错要点名临时锚：{err}");
+        assert!(err.contains("定稿"), "报错要指向下一步（先定稿）：{err}");
+        assert!(store.get(&root.id).is_some(), "什么都没改");
+    }
+
+    /// 任务（含祖先链）没有 `outline_path` → 没有可同步的文档：409 而不是
+    /// 404（任务在，只是它的状态不支持这个操作）。
+    #[test]
+    fn outline_sync_requires_outline() {
+        let (_dir, mut store) = tmp_store();
+        let plain = make_task(&mut store, "没有大纲");
+        let err = outline_abs_path_for_task(&store, &plain.id).expect_err("无大纲必须拒绝");
+        assert_eq!(err.status, 409, "无大纲是状态冲突不是 404：{err:?}");
+        assert!(err.message.contains(&plain.id), "报错要点名任务：{err:?}");
+        // 任务本身不存在 → 404（Handler 层同样靠这两个码区分）。
+        let err = outline_abs_path_for_task(&store, "LAT-404").expect_err("不存在");
+        assert_eq!(err.status, 404);
+        // 祖先链上有大纲 → 子孙一样能解析出同一份文档的绝对路径。
+        let root = make_outline_root(&mut store, "根", "docs/outlines/chain.md");
+        let child = make_child(&mut store, &root, "子");
+        let abs = outline_abs_path_for_task(&store, &child.id).expect("靠祖先链解析");
+        assert!(abs.ends_with("docs/outlines/chain.md"), "{abs:?}");
     }
 }

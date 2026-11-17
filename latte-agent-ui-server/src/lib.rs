@@ -766,6 +766,9 @@ fn build_router(state: AppState) -> Router {
             "/tasks/:id/workflow-runs/:wf_id",
             get(task_workflow_run_detail),
         )
+        // 大纲（手改后把结构推回看板：只动 title/needs_split/parent_id，
+        // 执行状态仍由看板独占；缺项默认只报，prune=true 才删）
+        .route("/outlines/:task_id/sync", post(sync_outline))
         // 工作流管理（编辑器 CRUD + 校验 + 测试运行）
         .route("/workflows", get(list_workflows_h).post(create_workflow_h))
         .route("/workflows/validate", post(validate_workflow_h))
