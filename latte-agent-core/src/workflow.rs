@@ -556,6 +556,67 @@ const BOOK_MAX_DESC_CHARS: usize = 260;
 /// 一本书的章数上限：清单是一次输出，章数再多就会在输出上限处被截断。
 const BOOK_MAX_CHAPTERS: usize = 40;
 
+/// 单章锚点体量 / 形态的机械判据，返回问题描述（空 = 合格）。
+///
+/// 抽出来是因为它必须在**两个时机**用同一套判据：
+/// ① 骨架阶段（`require_learn_skeleton` / 扇出前）：`chapters.json` 里的
+///    `paths` 就已经能测出大文件，早拦能省掉整轮扇出；
+/// ② 装配阶段（`require_learn_book`）：条目可能被改过，还要再数一遍。
+///
+/// 曾经只在装配阶段查，而 `detail` 的 prompt 要求「paths 原样照抄骨架」——
+/// 坏 `paths` 是骨架带进来的，定向返工只重做条目、改不了骨架，于是同一批
+/// 章每次都撞同一堵墙直到 `max_attempts` 耗尽（2026-11-16 linux 书目录：
+/// 8 章各锚一个 3k–13k 行的巨型文件，两轮返工后整单 failed）。
+fn anchor_volume_problems(
+    cwd: &Path,
+    title: &str,
+    desc: &str,
+    paths: &[String],
+    is_reading: bool,
+    rank: Option<usize>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let branch_or_leaf = rank.is_none_or(|r| r >= LAYER_BRANCH);
+    if is_reading && branch_or_leaf && paths.is_empty() {
+        problems.push(format!(
+            "精读章「{title}」没有 paths：至少锚定 1 个先用 search / ls 核实过存在的 .cc / .c 文件；超大文件（> {BOOK_MAX_FILE_LINES} 行）别当锚点，换同一功能的小文件"
+        ));
+        return problems;
+    }
+    if !is_reading || paths.is_empty() {
+        return problems;
+    }
+    let v = crate::learn_complexity::measure_paths(cwd, paths);
+    if v.max_file_lines > BOOK_MAX_FILE_LINES {
+        problems.push(format!(
+            "「{title}」把 {} 行的大文件 {} 整个当锚点：一章读不完，plan 也没法在里面选。把它从 paths 里去掉（paths 可以留空，learn_loop 会现场取证），在描述里点名要读的函数",
+            v.max_file_lines, v.largest
+        ));
+    } else if v.lines > BOOK_MAX_CHAPTER_LINES {
+        problems.push(format!(
+            "「{title}」锚点合计 {} 行（上限 {BOOK_MAX_CHAPTER_LINES}），一章学不完：拆成两章，或去掉次要的锚点文件",
+            v.lines
+        ));
+    } else if v.lines > 0 && branch_or_leaf && v.lines < BOOK_MIN_CHAPTER_LINES {
+        problems.push(format!(
+            "「{title}」锚点合计只有 {} 行（下限 {BOOK_MIN_CHAPTER_LINES}），太薄，撑不起一个知识点，不值得单独成章：与相邻的同层章合并",
+            v.lines
+        ));
+    }
+    let header_only = paths
+        .iter()
+        .all(|p| [".h", ".hh", ".hpp"].iter().any(|e| p.ends_with(e)));
+    let says_interface = ["接口", "契约", "声明", "配置", "API"]
+        .iter()
+        .any(|k| desc.contains(k) || title.contains(k));
+    if header_only && !says_interface {
+        problems.push(format!(
+            "「{title}」只锚定了头文件（只有声明，没有行为），但验收要求读出行为 / 成因 / 时序：加上对应的 .cc / .c 实现文件，或在描述里写明这一章只学接口契约"
+        ));
+    }
+    problems
+}
+
 /// 汇总跨章重复的精读锚点。输入既可来自最终 task 清单，也可来自
 /// `chapters.json` 骨架；两层共用同一判据，避免坏骨架先扇出几十章后才失败。
 fn shared_anchor_problems(
@@ -801,42 +862,14 @@ fn check_learn_book_output(output: &str, cwd: &std::path::Path) -> Result<(), St
         let is_reading = t["task_type"].as_str().map(str::trim) == Some("learn_loop");
         // `learn_loop` 表示交互式课程形态，不等同于每章都必须做源码精读。
         // 地基/树干允许是概念课而没有锚点；进入枝干/树叶后才要求源码落点。
-        let requires_anchor = is_reading && *rank >= LAYER_BRANCH;
-        if requires_anchor && paths.is_empty() {
-            problems.push(format!(
-                "精读章「{title}」没有 paths：至少锚定 1 个先用 search / ls 核实过存在的 .cc / .c 文件；超大文件（> {BOOK_MAX_FILE_LINES} 行）别当锚点，换同一功能的小文件"
-            ));
-        }
-        if is_reading && !paths.is_empty() {
-            let v = crate::learn_complexity::measure_paths(cwd, &paths);
-            if v.max_file_lines > BOOK_MAX_FILE_LINES {
-                problems.push(format!(
-                    "「{title}」把 {} 行的大文件 {} 整个当锚点：一章读不完，plan 也没法在里面选。把它从 paths 里去掉（paths 可以留空，learn_loop 会现场取证），在 description 里点名要读的函数",
-                    v.max_file_lines, v.largest
-                ));
-            } else if v.lines > BOOK_MAX_CHAPTER_LINES {
-                problems.push(format!(
-                    "「{title}」锚点合计 {} 行（上限 {BOOK_MAX_CHAPTER_LINES}），一章学不完：拆成两章，或去掉次要的锚点文件",
-                    v.lines
-                ));
-            } else if v.lines > 0 && *rank >= LAYER_BRANCH && v.lines < BOOK_MIN_CHAPTER_LINES {
-                problems.push(format!(
-                    "「{title}」锚点合计只有 {} 行（下限 {BOOK_MIN_CHAPTER_LINES}），太薄，撑不起一个知识点，不值得单独成章：与相邻的同层章合并",
-                    v.lines
-                ));
-            }
-            let header_only = paths
-                .iter()
-                .all(|p| [".h", ".hh", ".hpp"].iter().any(|e| p.ends_with(e)));
-            let says_interface = ["接口", "契约", "声明", "配置", "API"]
-                .iter()
-                .any(|k| desc.contains(k) || title.contains(k));
-            if header_only && !says_interface {
-                problems.push(format!(
-                    "「{title}」只锚定了头文件（只有声明，没有行为），但验收要求读出行为 / 成因 / 时序：加上对应的 .cc / .c 实现文件，或在描述里写明这一章只学接口契约"
-                ));
-            }
-        }
+        problems.extend(anchor_volume_problems(
+            cwd,
+            &title,
+            desc,
+            &paths,
+            is_reading,
+            Some(*rank),
+        ));
     }
     // ── 第二遍：章号连续、枝干要回指推导、被多章依赖的不是树叶 ──
     {
@@ -1460,20 +1493,78 @@ fn gate_targets_key(step_id: &str) -> String {
     format!("__gate_invalidated_targets:{step_id}")
 }
 
-/// 删除 cwd 内的若干普通文件（定向返工的产物失效），返回实际删掉的相对路径。
-/// 规范化后再比前缀，挡住 `..` 穿越；不存在/不是文件的静默跳过。
-fn remove_cwd_files(cwd: &Path, rels: &[String]) -> Vec<String> {
-    let mut removed = Vec::new();
-    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    for rel in rels {
-        let Ok(p) = cwd.join(rel).canonicalize() else {
-            continue;
-        };
-        if p.starts_with(&root) && p.is_file() && std::fs::remove_file(&p).is_ok() {
-            removed.push(rel.clone());
+/// 把 workflow 配置里的产物相对路径做**词法**归一，返回 `a/b/c` 形式。
+/// 拒绝绝对路径、根/盘符前缀与 `..` 穿越；不做 canonicalize（原因见
+/// [`remove_cwd_files`]）。
+fn lexical_workspace_rel(rel: &str) -> Option<String> {
+    let path = Path::new(rel.trim());
+    if path.is_absolute() {
+        return None;
+    }
+    let mut out: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(s) => out.push(s.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => return None,
         }
     }
-    removed
+    (!out.is_empty()).then(|| out.join("/"))
+}
+
+/// 删除 cwd 内的若干普通文件（定向返工的产物失效），返回
+/// `(已删, 删不掉)`，两者都回填配置里的原始相对路径。
+///
+/// 边界必须按**词法**判，不能 canonicalize 后比前缀：task-worktree 会把
+/// `<worktree>/.latte` 做成指向 `<repo>/.latte` 的软链
+/// （`task_worktree::link_state_dir`），而 learn_plan 的产物恰好全在
+/// `.latte/learn-plan/` 下。canonicalize 把目标解析回真实仓库，于是
+/// `starts_with(cwd)` 恒假、静默删 0 个文件 → 返工步的 `skip_fresh` 看到旧
+/// 产物仍然新鲜而零派发 → 装配拿同一份坏数据再失败一次，直到
+/// `max_attempts` 耗尽整单 failed（2026-11-16 linux 书目录实测：连报
+/// 「失效 0 个产物」+「step 'detail' 扇出 0 个任务」）。
+/// 路径来源是 TOML 配置 + `is_safe_target_id` 过滤过的章号，词法边界足够。
+///
+/// 不存在 = 本来就没产物（有的目标章从未落盘），不算失败；存在却删不掉
+/// 才算——调用方必须把失败吵出来，否则就是「静默零派发」重演。
+fn remove_cwd_files(cwd: &Path, rels: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut failed = Vec::new();
+    for rel in rels {
+        let Some(path) = lexical_workspace_rel(rel) else {
+            failed.push(rel.clone());
+            continue;
+        };
+        let full = cwd.join(&path);
+        if !full.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&full) {
+            Ok(()) => removed.push(rel.clone()),
+            Err(_) => failed.push(rel.clone()),
+        }
+    }
+    (removed, failed)
+}
+
+/// 定向返工失效失败要吵：删不掉的产物会让返工步零派发，用同一份坏产物把
+/// 同一处失败重演到重试耗尽。
+fn warn_unremoved_artifacts(
+    event_tx: &broadcast::Sender<ChatEvent>,
+    step_id: &str,
+    failed: &[String],
+) {
+    if failed.is_empty() {
+        return;
+    }
+    let _ = event_tx.send(ChatEvent::Status {
+        message: format!(
+            "⚠ step '{step_id}' 定向返工失效失败：{failed:?} 删不掉——返工步很可能零派发、\
+             把同一处失败原样重演"
+        ),
+    });
 }
 
 const VERDICT_SEVERITIES: [&str; 3] = ["blocking", "important", "nit"];
@@ -13276,7 +13367,8 @@ async fn run_workflow_serial(
                     vars.remove(&tkey);
                 }
                 if output.starts_with("VERDICT: REJECT") && !invalidate.is_empty() {
-                    let removed = remove_cwd_files(&ctx.cwd, &invalidate);
+                    let (removed, failed) = remove_cwd_files(&ctx.cwd, &invalidate);
+                    warn_unremoved_artifacts(&ctx.event_tx, &step.id, &failed);
                     let _ = ctx.event_tx.send(ChatEvent::Status {
                         message: format!(
                             "[workflow '{}'] 定向返工：失效 {} 个产物 {:?}",
@@ -13380,7 +13472,8 @@ async fn run_workflow_serial(
                                         p
                                     })
                                     .collect();
-                                let removed = remove_cwd_files(&ctx.cwd, &paths);
+                                let (removed, failed) = remove_cwd_files(&ctx.cwd, &paths);
+                                warn_unremoved_artifacts(&ctx.event_tx, &step.id, &failed);
                                 let _ = ctx.event_tx.send(ChatEvent::Status {
                                     message: format!(
                                         "↩ step '{}' 装配校验未通过，定向返工 {targets:?}（第 {attempt}/{max} 次，失效 {} 个产物）：跳回 '{}' 重做",
@@ -13396,6 +13489,13 @@ async fn run_workflow_serial(
                                      不依赖它的表述。",
                                     targets.join("、")
                                 ));
+                                // 续跑时目标步可能已在 `done_steps` 里（checkpoint
+                                // 记过完成）—— 不摘掉就会被循环顶部的「已完成跳过」
+                                // 直接越过，返工空转（2026-11-16 实测：resume 后
+                                // assemble 连报两次「定向返工 ["ch08"]」，rechapter
+                                // 一步没跑，最后死于「缺章 ch08」）。其它 rework 路径
+                                // （loop_until / gate / 契约返工）都摘了，这里漏了。
+                                done_steps.remove(wf.steps[t].id.as_str());
                                 idx = t;
                                 continue;
                             }
@@ -14590,13 +14690,44 @@ fn collect_plan_tasks_mechanical(
         if let Some(d) = elem.get("depends_on") {
             obj.insert("depends_on".into(), d.clone());
         }
+        // `paths` 同样是骨架权威字段：骨架的 paths 决定每章读多少行，是体量
+        // 判据（`anchor_volume_problems`）的输入。不覆盖的话，detail 里加进来
+        // 的巨型文件会存活到装配，而装配只报症状（「把 7127 行的 fair.c 整个
+        // 当锚点」）、又说不出该回哪儿修——骨架阶段查不出（骨架是干净的）、
+        // 定向返工改不动骨架，于是每轮重做撞同一堵墙直到重试耗尽（2026-11-16
+        // linux 书目录：8 章各锚一个 3k–13k 行的文件，两轮返空中整单 failed）。
+        // 覆盖后不变式闭合：骨架是结构字段的唯一真相，detail 无权扩写锚点。
+        if let Some(p) = elem.get("paths") {
+            obj.insert("paths".into(), p.clone());
+        }
         tasks.push(val);
     }
     // 3) 拼成唯一 tasks fence（紧凑 JSON）。
     let body = serde_json::to_string(&serde_json::json!({ "tasks": tasks }))
         .map_err(|e| format!("序列化 tasks 失败：{e}"))?;
     let fence = format!("```json\n{body}\n```");
-    // 4) 跑与模型步同一套机械校验：基础任务/章节约束之后，按配置继续跑
+    // 4) 逐章先把**可归因**的机械错误标上章号再报：`collect_plan_tasks.on_fail`
+    // 只能按报错里的 chNN 定向返工到 rechapter（见 `collect_fail_targets`），
+    // 而 paths 存在性报错带的是清单下标 `tasks[N]`，带不出章号（装配步按章读
+    // 条目，只有这里知道下标↔章号的对应）。点不出章 → 整单判死。
+    // 实测 2026-11-15 linux 会话：ch08 把不存在的 `kernel/locking/seqlock.c`
+    // 写进 paths，23 章扇出 ~107 万 token 后 assemble 直接 failed，on_fail 的
+    // 定向返工一次都没用上——而它正是为这种「单章路径幻觉」设计的。
+    // 单任务校验的判据（paths 存在性 / workflow 名 / task_type 名）恰好都是
+    // 逐任务的；跨任务判据（paths 重叠、章号链、书结构）留给下面的全局校验。
+    let mut per_chapter: Vec<String> = Vec::new();
+    for (id, task) in ids.iter().zip(tasks.iter()) {
+        if let Err(e) = crate::controller::validate_single_plan_task(cwd, task) {
+            per_chapter.push(format!("章 {id}：{e}"));
+        }
+    }
+    if !per_chapter.is_empty() {
+        return Err(format!(
+            "装配后校验未通过：任务清单未通过机械校验：\n- {}",
+            per_chapter.join("\n- ")
+        ));
+    }
+    // 5) 跑与模型步同一套机械校验：基础任务/章节约束之后，按配置继续跑
     // 学习书全局约束。机械装配不能静默跳过 `require_learn_book`，否则共享
     // 锚点、层级、体量等问题只会在旧的模型装配路径里被发现。
     check_plan_tasks_output(&fence, cwd, learn_chapters)
@@ -14672,7 +14803,7 @@ fn load_fan_out_items(
     }
     // 扇出前骨架校验：坏骨架在派发任何子会话之前就失败。
     if fo.require_learn_chapters {
-        validate_learn_chapters_skeleton(arr).map_err(|e| {
+        validate_learn_chapters_skeleton(arr, cwd).map_err(|e| {
             format!(
                 "{} 骨架校验未过（扇出前拦截，省掉整轮扇出）：{e}",
                 full.display()
@@ -14715,15 +14846,23 @@ fn check_learn_skeleton_file(
     if arr.is_empty() {
         return Err(format!("骨架文件 {p} 的 chapters 为空"));
     }
-    validate_learn_chapters_skeleton(arr)
+    validate_learn_chapters_skeleton(arr, cwd)
 }
 
 /// `fan_out.require_learn_chapters` 的扇出前校验：把骨架元素
 /// （`id`/`title`/`depends_on`/`brief`/`accept`）折成 [`PlanTask`] 跑
 /// [`check_learn_chapters`]，并在扇出前统计精读锚点归属。这样同一文件被
 /// 三章以上使用时会直接要求重写骨架，不必先生成全部单章文件。
-fn validate_learn_chapters_skeleton(elems: &[serde_json::Value]) -> Result<(), String> {
+///
+/// 锚点体量也在这里查（[`anchor_volume_problems`]）：骨架的 `paths` 已经
+/// 决定了每章读多少行，装配阶段才发现就晚了——`detail` 被要求原样照抄
+/// 骨架 paths，定向返工改不动骨架。
+fn validate_learn_chapters_skeleton(
+    elems: &[serde_json::Value],
+    cwd: &Path,
+) -> Result<(), String> {
     let mut tasks: Vec<crate::controller::PlanTask> = Vec::with_capacity(elems.len());
+    let mut volume: Vec<String> = Vec::new();
     for e in elems {
         let title = e.get("title").and_then(|v| v.as_str()).unwrap_or_default();
         let brief = e.get("brief").and_then(|v| v.as_str()).unwrap_or_default();
@@ -14732,6 +14871,29 @@ fn validate_learn_chapters_skeleton(elems: &[serde_json::Value]) -> Result<(), S
             .get("depends_on")
             .cloned()
             .unwrap_or(serde_json::json!([]));
+        let paths = e
+            .get("paths")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+        let is_reading =
+            e.get("task_type").and_then(|v| v.as_str()).map(str::trim) == Some("learn_loop");
+        let rank = e
+            .get("layer")
+            .and_then(|v| v.as_str())
+            .and_then(|l| BOOK_LAYERS.iter().position(|x| *x == l.trim()));
+        volume.extend(anchor_volume_problems(
+            cwd,
+            title.trim(),
+            &format!("{brief} {accept}"),
+            &paths,
+            is_reading,
+            rank,
+        ));
         let pt: crate::controller::PlanTask = serde_json::from_value(serde_json::json!({
             "title": title,
             "description": format!("{brief} {accept}"),
@@ -14761,17 +14923,26 @@ fn validate_learn_chapters_skeleton(elems: &[serde_json::Value]) -> Result<(), S
             .unwrap_or_default();
         (title, is_reading, paths)
     }));
-    match (chapter_check, shared.is_empty()) {
-        (Ok(()), true) => Ok(()),
-        (Err(e), true) => Err(e),
-        (Ok(()), false) => Err(format!(
+    let mut errs: Vec<String> = Vec::new();
+    if let Err(e) = chapter_check {
+        errs.push(e);
+    }
+    if !shared.is_empty() {
+        errs.push(format!(
             "学习书骨架存在重复精读锚点：\n- {}",
             shared.join("\n- ")
-        )),
-        (Err(e), false) => Err(format!(
-            "{e}\n学习书骨架存在重复精读锚点：\n- {}",
-            shared.join("\n- ")
-        )),
+        ));
+    }
+    if !volume.is_empty() {
+        errs.push(format!(
+            "学习书骨架的锚点体量不合格（改 chapters.json 的 paths，别指望单章条目能改）：\n- {}",
+            volume.join("\n- ")
+        ));
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("\n"))
     }
 }
 
@@ -22630,6 +22801,157 @@ max_items = 2
             server.received_requests().await.unwrap().len(),
             1,
             "只跑了 prep"
+        );
+    }
+
+    /// 装配失败必须能定向返工（回归 2026-11-15 linux 会话）：ch02 的 paths 写了
+    /// 不存在的文件 → assemble 的报错带「章 ch02」→ on_fail 删掉该章产物、带着
+    /// 原始错误跳回生成步，而不是整单判死。此前 paths 存在性报错只报路径、不带
+    /// 章号，`collect_fail_targets` 抽不出目标 → 整条 workflow failed。
+    #[tokio::test]
+    async fn assemble_failure_reworks_named_chapter_only() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "assemble_rework_probe"
+[[steps]]
+id = "detail"
+role = "worker"
+task = "写章节 {{topic}}"
+[[steps]]
+id = "assemble"
+output_key = "tasks"
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json", on_fail = { rework = "detail", invalidate = "tasks/{{target}}.json", max_attempts = 1 } }
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("validate");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.c"), "int a;\n").unwrap();
+        std::fs::write(
+            root.join("chapters.json"),
+            r#"{"chapters":[{"id":"ch01"},{"id":"ch02"}]}"#,
+        )
+        .unwrap();
+        let chapter = |path: &str| {
+            serde_json::json!({
+                "title": "ch", "description": "学什么", "priority": 2,
+                "labels": ["学习", "只读"], "task_type": "learn_loop", "workflow": "",
+                "depends_on": [], "paths": [path], "subtasks": []
+            })
+            .to_string()
+        };
+        std::fs::write(root.join("tasks/ch01.json"), chapter("src/a.c")).unwrap();
+        std::fs::write(root.join("tasks/ch02.json"), chapter("src/ghost.c")).unwrap();
+
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server)
+            .await;
+        let (ctx, _rx) = test_ctx_at(test_config_at(&server.uri()), root.to_path_buf());
+
+        // 返工后的 detail 不会重写 ch02（模型只回 "ok"），第二次装配报缺章 →
+        // max_attempts=1 用尽才判死。判死是预期的，要验的是它**先**定向返工了一轮。
+        let err = run_workflow(&wf, "学 X", &ctx)
+            .await
+            .expect_err("两次装配都缺 ch02，最终必须失败");
+        let bodies: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .collect();
+        assert_eq!(bodies.len(), 2, "定向返工只该重跑 1 次生成步：{bodies:?}");
+        assert!(
+            !bodies[0].contains("章 ch02"),
+            "首轮不该带返工反馈：{}",
+            bodies[0]
+        );
+        assert!(
+            bodies[1].contains("只修点名章 ch02"),
+            "返工反馈必须点名病灶章：{}",
+            bodies[1]
+        );
+        assert!(
+            bodies[1].contains("src/ghost.c") && bodies[1].contains("必须整条存在"),
+            "返工反馈必须带上原始机械错误：{}",
+            bodies[1]
+        );
+        assert!(
+            !root.join("tasks/ch02.json").exists(),
+            "病灶章产物应被删除，重扇才只做它"
+        );
+        assert!(root.join("tasks/ch01.json").exists(), "好章产物不能被动");
+        assert!(err.contains("缺章 ch02"), "{err}");
+    }
+
+    /// 续跑时 `on_fail` 的返工目标不能被「已完成跳过」吃掉。
+    /// 2026-11-16 实测（chat 里的 `/wf-resume`）：assemble 连报两次
+    /// 「定向返工 ["ch08"]」，重做步一步没跑（0 次模型调用），最后死于
+    /// 「缺章 ch08」——目标步在 checkpoint 里记过完成，`done_steps` 把它跳过。
+    #[tokio::test]
+    async fn resume_reworks_target_even_when_checkpointed_complete() {
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "assemble_resume_probe"
+[[steps]]
+id = "detail"
+role = "worker"
+task = "写章节 {{topic}}"
+[[steps]]
+id = "assemble"
+output_key = "tasks"
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json", on_fail = { rework = "detail", invalidate = "tasks/{{target}}.json", max_attempts = 1 } }
+"#,
+        )
+        .unwrap();
+        wf.validate().expect("validate");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        std::fs::write(root.join("chapters.json"), r#"{"chapters":[{"id":"ch01"}]}"#).unwrap();
+
+        let server1 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server1)
+            .await;
+        let (ctx1, _rx1) = test_ctx_at(test_config_at(&server1.uri()), root.to_path_buf());
+        // 模型不落盘 → assemble 报「缺章 ch01」→ 定向返工 detail（第 1/1 次）
+        // → 仍缺章 → 判死。首轮 detail 共跑 2 次。
+        let err = run_workflow(&wf, "学 X", &ctx1)
+            .await
+            .expect_err("缺章 ch01 必然失败");
+        assert!(err.contains("缺章 ch01"), "{err}");
+        assert_eq!(
+            server1.received_requests().await.unwrap().len(),
+            2,
+            "首轮 = 1 次生成 + 1 次定向返工：{err}"
+        );
+        let wf_id = extract_wf_id(&err);
+
+        // 续跑：detail 已记成完成。若它被 done_steps 跳过，第二轮装配会
+        // 立刻二次失败且**零**模型调用。
+        let server2 = wiremock::MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("ok")))
+            .mount(&server2)
+            .await;
+        let (ctx2, _rx2) = test_ctx_at(test_config_at(&server2.uri()), root.to_path_buf());
+        let _ = run_workflow_resume(&wf, "", &ctx2, &wf_id)
+            .await
+            .expect_err("仍缺章，依旧失败");
+        assert_eq!(
+            server2.received_requests().await.unwrap().len(),
+            1,
+            "返工目标必须真跑一次（被续跑跳过就是 0 次）"
         );
     }
 
@@ -31485,6 +31807,59 @@ mod learn_plan_gate_tests {
         assert_eq!(parsed[0].targets, vec!["ch02", "ch05"]);
     }
 
+    /// 产物失效必须真的删掉：`<worktree>/.latte` 是指向主仓 `.latte` 的软链
+    /// （`task_worktree::link_state_dir`），learn_plan 的产物全在这底下。
+    /// 曾按 canonicalize 比前缀 → 目标解析回主仓、`starts_with(cwd)` 恒假、
+    /// 静默删 0 个 → 返工步 `skip_fresh` 零派发、同一处失败重演到耗尽
+    /// （2026-11-16 linux 书目录：assemble 连报两次「失效 0 个产物」＋
+    /// 「扇出 0 个任务」，最终整单 failed）。
+    #[cfg(unix)]
+    #[test]
+    fn remove_cwd_files_deletes_through_symlinked_state_dir() {
+        let repo = tempfile::tempdir().unwrap();
+        let tasks = repo.path().join(".latte/learn-plan/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        for ch in ["ch08", "ch10"] {
+            std::fs::write(tasks.join(format!("{ch}.json")), b"{}").unwrap();
+        }
+        // 模拟 task worktree：独立的 cwd，`.latte` 软链回主仓。
+        let worktree = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(repo.path().join(".latte"), worktree.path().join(".latte"))
+            .unwrap();
+
+        let rels = vec![
+            ".latte/learn-plan/tasks/ch08.json".to_string(),
+            ".latte/learn-plan/tasks/ch10.json".to_string(),
+            // 从未落盘的章：不存在 ≠ 失败。
+            ".latte/learn-plan/tasks/ch99.json".to_string(),
+        ];
+        let (removed, failed) = remove_cwd_files(worktree.path(), &rels);
+        assert_eq!(removed, rels[..2].to_vec(), "软链下的产物必须真删");
+        assert!(failed.is_empty(), "不存在不算失败: {failed:?}");
+        assert!(!tasks.join("ch08.json").exists());
+        assert!(!tasks.join("ch10.json").exists());
+    }
+
+    /// 词法边界：`..` 穿越与绝对路径一律删不掉（且要被判为失败，不静默）。
+    #[test]
+    fn remove_cwd_files_rejects_escapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("ch01.json");
+        std::fs::write(&victim, b"{}").unwrap();
+
+        let (removed, failed) = remove_cwd_files(
+            dir.path(),
+            &[
+                "../ch01.json".to_string(),
+                victim.to_string_lossy().into_owned(),
+            ],
+        );
+        assert!(removed.is_empty());
+        assert_eq!(failed.len(), 2, "逃逸必须报失败，不能静默: {failed:?}");
+        assert!(victim.exists(), "仓外文件绝不能被删");
+    }
+
     /// 字段归属（jemalloc ui-248856 复盘）：审查把「给 ch32 的 depends_on
     /// 加 ch31」标成 rechapter，但定向返工步无权改骨架的 depends_on——
     /// 机械门必须升级为全量返工，且不删任何产物。
@@ -31603,42 +31978,93 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
         assert!(err.contains("必须用 write 写出"), "{err}");
     }
 
+    /// 锚点体量必须在**骨架阶段**就拦：`detail` 被要求原样照抄骨架 paths，
+    /// 定向返工改不动骨架，于是坏骨架会让同一批章每次装配都撞同一堵墙直到
+    /// `max_attempts` 耗尽（2026-11-16 linux 书目录：8 章各锚一个
+    /// 3k–13k 行的巨型文件，两轮返工后整单 failed）。
+    #[test]
+    fn learn_skeleton_check_flags_oversized_anchors_before_fanout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("kernel")).unwrap();
+        // 4000 行 > BOOK_MAX_FILE_LINES：整个文件当锚点必须被打回。
+        let big: String = (0..4000).map(|i| format!("int v{i};\n")).collect();
+        std::fs::write(root.join("kernel/huge.c"), big).unwrap();
+        std::fs::write(root.join("kernel/small.c"), "int a;\n".repeat(400)).unwrap();
+
+        let ch = |id: &str, path: &str, layer: &str| {
+            serde_json::json!({
+                "id": id,
+                "title": format!("{id} 章"),
+                "brief": "回应事实2：学一个子系统",
+                "accept": "能讲清机制成因",
+                "task_type": "learn_loop",
+                "depends_on": [],
+                "paths": [path],
+                "layer": layer
+            })
+        };
+        let write = |chapters: serde_json::Value| {
+            std::fs::write(
+                root.join("chapters.json"),
+                serde_json::json!({"chapters": chapters}).to_string(),
+            )
+            .unwrap();
+        };
+
+        write(serde_json::json!([ch("ch01", "kernel/huge.c", "层-枝干")]));
+        let err = check_learn_skeleton_file("chapters.json", &HashMap::new(), root).unwrap_err();
+        assert!(err.contains("整个当锚点"), "骨架阶段就要拦下巨型锚点: {err}");
+        assert!(err.contains("paths"), "要指明改骨架的 paths: {err}");
+
+        write(serde_json::json!([ch("ch01", "kernel/small.c", "层-枝干")]));
+        check_learn_skeleton_file("chapters.json", &HashMap::new(), root)
+            .expect("换成体量合格的锚点后应通过");
+    }
+
     #[test]
     fn collect_plan_tasks_overrides_skeleton_and_reports_missing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let base = root.join(".latte/learn-plan");
         std::fs::create_dir_all(base.join("tasks")).unwrap();
+        // 骨架锚点必须真实存在（装配会校验 paths 存在性）。
+        std::fs::create_dir_all(root.join("mm")).unwrap();
+        std::fs::write(root.join("mm/small_page.c"), "// page\n").unwrap();
         // 骨架：ch01 → ch02（ch02 先修 ch01），权威标题。
+        // ch02 的骨架锚点是体量合格的小文件；detail 若私自换成巨型文件，
+        // 装配必须以骨架为准覆盖回去。
         std::fs::write(
             base.join("chapters.json"),
             serde_json::json!({"chapters":[
-                {"id":"ch01","title":"ch01 环境搭建","depends_on":[]},
-                {"id":"ch02","title":"ch02 整体地图","depends_on":["ch01 环境搭建"]}
+                {"id":"ch01","title":"ch01 环境搭建","depends_on":[],"paths":[]},
+                {"id":"ch02","title":"ch02 整体地图","depends_on":["ch01 环境搭建"],"paths":["mm/small_page.c"]}
             ]})
             .to_string(),
         )
         .unwrap();
-        let task = |title: &str, deps: serde_json::Value| {
+        let task = |title: &str, deps: serde_json::Value, paths: serde_json::Value| {
             serde_json::json!({
                 "title": title, "description": "学什么+能讲清什么",
                 "priority": 2, "labels": ["学习","只读","第1编"],
                 "task_type": "learn_loop", "workflow": "", "depends_on": deps,
-                "paths": [], "subtasks": []
+                "paths": paths, "subtasks": []
             })
             .to_string()
         };
         std::fs::write(
             base.join("tasks/ch01.json"),
-            task("ch01 环境搭建", serde_json::json!([])),
+            task("ch01 环境搭建", serde_json::json!([]), serde_json::json!([])),
         )
         .unwrap();
-        // ch02 详情文件标题被模型改漂了 + 依赖写错——机械步应以骨架覆盖。
+        // ch02 详情文件标题被模型改漂了 + 依赖写错 + 私自把锚点换成巨型文件
+        // ——机械步应全部以骨架覆盖。
         std::fs::write(
             base.join("tasks/ch02.json"),
             task(
                 "ch02 地图（被改写的标题）",
                 serde_json::json!(["ch01 环境搭建（也被改写）"]),
+                serde_json::json!(["mm/small_page.c", "mm/huge_scan.c"]),
             ),
         )
         .unwrap();
@@ -31658,12 +32084,75 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[1]["title"], "ch02 整体地图");
         assert_eq!(arr[1]["depends_on"][0], "ch01 环境搭建");
+        assert_eq!(
+            arr[1]["paths"],
+            serde_json::json!(["mm/small_page.c"]),
+            "paths 是骨架权威字段：detail 自行扩写的巨型锚点必须被丢弃"
+        );
 
         // 缺章：删掉 ch02 的文件，报错并指名。
         std::fs::remove_file(base.join("tasks/ch02.json")).unwrap();
         let err =
             collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true, false).unwrap_err();
         assert!(err.contains("缺章 ch02"), "{err}");
+    }
+
+    /// 单章 paths 幻觉（只读任务的整条路径不存在）必须把错误归到章号上：
+    /// assemble 的 `collect_plan_tasks.on_fail` 只能按报错里的 chNN 定向返工
+    /// 到 rechapter，报错里没有章号就整单判死（2026-11-15 linux 会话实测：
+    /// ch08 写 `kernel/locking/seqlock.c`，23 章扇出 ~107 万 token 后 failed）。
+    #[test]
+    fn collect_plan_tasks_attributes_hallucinated_path_to_chapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let base = root.join(".latte/learn-plan");
+        std::fs::create_dir_all(base.join("tasks")).unwrap();
+        std::fs::create_dir_all(root.join("kernel/locking")).unwrap();
+        std::fs::write(root.join("kernel/locking/mutex.c"), "// mutex\n").unwrap();
+        std::fs::write(
+            base.join("chapters.json"),
+            serde_json::json!({"chapters":[
+                {"id":"ch01","title":"ch01 锁","depends_on":[]},
+                {"id":"ch02","title":"ch02 调度","depends_on":[]}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let task = |paths: serde_json::Value| {
+            serde_json::json!({
+                "title": "x", "description": "学什么+能讲清什么",
+                "priority": 2, "labels": ["学习","只读","第1编"],
+                "task_type": "learn_loop", "workflow": "", "depends_on": [],
+                "paths": paths, "subtasks": []
+            })
+            .to_string()
+        };
+        std::fs::write(
+            base.join("tasks/ch01.json"),
+            task(serde_json::json!(["kernel/locking/mutex.c"])),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("tasks/ch02.json"),
+            task(serde_json::json!(["kernel/locking/seqlock.c"])),
+        )
+        .unwrap();
+        let cp = CollectPlanTasks {
+            order_file: ".latte/learn-plan/chapters.json".into(),
+            order_items: "chapters".into(),
+            order_id: "id".into(),
+            task_file: ".latte/learn-plan/tasks/{{id}}.json".into(),
+            on_fail: None,
+        };
+        let err =
+            collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true, false).unwrap_err();
+        assert!(err.contains("章 ch02"), "{err}");
+        assert!(err.contains("kernel/locking/seqlock.c"), "{err}");
+        // 报错的措辞必须与事实相符：目录存在、文件不存在。
+        assert!(err.contains("必须整条存在"), "{err}");
+        assert!(!err.contains("第一级目录不存在"), "{err}");
+        // 且必须能被 on_fail 解析成可定向返工的章号。
+        assert_eq!(collect_fail_targets(&err), vec!["ch02"]);
     }
 
     #[test]

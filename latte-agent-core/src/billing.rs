@@ -258,6 +258,18 @@ const BILLING_MARKERS: &[&str] = &[
     "账户余额",
 ];
 
+/// 「账户额度用完」但报文里没写「余额/额度」时的**组合**判据。
+///
+/// 实测 MiniMax（2026-11-14 linux 会话）：429 + `已达到 Token Plan 用量上限：
+/// 请升级 Token Plan 套餐或购买积分补充用量。 (2056)`。这其实是账户级上限
+/// （充值才恢复），但按普通限流处理会每 60s 白打一次，一整晚都在重试一个已经
+/// 没量的账户，还把 `glm-5.3` 的 payload 400 挤在同一个「模型不可用」里。
+///
+/// 单独一个「用量上限」不足以定性：`TPM 用量上限` 是每分钟配额，属于可自愈的
+/// 限流。所以要求**同时**出现「升级/购买/充值/套餐」这类要人掏钱的措辞。
+const QUOTA_CAP_PHRASES: &[&str] = &["用量上限", "使用上限", "配额已用尽", "配额用尽"];
+const TOPUP_PHRASES: &[&str] = &["升级", "购买", "充值", "套餐"];
+
 /// 这次失败是不是「账户没钱 / 配额用完」。402 一律算；其余 4xx / 429 / 鉴权
 /// 错误看报文（OpenAI 的配额耗尽是 429 `insufficient_quota`，按限流重试只会
 /// 每 60s 白打一次）。
@@ -267,6 +279,8 @@ pub fn is_billing_error(e: &AiError) -> bool {
         BILLING_MARKERS
             .iter()
             .any(|k| m.contains(k) || msg.contains(k))
+            || (QUOTA_CAP_PHRASES.iter().any(|k| msg.contains(k))
+                && TOPUP_PHRASES.iter().any(|k| msg.contains(k)))
     };
     match e {
         AiError::Api { status: 402, .. } => true,
@@ -465,6 +479,27 @@ mod tests {
         assert!(!is_billing_error(&AiError::Api {
             status: 500,
             message: "billing service down".into()
+        }));
+    }
+
+    #[test]
+    fn minimax_token_plan_cap_counts_as_billing_not_rate_limit() {
+        // 实测报文（2026-11-14）：429 + 这条文案。按限流处理会被每 60s 白打
+        // 一次，一个已经没量的账户被重试一整晚。
+        assert!(is_billing_error(&AiError::RateLimited {
+            retry_after: 60.0,
+            message: "已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)"
+                .into()
+        }));
+        // 每分钟配额（TPM/RPM）是可自愈的限流，不能当账户欠费摘除。
+        assert!(!is_billing_error(&AiError::RateLimited {
+            retry_after: 5.0,
+            message: "TPM 用量上限已到，请稍后重试".into()
+        }));
+        // 光有「上限」没有充值措辞，也不定性。
+        assert!(!is_billing_error(&AiError::RateLimited {
+            retry_after: 5.0,
+            message: "每日调用次数达到上限，请明天再试".into()
         }));
     }
 

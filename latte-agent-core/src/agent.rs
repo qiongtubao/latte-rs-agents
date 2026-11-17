@@ -392,6 +392,22 @@ impl Agent {
                 continue;
             }
             if !mc.is_available() {
+                // 冷却中的模型原来是**静默跳过**：全链都在冷却时 `failures`
+                // 是空的，暂停原因退化成一串括号——「模型不可用（）」，连哪个
+                // 模型、还剩几秒都看不出来（实测：流式下一个 400 把三个模型
+                // 逐个冷却完，重新进 `chat_stream` 就拿到这个空摘要，然后
+                // 每个退避周期重复一次）。
+                // 记一条带剩余时间的占位，摘要才能点名。注意这类条目**不带**
+                // 任何失败类别前缀（余额/鉴权/请求被拒），所以
+                // `failures_are_all_*` 判定不受它影响、该自动重试的照常重试。
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    match mc.cooldown_remaining() {
+                        Some(d) => format!("冷却中（{}s 后放行，本轮未发请求）", d.as_secs()),
+                        None => "不可用（本轮未发请求）".to_string(),
+                    },
+                ));
                 continue;
             }
             match mc.client.chat(messages, p).await {
@@ -435,7 +451,7 @@ impl Agent {
                         ));
                         continue;
                     }
-                    failures.push((mc.model.id.clone(), brief_model_error(&e)));
+                    failures.push((mc.model.id.clone(), failure_detail(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
                     } else {
@@ -489,7 +505,7 @@ impl Agent {
                                     brief_model_error(&e)
                                 )
                             } else {
-                                brief_model_error(&e)
+                                failure_detail(&e)
                             };
                             failures.push((mc.model.id.clone(), failure));
                         }
@@ -546,6 +562,22 @@ impl Agent {
                 continue;
             }
             if !mc.is_available() {
+                // 冷却中的模型原来是**静默跳过**：全链都在冷却时 `failures`
+                // 是空的，暂停原因退化成一串括号——「模型不可用（）」，连哪个
+                // 模型、还剩几秒都看不出来（实测：流式下一个 400 把三个模型
+                // 逐个冷却完，重新进 `chat_stream` 就拿到这个空摘要，然后
+                // 每个退避周期重复一次）。
+                // 记一条带剩余时间的占位，摘要才能点名。注意这类条目**不带**
+                // 任何失败类别前缀（余额/鉴权/请求被拒），所以
+                // `failures_are_all_*` 判定不受它影响、该自动重试的照常重试。
+                tried.push(mc.model.id.clone());
+                failures.push((
+                    mc.model.id.clone(),
+                    match mc.cooldown_remaining() {
+                        Some(d) => format!("冷却中（{}s 后放行，本轮未发请求）", d.as_secs()),
+                        None => "不可用（本轮未发请求）".to_string(),
+                    },
+                ));
                 continue;
             }
             match mc.client.chat_stream(messages, p).await {
@@ -579,7 +611,7 @@ impl Agent {
                         ));
                         continue;
                     }
-                    failures.push((mc.model.id.clone(), brief_model_error(&e)));
+                    failures.push((mc.model.id.clone(), failure_detail(&e)));
                     if let Some(cd) = cooldown_for_error(&e) {
                         mc.set_cooldown(cd);
                     } else {
@@ -1253,6 +1285,47 @@ fn brief_model_error(e: &AiError) -> String {
     format!("{cut}…")
 }
 
+/// 上游**确定性拒绝这份请求**（payload 形状 / 未知字段 / 工具 schema /
+/// 模型 id 不对……）的失败前缀。
+///
+/// 与 [`crate::billing::BILLING_FAILURE_PREFIX`]、
+/// [`crate::credentials::CREDENTIAL_FAILURE_PREFIX`] 同一套用法：失败清单
+/// 里带这个前缀 = 「换个时间重发同一份 payload，结果不会变」，暂停层据此
+/// 不自动退避重试——否则确定性失败会被退避 5 次再转人工，真正的原因埋在
+/// 「模型不可用」后面（实测 2026-11-14 linux 会话：manager 第一轮只调了
+/// 一次 read，之后 9 小时 8 次暂停，全是一条 `content: []` 引出的 400）。
+const REQUEST_REJECTED_PREFIX: &str = "请求被拒（payload/模型 id 类 4xx）";
+
+/// 这个错误是不是「上游拒绝请求内容本身」。
+///
+/// 4xx 里排除：401/403（鉴权，另有进程级登记）、402（余额，另有登记）、
+/// 408/409（超时/冲突，可自愈）、429（限流，可自愈），以及上下文超窗
+/// （另有压缩恢复路径）。
+///
+/// **不**把这类错误从 fallback 链上摘掉：换模型仍可能过（不同 vendor 的
+/// 校验松紧差别很大），所以 `cooldown_for_error` 照样给它冷却、让链继续
+/// 走，只在「全链都失败之后」禁止自动重试。
+fn is_request_rejection(e: &AiError) -> bool {
+    match e {
+        AiError::Api { status, message } => {
+            matches!(*status, 400..=499)
+                && !matches!(*status, 401 | 403 | 402 | 408 | 409 | 429)
+                && !crate::compaction::is_context_overflow_error(message)
+        }
+        _ => false,
+    }
+}
+
+/// 失败清单里的一行：请求被拒的条目加前缀点名病灶，其余保持原样。
+fn failure_detail(e: &AiError) -> String {
+    let brief = brief_model_error(e);
+    if is_request_rejection(e) {
+        format!("{REQUEST_REJECTED_PREFIX}：{brief}")
+    } else {
+        brief
+    }
+}
+
 fn cooldown_for_error(e: &AiError) -> Option<Duration> {
     match e {
         // Vendor told us how long to wait — respect it (floor 1s).
@@ -1280,12 +1353,17 @@ fn cooldown_for_error(e: &AiError) -> Option<Duration> {
             // 给一个远超正常会话时长的冷却，等价于"本次会话内摘掉它"，
             // 但不需要改配置、也不会永久禁用（新进程重新试一次）。
             402 => Some(Duration::from_secs(24 * 3600)),
-            // 4xx (other than 429/402) usually means "this model id doesn't
-            // exist on this vendor" or "bad request payload for this
-            // model". Walking the fallback chain is still worth it
-            // because the next model may have a different id format or
-            // accept the payload. Short cooldown to avoid hammering a
-            // broken model.
+            // 4xx (other than 429/402)：确定性拒绝——「这个模型 id 在这家
+            // 不存在」或「这份 payload 这个模型不收」。**仍然给冷却**，因为
+            // 冷却在这里的作用是「本轮跳过它、让 fallback 链继续走」（链上
+            // 下一个模型的校验松紧可能完全不同），不是「过一会儿重试」。
+            // 返回 `None` 会让调用方直接 `return Err`，链上一个模型都不再
+            // 咨询（`chat` / `chat_stream` / `try_stream_fallback` 三处都是
+            // 这个语义）。
+            //
+            // 「过一会儿重试」这件事由 `REQUEST_REJECTED_PREFIX` +
+            // `failures_are_all_request_rejected` 在暂停层关掉：重发同一份
+            // payload 的结果是确定的，退避重试只会把原因埋掉。
             400..=499 => Some(Duration::from_secs(60)),
             // Anything else (3xx redirects we don't auto-follow, 6xx
             // exotic) — also retryable, very long cooldown.
@@ -1529,7 +1607,11 @@ fn classify_tool_execution_error(e: &latte_rs_agent_tools::error::ToolError) -> 
         // plan 工具的确定性输入校验失败：原样重试只会再次被同一
         // 份错误清单拒绝；应把错误喂回 model，让它修正 paths。
         "paths 范围重叠",
-        "第一级目录在仓库里不存在",
+        // 实际文案是「paths 的第一级目录不存在」/「只读任务的 paths 必须整条
+        // 存在」——旧条目写的是「第一级目录在仓库里不存在」，与实际报错对不上，
+        // 一直是死匹配（宽松档靠下一行的「疑似幻觉路径」才判成永久错误）。
+        "第一级目录",
+        "必须整条存在",
         "疑似幻觉路径",
         "tasks[",
         // plan 工具的 workflow/task_type 名提交侧校验：同为确定性
@@ -1949,6 +2031,34 @@ fn failures_are_all_permanent_accounts(e: &AgentError) -> bool {
     }
 }
 
+/// 失败清单里每一项都是「上游确定性拒绝这份请求」——重发同一份 payload
+/// 不会有不同结果，所以不值得自动退避重试（换模型仍可能过，但那是同一次
+/// 调用里已经走过的 fallback 链，不是定时重试能解决的）。
+fn failures_are_all_request_rejected(failures: &[(String, String)]) -> bool {
+    !failures.is_empty()
+        && failures
+            .iter()
+            .all(|(_, f)| f.starts_with(REQUEST_REJECTED_PREFIX))
+}
+
+/// 全链失败都是**不会随时间自愈**的类别：余额/配额、鉴权、请求被拒。
+///
+/// 共同点是「等一会儿、重发同一份东西，结果一样」，所以暂停层不该退避重试。
+/// 与 [`failures_are_all_request_rejected`] 的区别：那个要求**全是**拒绝（用于
+/// 选专用措辞），这个只要**没有**一个可能自愈失败就成立——实测 2026-11-14
+/// 会话就是混合失败（glm 拒绝 + MiniMax 配额耗尽），两个判据都不成立，于是
+/// 白退避了 5 次。
+///
+/// 「冷却中（…）」占位**不算**：那是上一轮的瞬时失败，等的就是它冷却结束。
+fn failures_all_non_healing(failures: &[(String, String)]) -> bool {
+    !failures.is_empty()
+        && failures.iter().all(|(_, f)| {
+            f.starts_with(crate::billing::BILLING_FAILURE_PREFIX)
+                || f.starts_with(crate::credentials::CREDENTIAL_FAILURE_PREFIX)
+                || f.starts_with(REQUEST_REJECTED_PREFIX)
+        })
+}
+
 fn model_failures_summary(e: &AgentError) -> String {
     match e {
         AgentError::ModelsUnavailable {
@@ -1974,8 +2084,13 @@ fn model_failures_summary(e: &AgentError) -> String {
                 f
             };
             match next_retry_in {
-                Some(d) => format!("{f}（{}s 后可自动重试）", d.as_secs()),
-                None => f,
+                // 全链都是不会自愈的失败：暂停层已经不会自动退避（见
+                // `pause_wait_model_unavailable`），这里就别再承诺
+                // 「Ns 后可自动重试」——否则日志自相矛盾。
+                Some(d) if !failures_all_non_healing(failures) => {
+                    format!("{f}（{}s 后可自动重试）", d.as_secs())
+                }
+                _ => f,
             }
         }
         other => other.to_string(),
@@ -3543,6 +3658,17 @@ impl AgentRunner {
         let credentials = crate::credentials::blocked_summary();
         let all_billing = failures_are_all_billing(e);
         let all_permanent = failures_are_all_permanent_accounts(e);
+        let all_rejected = matches!(
+            e,
+            AgentError::ModelsUnavailable { failures, .. }
+                if failures_are_all_request_rejected(failures)
+        );
+        // 混在里面的冷却占位不算「不可自愈」，见 `failures_all_non_healing`。
+        let no_self_heal = matches!(
+            e,
+            AgentError::ModelsUnavailable { failures, .. }
+                if failures_all_non_healing(failures)
+        );
         let hint = if all_billing {
             format!(
                 "模型链上能用的账户都余额不足/配额耗尽：{}。重试无意义，已停下等你处理——充值（或在模型配置里换掉这些模型）后点 ▶ 继续，会重新检测",
@@ -3553,6 +3679,12 @@ impl AgentRunner {
                 "模型链上的凭证/模型授权均被拒绝：{}。已摘除且不自动重试——修正 API key 或授权后点 ▶ 继续，会重新检测",
                 credentials.join("；")
             )
+        } else if all_rejected {
+            "模型都拒绝了这份请求本身（确定性 4xx：payload 字段 / 工具 schema / 模型 id 不被接受）——原样重发结果不会变，已停下等你处理。按上面的原始报错修正请求或模型配置后点 ▶ 继续，重试会重新走整条模型链"
+                .to_string()
+        } else if no_self_heal {
+            "链上的失败都不会随时间自愈（余额/配额、鉴权、请求被拒的混合）——等一会儿重发结果一样，已停下等你处理。按上面的原始报错逐项修正（充值 / 修 key 授权 / 改请求或模型配置）后点 ▶ 继续，重试会重新走整条模型链"
+                .to_string()
         } else if failures_include_context_overflow(e) {
             "检测到上下文超出模型窗口——原样重试必败。点 ▶ 继续将自动裁剪本轮待发消息中的超长内容（多为工具结果）后重试；会话记录不受影响"
                 .to_string()
@@ -3593,9 +3725,9 @@ impl AgentRunner {
             turn: 0,
         });
 
-        // 全是不会随时间自愈的账户类失败（余额或鉴权）：直接等人工，
-        // 不进入 cooldown 自动重试。
-        let auto_after = if all_permanent { None } else { auto_after };
+        // 全是不会随时间自愈的失败（余额、鉴权、请求被拒，以及它们的混合）：
+        // 直接等人工，不进入 cooldown 自动重试。
+        let auto_after = if no_self_heal { None } else { auto_after };
         // (是否恢复, 是否人工点的继续)
         let (resumed, manual) = match auto_after {
             // 退避窗口内人点了 ▶ 就走人工路径；没人管则超时自恢复。
@@ -4238,6 +4370,9 @@ impl AgentRunner {
     /// 2. 错误不可通过换模型规避（`cooldown_for_error` 返回 `None`，即本地
     ///    配置/序列化类错误）；
     /// 3. 已经换过 `max` 次 —— 防止「链上每个模型都在连接后立刻报错」时打转。
+    /// 返回 `(被冷却/摘除的模型, 下一个可换的模型)`：`None` = 不重开流。
+    /// `to` 为 `None` 表示「这一路错误已经把整条链冷却完」，调用方据此决定
+    /// 是把原始错误报上去，还是重新进 `chat_stream` 等冷却。
     fn try_stream_fallback(
         &self,
         err: &AiError,
@@ -4245,7 +4380,7 @@ impl AgentRunner {
         fallbacks: &mut u8,
         max: u8,
         meta: &crate::trace::TraceMeta,
-    ) -> Option<Option<String>> {
+    ) -> Option<(String, Option<String>)> {
         if streamed_any || *fallbacks >= max {
             return None;
         }
@@ -4261,12 +4396,12 @@ impl AgentRunner {
         *fallbacks += 1;
         self.sink.emit(crate::trace::TraceEvent::FallbackTriggered {
             meta: meta.refreshed(),
-            from_model: from,
+            from_model: from.clone(),
             to_model: to.clone(),
             reason: crate::trace::FallbackReason::RetryableFailure,
             cause_kind: Some(crate::trace::ModelErrorKind::from(err)),
         });
-        Some(to)
+        Some((from, to))
     }
 
     /// 测试用：是否挂了模型热更新源（workflow / delegate 路径的接线
@@ -5271,28 +5406,54 @@ impl AgentRunner {
                             }
                             Some(StreamEvent::Error(e)) => {
                                 let err = AiError::Stream(e);
-                                if let Some(next) = self.try_stream_fallback(
+                                if let Some((from, next)) = self.try_stream_fallback(
                                     &err,
                                     streamed_any,
                                     &mut stream_fallbacks,
                                     MAX_STREAM_FALLBACKS,
                                     &meta,
                                 ) {
-                                    let _ = next;
+                                    if next.is_none() && is_request_rejection(&err) {
+                                        // 确定性拒绝 + 链已被这一路错误冷却完：重新进
+                                        // `chat_stream` 只会看到「全在冷却」，拿到一份
+                                        // **空**的失败清单，暂停原因变成「模型不可用
+                                        // （）」——病灶全丢（实测：三个模型都被 400 拒
+                                        // 后就是这个空摘要）。直接用原始错误构造，点名
+                                        // 模型 + 原始报错；暂停层据
+                                        // `REQUEST_REJECTED_PREFIX` 不自动退避重试。
+                                        return Err(AgentError::ModelsUnavailable {
+                                            tried: vec![from.clone()],
+                                            failures: vec![(from, failure_detail(&err))],
+                                            next_retry_in: cooldown_for_error(&err),
+                                        });
+                                    }
                                     continue 'stream_attempt;
                                 }
                                 return Err(AgentError::from(err));
                             }
                             Some(StreamEvent::HttpError { status, message }) => {
                                 let err = AiError::Api { status, message };
-                                if let Some(next) = self.try_stream_fallback(
+                                if let Some((from, next)) = self.try_stream_fallback(
                                     &err,
                                     streamed_any,
                                     &mut stream_fallbacks,
                                     MAX_STREAM_FALLBACKS,
                                     &meta,
                                 ) {
-                                    let _ = next;
+                                    if next.is_none() && is_request_rejection(&err) {
+                                        // 确定性拒绝 + 链已被这一路错误冷却完：重新进
+                                        // `chat_stream` 只会看到「全在冷却」，拿到一份
+                                        // **空**的失败清单，暂停原因变成「模型不可用
+                                        // （）」——病灶全丢（实测：三个模型都被 400 拒
+                                        // 后就是这个空摘要）。直接用原始错误构造，点名
+                                        // 模型 + 原始报错；暂停层据
+                                        // `REQUEST_REJECTED_PREFIX` 不自动退避重试。
+                                        return Err(AgentError::ModelsUnavailable {
+                                            tried: vec![from.clone()],
+                                            failures: vec![(from, failure_detail(&err))],
+                                            next_retry_in: cooldown_for_error(&err),
+                                        });
+                                    }
                                     continue 'stream_attempt;
                                 }
                                 return Err(AgentError::from(err));
@@ -5461,7 +5622,14 @@ impl AgentRunner {
             self.sink.emit(TraceEvent::ModelCall {
                 meta: meta.refreshed(),
                 model_id: self.agent.served_model_id(),
-                params_json: serde_json::to_string(&self.agent.params).unwrap_or_default(),
+                // 记**实际下发**的那份 params（含 tools / prompt_cache_key），
+                // 不是 `self.agent.params`（role 默认值，tools 恒为空）——
+                // 后者会让会话日志里的 `"tools":[]` 骗人：排查 payload 类
+                // 400 时看不出工具到底发没发。
+                params_json: chat_params
+                    .as_ref()
+                    .map(|p| serde_json::to_string(p).unwrap_or_default())
+                    .unwrap_or_default(),
                 latency_ms,
                 finish_reason: completion.stop_reason.clone(),
                 usage: crate::trace::CallUsage::from(&completion.usage),
@@ -7155,15 +7323,59 @@ mod tests {
 
     #[test]
     fn test_cooldown_for_non_auth_4xx_is_60s() {
-        // Deterministic non-auth 4xx retain the existing model-chain fallback
-        // behavior. Authentication has a separate process-wide block.
-        for status in [400u16, 404, 422] {
+        // 确定性 4xx 的冷却**不是**「等会儿重试」的许可，而是「本轮跳过
+        // 它、让 fallback 链继续走」的机制：返回 None 会让调用方直接
+        // return Err，链上下一个模型（校验松紧不同）就没机会了。
+        // 自动重试由 `failures_are_all_request_rejected` 在暂停层关掉。
+        for status in [400u16, 404, 408, 409, 413, 422] {
             let d = cooldown_for_error(&AiError::Api {
                 status,
                 message: "bad request".into(),
             });
             assert_eq!(d, Some(Duration::from_secs(60)), "status={status}");
         }
+    }
+
+    #[test]
+    fn test_request_rejection_classification() {
+        let api = |status: u16, msg: &str| AiError::Api {
+            status,
+            message: msg.into(),
+        };
+        // 4xx 里「这份 payload 不被接受」的那一类。
+        for status in [400u16, 404, 405, 413, 415, 422] {
+            assert!(is_request_rejection(&api(status, "bad")), "status={status}");
+        }
+        // 鉴权 / 余额 / 超时 / 冲突 / 限流都另有处理路径，不算 payload 问题。
+        for status in [401u16, 402, 403, 408, 409, 429, 500] {
+            assert!(
+                !is_request_rejection(&api(status, "bad")),
+                "status={status}"
+            );
+        }
+        // 上下文超窗走压缩恢复，不是「请求被拒」。
+        assert!(!is_request_rejection(&api(
+            400,
+            "invalid params, context window exceeds limit"
+        )));
+        // 非 Api 错误一律不算。
+        assert!(!is_request_rejection(&AiError::Stream("boom".into())));
+    }
+
+    #[test]
+    fn test_failure_detail_prefixes_only_request_rejections() {
+        let rejected = failure_detail(&AiError::Api {
+            status: 400,
+            message: "请求参数值或格式不受支持".into(),
+        });
+        assert!(rejected.starts_with(REQUEST_REJECTED_PREFIX), "{rejected}");
+        assert!(rejected.contains("400"), "{rejected}");
+
+        let rate_limited = failure_detail(&AiError::Api {
+            status: 429,
+            message: "rate limit".into(),
+        });
+        assert_eq!(rate_limited.starts_with(REQUEST_REJECTED_PREFIX), false);
     }
 
     #[test]
@@ -8282,6 +8494,109 @@ mod tests {
         );
     }
 
+    /// 全链都是「请求被拒」（确定性 4xx）：**不**自动退避重试——重发同一份
+    /// payload 结果不会变，退避只会把真正的原因埋进「模型不可用」。暂停
+    /// 原因要点名 payload 类问题，且不能承诺「Ns 后可自动重试」。
+    #[tokio::test]
+    async fn request_rejection_pauses_without_auto_retry() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = crate::pause_gate::AgentPauseGate::new("session");
+        let runner = AgentRunner::new(agent).with_agent_pause_gate(gate.clone());
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["glm".into()],
+            failures: vec![(
+                "glm".into(),
+                format!(
+                    "{}：API error: 400 - 请求参数值或格式不受支持",
+                    REQUEST_REJECTED_PREFIX
+                ),
+            )],
+            // 确定性 4xx 仍然带冷却（为了走链），暂停层必须无视它。
+            next_retry_in: Some(Duration::from_millis(50)),
+        };
+        let g2 = gate.clone();
+        let watcher = tokio::spawn(async move {
+            // 远超 50ms 的退避窗口：若仍在自动重试，这期间门早已被放开。
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let still_paused = g2.is_paused();
+            let reason = g2.pause_reason().unwrap_or_default();
+            g2.resume();
+            (still_paused, reason)
+        });
+        assert!(runner.pause_wait_model_unavailable(&err, 0).await);
+        let (still_paused, reason) = watcher.await.unwrap();
+        assert!(still_paused, "请求被拒不该自动退避恢复");
+        assert!(
+            reason.contains("拒绝") && reason.contains("400"),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("后可自动重试"),
+            "确定性 4xx 不该承诺自动重试：{reason}"
+        );
+    }
+
+    /// 混合的「不会自愈」失败（请求被拒 + 配额耗尽）：两个单项判据都不是
+    /// `all`，但合起来同样没有一条能靠等待恢复——2026-11-14 会话正是这个形状
+    /// （glm 400 + MiniMax 429），结果白退避了 5 次。
+    #[tokio::test]
+    async fn mixed_non_healing_failures_pause_without_auto_retry() {
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let gate = crate::pause_gate::AgentPauseGate::new("session");
+        let runner = AgentRunner::new(agent).with_agent_pause_gate(gate.clone());
+        let err = AgentError::ModelsUnavailable {
+            tried: vec!["glm".into(), "MiniMax".into()],
+            failures: vec![
+                (
+                    "glm".into(),
+                    format!(
+                        "{}：API error: 400 - 请求参数值或格式不受支持",
+                        REQUEST_REJECTED_PREFIX
+                    ),
+                ),
+                (
+                    "MiniMax".into(),
+                    format!(
+                        "{}：429 已达到 Token Plan 用量上限",
+                        crate::billing::BILLING_FAILURE_PREFIX
+                    ),
+                ),
+            ],
+            next_retry_in: Some(Duration::from_millis(50)),
+        };
+        let g2 = gate.clone();
+        let watcher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let still_paused = g2.is_paused();
+            let reason = g2.pause_reason().unwrap_or_default();
+            g2.resume();
+            (still_paused, reason)
+        });
+        assert!(runner.pause_wait_model_unavailable(&err, 0).await);
+        let (still_paused, reason) = watcher.await.unwrap();
+        assert!(still_paused, "不会自愈的混合失败不该自动退避恢复");
+        assert!(
+            reason.contains("不会随时间自愈"),
+            "应说明为什么要人工介入：{reason}"
+        );
+        assert!(
+            !reason.contains("后可自动重试"),
+            "不该承诺自动重试：{reason}"
+        );
+    }
+
     /// 无暂停门 → 不等人，直接 false（调用方原样抛错，保持旧行为）。
     #[tokio::test]
     async fn models_unavailable_without_gate_fails_fast() {
@@ -8379,6 +8694,54 @@ mod tests {
         assert!(!agent.model_chain[0].is_available());
         // Fallback should still be available.
         assert!(agent.model_chain[1].is_available());
+    }
+
+    /// 400（payload 被主模型拒绝）不能让整条链当场作废：备用模型可能接受
+    /// 同一份 payload（各家校验松紧不同）。这条钉住「4xx 仍给冷却、链继续
+    /// 走」——把 `cooldown_for_error` 的 4xx 改成 `None` 会在这里挂。
+    #[tokio::test]
+    async fn test_chat_walks_chain_on_payload_rejection() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let primary = wiremock::MockServer::start().await;
+        primary
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(ResponseTemplate::new(400).set_body_string(
+                        r#"{"error":{"message":"请求参数值或格式不受支持"}}"#,
+                    )),
+            )
+            .await;
+        let fallback = wiremock::MockServer::start().await;
+        fallback
+            .register(
+                Mock::given(method("POST"))
+                    .and(path("/chat/completions"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_string(openai_completion_body("fallback won", vec![])),
+                    ),
+            )
+            .await;
+
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![
+                model_at(&primary, "primary"),
+                model_at(&fallback, "fallback"),
+            ],
+            GenerateParams::default(),
+        )
+        .unwrap();
+
+        let resp = agent
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
+            .await
+            .expect("400 后应继续走链");
+        assert_eq!(resp.content, "fallback won");
     }
 
     /// 空 completion（200 但无文本、无 tool_calls）按模型局部失败处理：
@@ -9001,6 +9364,73 @@ mod tests {
         assert_eq!(s1.received_requests().await.unwrap().len(), 1);
         assert_eq!(s2.received_requests().await.unwrap().len(), 2);
         crate::credentials::clear_all();
+    }
+
+    /// 全链都在冷却时 `failures` 不能是空的：暂停原因必须能点名「谁、还剩
+    /// 几秒」。回归：流式下一个 400 把链上模型逐个冷却完，`chat_stream` 把它
+    /// 们全静默跳过 → 空失败清单 → 暂停原因「模型不可用（）」，每个退避周期
+    /// 重复一次，病灶和进度全丢。
+    #[tokio::test]
+    async fn test_all_models_cooling_reports_which_and_how_long() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let s1 = wiremock::MockServer::start().await;
+        s1.register(
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("oops")),
+        )
+        .await;
+
+        let agent = Agent::new_with_chain(
+            "a".into(),
+            test_role(),
+            vec![model_at(&s1, "m1")],
+            GenerateParams::default(),
+        )
+        .unwrap();
+
+        // 第一次：真发请求，500 → 30s 冷却。（AiClient 内部可能对 5xx 重试，
+        // 所以这里只记基线，不假设次数。）
+        agent
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
+            .await
+            .expect_err("500 应失败");
+        let baseline = s1.received_requests().await.unwrap().len();
+        assert!(baseline >= 1, "第一次调用必须真的发过请求");
+
+        // 第二次：唯一模型在冷却中，一个请求都不该再发出去。
+        let err = agent
+            .chat(&[Message::user("hi")], None, WaitPolicy::NoWait)
+            .await
+            .expect_err("全在冷却也应失败");
+        assert_eq!(
+            s1.received_requests().await.unwrap().len(),
+            baseline,
+            "冷却中的模型不该再发请求"
+        );
+        let summary = model_failures_summary(&err);
+        match &err {
+            AgentError::ModelsUnavailable {
+                tried,
+                failures,
+                next_retry_in,
+            } => {
+                assert_eq!(tried, &vec!["m1".to_string()]);
+                assert_eq!(failures.len(), 1, "{failures:?}");
+                assert!(
+                    failures[0].1.contains("冷却中"),
+                    "应点名冷却：{}",
+                    failures[0].1
+                );
+                assert!(next_retry_in.is_some());
+            }
+            other => panic!("expected ModelsUnavailable, got {other:?}"),
+        }
+        assert!(summary.contains("m1"), "{summary}");
+        assert!(summary.contains("冷却中"), "{summary}");
+        assert!(!summary.contains("（）"), "摘要不能是空括号：{summary}");
     }
 
     #[tokio::test]

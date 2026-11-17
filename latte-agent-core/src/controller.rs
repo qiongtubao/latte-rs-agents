@@ -6940,16 +6940,23 @@ fn plan_dependency_edge_count(tasks: &[PlanTask]) -> usize {
 /// 不继承等于严格档对整份交付物失效。
 fn check_exists_tree(
     t: &PlanTask,
+    label: &str,
     inherited_strict: bool,
     read_only: &dyn Fn(Option<&str>, &[String]) -> bool,
     check_exists: &mut dyn FnMut(&str, &str, bool),
 ) {
     let strict = inherited_strict || read_only(t.task_type.as_deref(), &t.labels);
     for p in &t.paths {
-        check_exists(&t.title, p, strict);
+        check_exists(label, p, strict);
     }
-    for s in &t.subtasks {
-        check_exists_tree(s, strict, read_only, check_exists);
+    for (i, s) in t.subtasks.iter().enumerate() {
+        check_exists_tree(
+            s,
+            &format!("{label}.subtasks[{i}]"),
+            strict,
+            read_only,
+            check_exists,
+        );
     }
 }
 
@@ -6970,6 +6977,16 @@ fn plan_tasks_dep_linked(a: &PlanTask, b: &PlanTask) -> bool {
 }
 
 fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), String> {
+    validate_plan_paths_impl(cwd, tasks, true)
+}
+
+/// `label_tasks = false`：机械装配的**逐章**校验（一次只传一章）用——那里
+/// 的 `tasks[0]` 索引没有意义，病灶位置由调用方按章号标注。
+fn validate_plan_paths_impl(
+    cwd: &std::path::Path,
+    tasks: &[PlanTask],
+    label_tasks: bool,
+) -> Result<(), String> {
     let normalize = |p: &str| -> String {
         p.trim()
             .trim_start_matches("./")
@@ -7009,9 +7026,16 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     }
     validate_artifacts(tasks)?;
     // ── 存在性 ──
-    // 反馈只报路径本身（不带任务标题）并去重：tool_result 只有 256
-    // 字节，带标题的长清单一撑就爆，模型看到的是被砍掉尾部的残句。
-    let mut missing: Vec<String> = Vec::new();
+    // 反馈只报「条目位置 + 路径」并去重，不带任务标题：标题长且中文占字节
+    // 多，而模型拿到自己清单里的下标就能定位。
+    // 位置用 `tasks[N].subtasks[M]`（JSON 路径，同 opencode 的
+    // `todos[3].status`、deepseek-harness 的 `operation 3`）。
+    let mut missing: Vec<(String, String)> = Vec::new();
+    // 严格档的未命中单独记账：`kernel/locking/seqlock.c` 这种「首级目录
+    // 存在、文件不存在」的路径若混进 `missing`，报出来是「第一级目录
+    // 不存在」——与事实相反，读错误的人（模型或引擎的定向返工）会先怀
+    // 疑校验器坏掉，而不是去换锚点（实测 2026-11-15 linux 会话）。
+    let mut missing_strict: Vec<(String, String)> = Vec::new();
     // 只读类任务：不新建文件，声明的 paths 必须整条存在。
     let read_only = |task_type: Option<&str>, labels: &[String]| -> bool {
         matches!(
@@ -7019,21 +7043,22 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
             Some("learn") | Some("learn_loop") | Some("research")
         ) || labels.iter().any(|l| l.trim() == "只读")
     };
-    let mut check_exists = |_title: &str, raw: &str, strict: bool| {
+    let mut check_exists = |label: &str, raw: &str, strict: bool| {
         let p = normalize(raw);
         if p.is_empty() {
             return;
         }
+        let entry = (label.to_string(), p);
         if strict {
             // 严格档：整条路径必须存在。
-            if !cwd.join(&p).exists() && !missing.contains(&p) {
-                missing.push(p);
+            if !cwd.join(&entry.1).exists() && !missing_strict.contains(&entry) {
+                missing_strict.push(entry);
             }
             return;
         }
         let mut cur = cwd.to_path_buf();
         let mut top_exists = false;
-        for (idx, comp) in std::path::Path::new(&p).components().enumerate() {
+        for (idx, comp) in std::path::Path::new(&entry.1).components().enumerate() {
             if matches!(comp, std::path::Component::CurDir) {
                 continue;
             }
@@ -7045,41 +7070,70 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
                 break;
             }
         }
-        if !top_exists && !missing.contains(&p) {
-            missing.push(p);
+        if !top_exists && !missing.contains(&entry) {
+            missing.push(entry);
         }
     };
-    for t in tasks {
-        check_exists_tree(t, false, &read_only, &mut check_exists);
-    }
-    if !missing.is_empty() {
-        // 反馈通道只有 256 字节（tool_result 截断，见 agent.rs 终止态
-        // 处理），长清单会被砍掉尾部，模型只能看到前一两条 —— 与其被
-        // 动截断，不如主动只报前 3 条 + 总数。
-        // 每条幻觉路径附模糊匹配的相近真实路径（path_suggest）：
-        // 「第一级目录不存在」+ 候选清单才能让模型一次改对（实测 jemalloc
-        // 会话：模型按 ≤5.2 的旧记忆写 `src/slab.c` 这类已消失的文件）。
-        let head = missing
-            .iter()
-            .take(3)
-            .map(|p| {
-                let suggestions =
-                    latte_rs_agent_tools::utils::path_suggest::suggest_similar_paths(cwd, p, 2);
-                if suggestions.is_empty() {
-                    p.clone()
-                } else {
-                    format!("{p}（相近：{}）", suggestions.join("、"))
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("、");
-        let more = if missing.len() > 3 {
-            format!("（共 {} 处）", missing.len())
+    for (i, t) in tasks.iter().enumerate() {
+        let label = if label_tasks {
+            format!("tasks[{i}]")
         } else {
             String::new()
         };
+        check_exists_tree(t, &label, false, &read_only, &mut check_exists);
+    }
+    if !missing.is_empty() || !missing_strict.is_empty() {
+        // 一条错误最多报 5 条 + 总数：`tool_result` 的错误回填上限是
+        // `agent.rs::MAX_TOOL_ERROR_BYTES`（2048，中段省略），旧注释里的
+        // 256 字节早已提到 2048——按旧预算把条数砍到 3、把任务标题整个
+        // 砍掉，反而让报错点不出病灶（2026-11-15 linux 会话：23 章装配
+        // 失败只剩一条路径，引擎无法定向返工）。
+        // 每条幻觉路径附模糊匹配的相近真实路径（path_suggest）：
+        // 「不存在」+ 候选清单才能让模型一次改对（实测 jemalloc
+        // 会话：模型按 ≤5.2 的旧记忆写 `src/slab.c` 这类已消失的文件）。
+        const REPORT_LIMIT: usize = 5;
+        let render = |list: &[(String, String)]| -> String {
+            let head = list
+                .iter()
+                .take(REPORT_LIMIT)
+                .map(|(label, p)| {
+                    let suggestions =
+                        latte_rs_agent_tools::utils::path_suggest::suggest_similar_paths(cwd, p, 2);
+                    let hit = if suggestions.is_empty() {
+                        p.clone()
+                    } else {
+                        format!("{p}（相近：{}）", suggestions.join("、"))
+                    };
+                    if label.is_empty() {
+                        hit
+                    } else {
+                        format!("{label}: {hit}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("、");
+            let more = if list.len() > REPORT_LIMIT {
+                format!("（共 {} 处）", list.len())
+            } else {
+                String::new()
+            };
+            format!("{head}{more}")
+        };
+        // 两档分开报：只读任务的整条路径缺失报「第一级目录不存在」是
+        // 假话（目录明明在），会把读错误的模型引去怀疑校验器。
+        let mut parts: Vec<String> = Vec::new();
+        if !missing_strict.is_empty() {
+            parts.push(format!(
+                "只读任务（learn/learn_loop/research/带「只读」标签）的 paths 必须整条存在，找不到：{}",
+                render(&missing_strict)
+            ));
+        }
+        if !missing.is_empty() {
+            parts.push(format!("paths 的第一级目录不存在：{}", render(&missing)));
+        }
         return Err(format!(
-            "paths 的第一级目录不存在：{head}{more}（相对路径按会话工作目录校验，任务针对其他仓库请改用绝对路径；疑似幻觉路径先用 read/search 核实）"
+            "{}（相对路径按会话工作目录校验，任务针对其他仓库请改用绝对路径；疑似幻觉路径先用 read/search 核实）",
+            parts.join("；")
         ));
     }
     // ── 清单内重叠（仅顶层任务两两比较；子任务继承父任务范围） ──
@@ -7088,7 +7142,7 @@ fn validate_plan_paths(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<(), 
     // 学习/调研类任务天然可以共用同一份代码。（实测
     // 会话：8 个纯阅读的学习任务因为都要读
     // `include/foo/internal` 被判 45 处冲突，5855 字错误回喂时又
-    // 被截到 256 字节，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
+    // 被中段省略，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
     //
     // **声明了依赖关系的一对任务同样跳过**：重叠只在两个任务*同时*跑
     // 的时候有害，而看板保证有依赖的任务串行执行（依赖 done 才派发）。
@@ -7201,7 +7255,8 @@ fn validate_plan_workflows(cwd: &std::path::Path, tasks: &[PlanTask]) -> Result<
     if unknown.is_empty() {
         return Ok(());
     }
-    // 反馈通道只有 256 字节：可用名只给前 5 个 + 总数，够模型改对。
+    // 刻意只给前 5 个可用名 + 总数（tool_result 回填上限 2048，留足余量
+    // 且短清单模型更容易一次改对）。
     let head = available
         .iter()
         .take(5)
@@ -7587,6 +7642,34 @@ pub(crate) fn parse_and_validate_plan_tasks(
     // （learning→learn 等实测笔误），见函数文档。
     validate_plan_task_types(cwd, &mut tasks)?;
     Ok(tasks)
+}
+
+/// 单任务的**逐任务判据**校验（paths 存在性 / workflow 名 / task_type 名）。
+///
+/// 存在的理由：workflow 的机械装配步（`collect_plan_tasks`）按章读条目，
+/// 校验失败后要把错误归到具体章号——`collect_plan_tasks.on_fail` 只能按
+/// 报错里的 chNN 定向返工到 rechapter，而 paths 存在性报错带的是**清单下标**
+/// `tasks[N]`，带不出章号（见 [`validate_plan_paths`]）。
+///
+/// 刻意**不跑**跨任务判据（`validate_plan_dependencies` 的 depends_on 引用、
+/// paths 重叠）：单独一章的 depends_on 指向的是清单里别的章，逐任务跑必然
+/// 误报悬空。
+pub(crate) fn validate_single_plan_task(
+    cwd: &std::path::Path,
+    task_val: &serde_json::Value,
+) -> Result<(), String> {
+    let task: PlanTask = serde_path_to_error::deserialize(task_val.clone()).map_err(|e| {
+        let path = e.path().to_string();
+        format!("任务条目非法：{e}（出错字段：{path}）")
+    })?;
+    if task.title.trim().is_empty() {
+        return Err("title must not be empty".into());
+    }
+    validate_plan_paths_impl(cwd, std::slice::from_ref(&task), false)?;
+    validate_plan_workflows(cwd, std::slice::from_ref(&task))?;
+    let mut one = vec![task];
+    validate_plan_task_types(cwd, &mut one)?;
+    Ok(())
 }
 
 /// 提交一份 plan 提案的共享实现：`plan` 工具 handler 与 workflow 引擎的
@@ -11165,7 +11248,7 @@ pub(crate) mod tests {
         assert!(err.contains("留空"), "{err}");
         assert!(
             err.len() <= 256,
-            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            "自设上限 256 字节（tool_result 回填上限是 2048，这里刻意留余量；实际 {} 字节）：{err}",
             err.len()
         );
     }
@@ -11210,7 +11293,7 @@ pub(crate) mod tests {
         assert!(err.contains("留空"), "{err}");
         assert!(
             err.len() <= 256,
-            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            "自设上限 256 字节（tool_result 回填上限是 2048，这里刻意留余量；实际 {} 字节）：{err}",
             err.len()
         );
     }
@@ -11385,7 +11468,7 @@ pub(crate) mod tests {
         assert!(err.contains("ghost_type"), "{err}");
     }
 
-    /// 冲突反馈必须短且按路径聚合：tool_result 只有 256 字节，长清单
+    /// 冲突反馈必须短且按路径聚合：长清单回填时会被中段省略，
     /// 会被截断，模型看不全就修不动（事故里 5855 字 / 45 对）。
     #[test]
     fn overlap_error_is_short_and_aggregated() {
@@ -11406,7 +11489,7 @@ pub(crate) mod tests {
         let err = validate_plan_paths(cwd, &tasks).expect_err("应判重叠");
         assert!(
             err.len() <= 256,
-            "错误必须能塞进 256 字节的 tool_result（实际 {} 字节）：{err}",
+            "自设上限 256 字节（tool_result 回填上限是 2048，这里刻意留余量；实际 {} 字节）：{err}",
             err.len()
         );
         // 保留分类关键词，否则 classify_tool_execution_error 不会判
@@ -11417,9 +11500,13 @@ pub(crate) mod tests {
         assert!(err.contains("只读"), "应告知只读逃生阀：{err}");
     }
 
-    /// 幻觉路径清单同样要截断，只报前几条 + 总数。
+    /// 幻觉路径清单：报前 5 条 + 总数，且每条带 `tasks[N]` 位置——模型据此
+    /// 能直接在自己的清单里定位改哪一条。
+    /// 旧版按 256 字节预算只报 3 条、且完全不带位置：那个上限早已提到
+    /// `agent.rs::MAX_TOOL_ERROR_BYTES`（2048，中段省略），按旧预算省字反而
+    /// 让报错点不出病灶（2026-11-15 linux 会话的装配失败就只剩一条路径）。
     #[test]
-    fn missing_paths_error_is_truncated() {
+    fn missing_paths_error_names_entries_and_stays_compact() {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path();
         let tasks: Vec<PlanTask> = (0..9)
@@ -11427,8 +11514,19 @@ pub(crate) mod tests {
             .collect();
         let err = validate_plan_paths(cwd, &tasks).expect_err("应判幻觉路径");
         assert!(err.contains("疑似幻觉路径"), "{err}");
+        assert!(err.contains("tasks[0]: no_such_dir_0/x.rs"), "{err}");
+        assert!(
+            err.contains("tasks[4]: no_such_dir_4/x.rs"),
+            "应报到第 5 条：{err}"
+        );
+        assert!(
+            !err.contains("no_such_dir_5/x.rs"),
+            "第 6 条起用总数概括：{err}"
+        );
         assert!(err.contains("共 9 处"), "应给出总数：{err}");
-        assert!(err.len() <= 256, "实际 {} 字节：{err}", err.len());
+        // 必须小于错误回填上限（2048）：超了 `compact_middle_out` 会从中间
+        // 挖掉条目，模型看到的清单会缺行。
+        assert!(err.len() < 2048, "实际 {} 字节：{err}", err.len());
     }
 
     // ─── Advisor v3 pause gate（controller 侧）─────────────────────
@@ -14741,8 +14839,8 @@ pub(crate) mod tests {
             .await
             .expect_err("清单内重叠必须被拒绝");
         let msg = err.to_string();
-        // 反馈按**热点路径**聚合（不再罗列任务对）：tool_result 只有
-        // 256 字节，罗列式清单会被截断，模型看不全就改不动。
+        // 反馈按**热点路径**聚合（不再罗列任务对）：罗列式清单又长又难改，
+        // 模型看不全就改不动（长清单在回填时会中段省略）。
         assert!(msg.contains("src/ringbuf"), "{msg}");
         assert!(msg.contains("paths 范围重叠"), "{msg}");
         assert!(
