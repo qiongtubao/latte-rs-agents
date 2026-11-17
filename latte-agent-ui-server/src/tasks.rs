@@ -273,6 +273,11 @@ pub struct TaskView {
     pub task: Task,
     /// 派发时实际生效的 workflow（显式 workflow 优先，否则按 task_type 默认推导；None=走 manager）。
     pub effective_workflow: Option<String>,
+    /// 生效的大纲路径：自身 outline_path 优先，否则沿 parent_id 祖先链向上找。
+    ///
+    /// 拆分只给根任务记大纲，子孙全是 None；读模型在此一次性解析好，
+    /// 前端/API 便不必各自实现（且容易漏掉多层嵌套的）祖先查找。
+    pub effective_outline_path: Option<String>,
     /// 后代任务总数（整棵子树递归统计，非仅直接子任务；无后代恒 0）。
     pub sub_total: usize,
     /// 后代中已终态（done/cancelled）的数量。
@@ -937,6 +942,24 @@ impl TaskStore {
             .collect()
     }
 
+    /// 沿 parent_id 祖先链找最近的 outline_path。
+    /// 防环：最多走 tasks.len() 跳——数据损坏成环时返回 None 而不是死循环。
+    fn effective_outline_path(&self, task: &Task) -> Option<String> {
+        let mut cur = task;
+        let mut hops = 0usize;
+        loop {
+            if let Some(p) = &cur.outline_path {
+                return Some(p.clone());
+            }
+            let parent = cur.parent_id.as_ref()?;
+            if hops >= self.tasks.len() {
+                return None;
+            }
+            cur = self.tasks.get(parent)?;
+            hops += 1;
+        }
+    }
+
     /// 组装 TaskView（含后代聚合：sub_* 递归统计整棵子树的全部后代，
     /// 不只直接子任务）。
     pub fn view(&self, task: &Task) -> TaskView {
@@ -966,6 +989,7 @@ impl TaskStore {
         );
         TaskView {
             effective_workflow: effective,
+            effective_outline_path: self.effective_outline_path(task),
             actions: task.effective_actions(),
             blocked_by: self
                 .unsatisfied_deps(&task.id)
@@ -4742,6 +4766,85 @@ mod tests {
             None,
             "重载后也不得凭空出现大纲路径"
         );
+    }
+
+    /// 只有拆分的根任务携带 `outline_path`；读模型必须替前端走完祖先链，
+    /// 否则每个调用方都得自己爬 parent_id（还会漏掉多层嵌套）。
+    #[test]
+    fn effective_outline_path_resolves_from_ancestor() {
+        let (dir, mut store) = tmp_store();
+        let _cwd = dir.path();
+        let mut root = store
+            .create("r", "", 3, vec![], None, None, None, None, "test")
+            .unwrap();
+        root.outline_path = Some("docs/outlines/root.md".into());
+        store.insert_task_for_test(root.clone());
+        let child = store
+            .create(
+                "c",
+                "",
+                3,
+                vec![],
+                None,
+                Some(root.id.clone()),
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
+        store.insert_task_for_test(child.clone());
+        let view = store.view(&child);
+        assert_eq!(
+            view.effective_outline_path.as_deref(),
+            Some("docs/outlines/root.md")
+        );
+    }
+
+    /// 孙辈同样要解析（递归向上，不是只看直接父级）；完全没有祖先携带
+    /// 大纲的独立任务必须给 None，而不是凭空编一个路径。
+    #[test]
+    fn effective_outline_path_walks_two_levels_and_defaults_none() {
+        let (_dir, mut store) = tmp_store();
+        let mut root = store
+            .create("r", "", 3, vec![], None, None, None, None, "test")
+            .unwrap();
+        root.outline_path = Some("docs/outlines/root.md".into());
+        store.insert_task_for_test(root.clone());
+        let child = store
+            .create(
+                "c",
+                "",
+                3,
+                vec![],
+                None,
+                Some(root.id.clone()),
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
+        let grandchild = store
+            .create(
+                "g",
+                "",
+                3,
+                vec![],
+                None,
+                Some(child.id.clone()),
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
+        assert_eq!(
+            store.view(&grandchild).effective_outline_path.as_deref(),
+            Some("docs/outlines/root.md")
+        );
+
+        let lone = store
+            .create("lone", "", 3, vec![], None, None, None, None, "test")
+            .unwrap();
+        assert_eq!(store.view(&lone).effective_outline_path, None);
     }
 
     // ─── ImportTask.paths 字段名别名 ─────────────────────────────────
