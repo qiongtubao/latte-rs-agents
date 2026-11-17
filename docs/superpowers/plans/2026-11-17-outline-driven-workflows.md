@@ -603,10 +603,47 @@ In `workflow.rs`, implement `check_outline_against_plan(plan_json: &str, outline
 - parse plan tasks via existing `parse_and_validate_plan_tasks` (`controller.rs:7630`);
 - `outline::parse_outline(outline_md)`;
 - compare the multiset of `### {title}` under anchors against plan task titles (top level + nested by `children` depth); on mismatch return `Err(format!("大纲锚点标题与任务清单不一致：..."))` listing missing/extra titles;
-- require `needs_split` on every plan task; absent → `Err("任务 <title> 缺少 needs_split")`;
+- require `needs_split` on every plan task; absent → `Err("任务 <title> 缺少 needs_split")` (see the shared presence check below);
 - require outline node `needs_split` flags equal plan's.
 
-Wire it as a new step field, in this order (order matters — `WorkflowStepDef` is `#[serde(deny_unknown_fields)]`, so the TOML key fails to load until the Rust field exists):
+**Presence must be checked on raw JSON, not the typed struct.** `PlanTask.needs_split` has `#[serde(default)]`, so an omitted field and an explicit `false` look identical after parsing — checking the typed value would let a model silently skip the field. Implement:
+
+```rust
+/// 每个 plan 任务（含任意深度 subtasks）都必须**显式**声明 needs_split。
+/// 必须查原始 JSON 键：`PlanTask.needs_split` 有 serde(default)，解析后
+/// 「没写」和「写了 false」无法区分。
+fn check_plan_tasks_have_needs_split(plan_json: &str) -> Result<(), String> {
+    fn walk(v: &serde_json::Value, missing: &mut Vec<String>) {
+        let Some(obj) = v.as_object() else { return };
+        let title = obj.get("title").and_then(|t| t.as_str()).unwrap_or("<无标题>");
+        if !obj.contains_key("needs_split") {
+            missing.push(title.to_string());
+        }
+        if let Some(subs) = obj.get("subtasks").and_then(|s| s.as_array()) {
+            for s in subs {
+                walk(s, missing);
+            }
+        }
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(plan_json).map_err(|e| format!("任务清单不是合法 JSON：{e}"))?;
+    let mut missing = Vec::new();
+    if let Some(arr) = v.get("tasks").and_then(|t| t.as_array()) {
+        for t in arr {
+            walk(t, &mut missing);
+        }
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("以下任务缺少 needs_split（拆分类清单必填）：{}", missing.join("、")))
+    }
+}
+```
+
+`check_outline_against_plan` calls this first, then does the title/flag comparison.
+
+Wire it as new step fields, in this order (order matters — `WorkflowStepDef` is `#[serde(deny_unknown_fields)]`, so a TOML key fails to load until the Rust field exists):
 
 1. Add to `WorkflowStepDef` (near `require_plan_tasks`, ~`workflow.rs:2754`):
 
@@ -615,6 +652,10 @@ Wire it as a new step field, in this order (order matters — `WorkflowStepDef` 
     /// 在锚点标题 / needs_split 上一致（见 `check_outline_against_plan`）。
     #[serde(default)]
     pub require_outline_against_plan: bool,
+    /// 清单机械校验：要求每个 plan 任务显式带 `needs_split`（缺字段 = 规划意图
+    /// 不明，绝不能默认成叶子）。拆分类 workflow 必须打开它。
+    #[serde(default)]
+    pub require_needs_split: bool,
 ```
 
 2. In the serial runner's mechanical-gate block (where `check_plan_tasks_output` is called, `workflow.rs:524`), after the plan gate, call `check_outline_against_plan(&vars["draft"], &step_output)` when the flag is set.
@@ -644,6 +685,8 @@ output_key = "draft"
 max_retries = 1
 tools = ["read", "search", "code_graph"]
 require_plan_tasks = true
+# 拆分类清单必须显式声明 needs_split：缺字段 = 规划意图不明，不能默默当叶子。
+require_needs_split = true
 prompt = """拆分下面这条大任务：
 
 【大任务】
@@ -793,9 +836,18 @@ pub fn check_refine_allowed(task: &Task) -> Result<(), RefineError> {
 
 Map `RefineError::Leaf` to `(StatusCode::CONFLICT, "叶子任务不可再拆（needs_split=false）")` in `handlers.rs:1309-1317`.
 
-- [ ] **Step 4: Add needs_split to refine prompt**
+- [ ] **Step 4: Add needs_split to refine prompt + turn on the mechanical gate**
 
 In `config/workflows/task_refine.toml`, inside the `refine` step prompt's JSON field list (line 77-85), add `needs_split（必填：true=还需继续拆，false=叶子）` after `workflow(...)`, and add one sentence: "每个子任务必须显式写 needs_split——引擎机械校验，缺失整单打回。"
+
+Also add to the `refine` step's header (next to its existing `require_plan_tasks = true` at `task_refine.toml:66`):
+
+```toml
+# 子任务也必须判"要不要再拆"：缺字段 = 规划意图不明，不能默默当叶子。
+require_needs_split = true
+```
+
+This is what makes the prompt's "必填" true rather than aspirational — `check_plan_tasks_have_needs_split` (Task 6) rejects the draft mechanically. `WorkflowStepDef` already has the field from Task 6, so `deny_unknown_fields` accepts it.
 
 - [ ] **Step 5: Insert child anchors mechanically at import (no model step)**
 
