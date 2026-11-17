@@ -1530,6 +1530,9 @@ mod tests {
                 args_json: "{}".into(),
                 latency_ms: 3,
                 status: ToolStatus::Ok("ok".into()),
+                output_complete: true,
+                output_bytes: 2,
+                artifact: None,
             });
         }
         drop(sink);
@@ -1609,6 +1612,9 @@ mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: ToolStatus::Ok("ok".into()),
+            output_complete: true,
+            output_bytes: 2,
+            artifact: None,
         });
         let (sub_b, sink_b) = backend.subsession_store.create(&sid, "reviewer");
         sink_b.emit(TraceEvent::ToolExec {
@@ -1617,6 +1623,9 @@ mod tests {
             args_json: "{}".into(),
             latency_ms: 1,
             status: ToolStatus::Ok("ok".into()),
+            output_complete: true,
+            output_bytes: 2,
+            artifact: None,
         });
         drop(sink_a);
         drop(sink_b);
