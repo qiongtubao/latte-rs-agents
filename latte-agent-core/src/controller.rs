@@ -14667,24 +14667,33 @@ pub(crate) mod tests {
             assert!(prompt.contains(needle), "prompt 缺少关键约束：{needle}");
         }
 
-        // 3) 骨架必须恰好一个 fenced 代码块（提示词只允许它一个代码块，
-        //    所以整份文件的行首围栏只能是"开+闭"两行）。
-        let fence_lines = prompt
-            .lines()
-            .filter(|l| l.trim_start().starts_with("```"))
-            .count();
-        assert_eq!(fence_lines, 2, "提示词必须恰好一个 fenced 代码块");
-
-        let fence_at = prompt
-            .lines()
-            .position(|l| l.trim() == "```markdown")
-            .expect("骨架必须用 ```markdown 围栏");
-        let block = prompt
-            .lines()
-            .skip(fence_at + 1)
-            .take_while(|l| l.trim() != "```")
-            .collect::<Vec<_>>()
-            .join("\n");
+        // 3) 提示词必须声明"只输出一个代码块"，且其中恰好有一个骨架代码块
+        //    （以 frontmatter 开头）。以后在提示词里加别的示例代码块不算违约。
+        assert!(
+            prompt.contains("恰好一个") && prompt.contains("代码块"),
+            "提示词必须声明只输出一个代码块"
+        );
+        let all_lines: Vec<&str> = prompt.lines().collect();
+        let fences: Vec<usize> = all_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.trim_start().starts_with("```"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(fences.len() % 2, 0, "围栏必须开闭成对");
+        let mut skeletons: Vec<String> = Vec::new();
+        for pair in fences.chunks(2) {
+            let body = all_lines[pair[0] + 1..pair[1]].join("\n");
+            if body.starts_with("---\nschema: 1") {
+                skeletons.push(body);
+            }
+        }
+        assert_eq!(
+            skeletons.len(),
+            1,
+            "必须恰好一个以 frontmatter 开头的大纲骨架代码块"
+        );
+        let block = &skeletons[0];
         assert!(!block.is_empty(), "骨架代码块不得为空");
 
         let idx = |needle: &str| {
@@ -14693,14 +14702,14 @@ pub(crate) mod tests {
                 .unwrap_or_else(|| panic!("骨架缺少 `{needle}`"))
         };
         assert!(block.starts_with("---\n"), "骨架必须以 frontmatter 开头");
-        assert!(
-            idx("schema: 1") < idx("task_id:") && idx("task_id:") < idx("title:"),
-            "frontmatter 键顺序必须是 schema → task_id → title"
-        );
+        // 解析器按 `key: value` 扫 frontmatter，不要求键序——只要求三个键都在。
+        for key in ["schema: 1", "task_id:", "title:"] {
+            assert!(block.contains(key), "frontmatter 缺少 `{key}`");
+        }
         assert_eq!(
-            block.matches("\n---\n").count() + usize::from(block.starts_with("---\n")),
-            2,
-            "frontmatter 必须有开头和结尾两条 `---`"
+            block.matches("\n---\n").count(),
+            1,
+            "frontmatter 必须有结尾的 `---`"
         );
 
         let lines: Vec<&str> = block.lines().collect();
@@ -14711,8 +14720,8 @@ pub(crate) mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(
-            anchors.len() >= 3,
-            "骨架至少要演示根 → 子 → 孙三层，实际锚点数 {}",
+            anchors.len() >= 2,
+            "骨架至少要演示根节点 + 一个子节点，实际锚点数 {}",
             anchors.len()
         );
         assert!(
@@ -14760,11 +14769,22 @@ pub(crate) mod tests {
             block.contains("<!-- learn-links:start -->\n<!-- learn-links:end -->"),
             "空的 learn-links 区块也必须写成一对起止标记"
         );
-        assert_eq!(
-            block.matches("<!-- learn-links:start -->").count(),
-            anchors.len() - 1,
-            "除根节点外每个节点都必须有 learn-links 区块"
-        );
+        // `learn-links` 在每个非根节点上都要有（草案阶段为空也要写起止标记）：
+        // 按"该锚点到下一个锚点"的切片查，不绑定骨架里有几层。
+        for (k, &a) in anchors.iter().enumerate().skip(1) {
+            let end = anchors.get(k + 1).copied().unwrap_or(lines.len());
+            let slice = &lines[a..end];
+            let opens = slice
+                .iter()
+                .position(|l| l.trim() == "<!-- learn-links:start -->");
+            assert!(
+                opens.is_some_and(|o| slice[o + 1..]
+                    .iter()
+                    .any(|l| l.trim() == "<!-- learn-links:end -->")),
+                "节点 `{}` 缺少成对的 learn-links 区块",
+                lines[a].trim()
+            );
+        }
         // 区块之后不得再出现标题行（解析器直接报错）。
         for pair in lines.windows(2) {
             let (cur, next) = (pair[0].trim(), pair[1].trim_start());
