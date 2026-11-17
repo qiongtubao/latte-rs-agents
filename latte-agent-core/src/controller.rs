@@ -907,9 +907,9 @@ pub struct PlanTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<String>,
     /// 是否仍需继续拆分。规划字段，与 subtasks 是否为空解耦。
-    /// 拆分类 workflow（outline_split / task_refine）的门禁要求每条任务
-    /// 都显式给出该字段；schema 侧仍保持可选（老的产出方照常通过），
-    /// 缺省即 `false`。`false` 不序列化。
+    ///
+    /// 拆分类 workflow 要求每个任务显式声明它；schema 层保持可选，
+    /// 只是为了让旧清单/旧消费者继续通过校验——缺省即 false（叶子）。
     #[serde(default, skip_serializing_if = "is_false")]
     pub needs_split: bool,
     /// 任务涉及的文件/目录前缀（相对项目根）：并行执行时范围重叠的
@@ -7560,9 +7560,8 @@ fn plan_task_input_property() -> latte_rs_agent_tools::types::ToolInputProperty 
             input_property(
                 PropertyType::Boolean,
                 "Whether this task must be broken down further before it is executable. \
-                 Splitting workflows (outline_split / task_refine) are required by their \
-                 workflow gate to emit this on every task; the JSON Schema keeps it optional so \
-                 older plan producers still validate. Independent of `subtasks`.",
+                 Splitting workflows must emit it on every task; the JSON Schema keeps it \
+                 optional so older plan producers still validate. Independent of `subtasks`.",
             ),
         ),
         (
