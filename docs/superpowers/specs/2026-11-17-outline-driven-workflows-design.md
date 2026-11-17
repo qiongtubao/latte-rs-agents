@@ -166,7 +166,7 @@ updated_at: 1784996760000
 
 | 模块 | 文件 | 职责 |
 |---|---|---|
-| 大纲解析/渲染/对账 | `latte-agent-core/src/outline.rs`（新） | `OutlineDoc`/`OutlineNode` 结构；`parse_outline`/`render_outline` 往返幂等；`sync_with_tasks` 按 id 对账；`rebind_tmp_ids` 把 `tmp:` 锚点换成真实 task.id；受控区块的保留式重写 |
+| 大纲解析/渲染/对账 | `latte-agent-core/src/outline.rs`（新） | `OutlineDoc`/`OutlineNode` 结构；`parse_outline`/`render_outline`（canonical 输入往返逐字节一致，其余规范化）；`apply_board_fields` 看板→大纲对账；`rebind_tmp_ids` 把 `tmp:` 锚点换成真实 task.id；`validate_unique_ids` 拒重复 id；受控区块的保留式重写 |
 | 大纲同步命令与 API | `latte-agent-core/src/controller.rs`、`latte-agent-ui-server/src/handlers.rs` | `outline_sync` 工具；`POST /api/outlines/:task_id/sync` 端点 |
 | 看板任务扩展 | `latte-agent-ui-server/src/tasks.rs` | 新字段持久化、`effective_outline_path` 解析、递归导入写标记、结构同步 |
 | 大任务拆分 workflow | `config/workflows/outline_split.toml`（新） | 输入大任务 → 任务树 JSON + 大纲草案 + 机械 gate + 提交 |

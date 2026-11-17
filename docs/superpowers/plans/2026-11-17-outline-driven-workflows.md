@@ -17,7 +17,7 @@
 ## File Structure (locked)
 
 **Create:**
-- `latte-agent-core/src/outline.rs` — `OutlineNode`/`OutlineDoc`, `parse_outline`, `render_outline`, `rebind_tmp_ids`, `sync_with_tasks`, controlled-block preservation.
+- `latte-agent-core/src/outline.rs` — `OutlineNode`/`OutlineDoc`, `parse_outline`, `render_outline`, `rebind_tmp_ids`, `apply_board_fields`(看板→大纲), `validate_unique_ids`, controlled-block preservation.
 - `prompts/outline_writer.md` — outline-writing role system prompt.
 - `config/agents/outline_writer.toml` — new role config (mirrors `task_planner.toml`).
 - `config/workflows/outline_split.toml` — big-task split workflow.
@@ -363,7 +363,29 @@ pub struct OutlineDoc {
 /// 解析成树。锚外自由文本不参与结构，只在 render 时原样放回（保留 `preamble`）。
 ```
 
-Keep a `preamble: String` field on `OutlineDoc` for text before the first `<!-- node: -->` so `render_outline(parse_outline(x)) == x` for hand-edited docs (spec §5.3 "重生成不丢内容"). Implementation: regex-scan lines; on `node:` start a node at current nesting depth; `children:start/end` adjust depth; collect `body`/`learn-links` lines between their markers; attach nodes to the nearest open parent by depth. Render mirrors parse: emit preamble, then for each node emit `<!-- node:{id}{ needs_split} -->`, `### {title}`, body block, learn-links block, then children inside `children:start/end`.
+Keep a `preamble: String` field on `OutlineDoc` for text before the first `<!-- node: -->` and store it verbatim, so机器不碰人手写的前言（spec §5.3 "重生成不丢内容"）。
+
+**Round-trip guarantee (be precise — do not over-promise):** `render_outline(parse_outline(x)) == x` holds for **canonical** docs (the shape this project generates: 4-space-free anchors, `### ` headings, blocks in body→learn-links→children order). Hand-edited variants (extra blank lines, `##`/`####` heading levels, anchor spacing variants) are parsed correctly and re-rendered canonically — content is preserved, byte layout may normalize. Store what is needed to avoid lossy round-trips on canonical input:
+
+```rust
+pub struct OutlineNode {
+    pub id: String,
+    pub title: String,
+    pub needs_split: bool,
+    /// 标题行原文（含 `### ` 前缀）。render 原样输出，避免改变层级。
+    /// `None` = 锚点后没有标题行（根节点常见：`## 概述` 属于 body 区块内部，
+    /// 不是节点标题）。**不要**给根节点凭空补一个标题。
+    pub heading_raw: Option<String>,
+    pub body: String,
+    /// 该节点是否带 `section:body` 区块——没有就**不要**在 render 时凭空加。
+    pub has_body_block: bool,
+    pub learn_links: Vec<String>,
+    pub has_learn_links_block: bool,
+    pub children: Vec<OutlineNode>,
+}
+```
+
+Implementation: line-scan; a `node:` anchor at depth d opens a node; `children:start/end` change depth; `body`/`learn-links` markers switch the collecting block. Heading capture rule: the first content line **outside** any block, after the anchor, that starts with `#` becomes `heading_raw` (exactly one line, `Some`); if the next thing after the anchor is a block marker or blank lines followed by a marker, `heading_raw` is `None`. Attach nodes to the nearest open parent. Render mirrors parse: preamble verbatim, then per node anchor line (`<!-- node:{id}{ needs_split} -->`), `heading_raw` if `Some`, body block only if `has_body_block`, learn-links block only if `has_learn_links_block`, then children wrapped in `children:start/end` **only if the node has children** (do not invent empty blocks — the second test's input has none).
 
 `rebind_tmp_ids`:
 
@@ -385,7 +407,7 @@ pub fn rebind_tmp_ids(doc: &mut OutlineDoc, title_to_id: &HashMap<String, String
 }
 ```
 
-`sync_with_tasks(doc, tasks: &[TaskBrief]) -> Result<(), String>`: reconcile shared fields (existence, hierarchy, title, needs_split) by id, leaving `body` untouched; used by the sync API (Task 8). `TaskBrief { id, title, parent_id, needs_split }` lives in `outline.rs` so core does not depend on ui-server types.
+`apply_board_fields(doc, tasks: &[TaskBrief]) -> Result<(), String>`: **看板 → 大纲**方向——按 id 把看板侧的 `title`/`needs_split` 落到文档，`body` 不动；父结构冲突、文档有而看板无的节点报错。反方向（大纲 → 看板）由 Task 8 的 sync 端点负责，两者不可混用。`TaskBrief { id, title, parent_id, needs_split }` 定义在 `outline.rs`，让 core 不依赖 ui-server 类型。
 
 - [ ] **Step 1: Write failing tests**
 
