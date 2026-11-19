@@ -89,6 +89,16 @@ fn agent_error_to_kind(e: &AgentError) -> ModelErrorKind {
         AgentError::ToolCallBudgetExceeded { calls, limit, .. } => ModelErrorKind::Other {
             message: format!("tool call budget exceeded ({calls} started, limit {limit})"),
         },
+        AgentError::RequiredToolNotCalled {
+            tools,
+            calls_started,
+            ..
+        } => ModelErrorKind::Other {
+            message: format!(
+                "required tool not called ({:?} missing after {calls_started} tool calls)",
+                tools
+            ),
+        },
         AgentError::DeadlineExceeded {
             elapsed_secs,
             tool_rounds,

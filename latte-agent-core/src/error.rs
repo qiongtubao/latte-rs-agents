@@ -139,6 +139,24 @@ pub enum AgentError {
         last_tool: Option<String>,
         partial: String,
     },
+    /// 本 turn 声明了必需工具（`require_tools` / `require_tools_any`），但
+    /// 循环内的必需工具门连续跳过了 `skips` 批偏离目标的调用之后仍未满足。
+    ///
+    /// 为什么必须中止而不只是提醒：`require_tools` 原先只在 turn 结束后
+    /// 判，于是「读了 78 次、一次没写」能一路跑到 step 超时（实测
+    /// `learn_book_pages` 的 detail 步），整步产出作废重来。这里在**循环内**
+    /// 就把方向掰回来，掰不动就带 partial 结束——调用方（workflow）据
+    /// `partial` 降级采纳，与 `ToolCallBudgetExceeded` 走同一条路径。
+    #[error("required tool not called: {tools:?} still missing after {calls_started} tool calls (skipped {skips} detour batches){}", fmt_partial(partial))]
+    RequiredToolNotCalled {
+        /// 没被调用的必需工具（短名；AND 组逐个点名，OR 组列全部候选）。
+        tools: Vec<String>,
+        /// 门放弃时本 turn 已启动的工具调用数（被跳过的批次不计）。
+        calls_started: usize,
+        /// 已经跳过了几批偏离目标的调用。
+        skips: usize,
+        partial: String,
+    },
     /// Wall-clock deadline exceeded before completion.
     #[error("deadline exceeded after {elapsed_secs}s ({tool_rounds} tool rounds){}", last_tool.as_ref().map(|t| format!(", last tool: {t}")).unwrap_or_default())]
     DeadlineExceeded {

@@ -37,6 +37,9 @@ unless_any = ["[[learn_plan:rechapter]]"]
 # 不合格带批注在本步重试，而不是让扇出前校验判死整单（实测 ch01 验收前指 ch02）。
 require_learn_skeleton = ".latte/learn-plan/chapters.json"
 max_retries = 2
+# 硬预算：本步只读骨架、不逐文件深读（见 task），取证很少超过 10~20 次。
+# 实测失控形态是 78 次只读、0 次 write 跑满 600s，故给一条廉价精确的刹车。
+max_tool_calls = 40
 tools = ["read", "code_graph", "search", "write"]
 require_tools = ["write"]
 require_tools_any = ["read", "code_graph", "search"]
@@ -116,6 +119,9 @@ description = "逐章扇出：每章一个独立 subsession，产出该章完整
 role = "tutor"
 depends_on = ["breakdown"]
 max_retries = 2
+# 硬预算：每章子会话只做「read/search 轻量核实 + write 落盘」，
+# 60 次已远超正常体量（实测失控形态：一个子会话 78 次只读、0 次 write）。
+max_tool_calls = 60
 tools = ["read", "search", "write"]
 require_tools = ["write"]
 # 扇出 N 个有界单章子会话，下游还有 assemble 机械校验 + verdict 抽查 +

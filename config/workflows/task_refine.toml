@@ -57,6 +57,9 @@ description = "task_planner 读代码摸底，输出结构化拆分草案（含 
 speakers = ["task_planner"]
 output_key = "draft"
 max_retries = 1
+# 硬预算：本步读代码摸底后**一次性**出草案，40 次取证足够；
+# 超出说明它在发散检索，而不是在拆任务（失控形态见 learn_book_pages 的 78 次只读）。
+max_tool_calls = 40
 # step 级工具过滤：本步硬性摘掉 plan 工具（引擎层 enforce，不靠
 # prompt 自觉）——草案必须先过 review/gate。
 tools = ["read", "search", "code_graph"]

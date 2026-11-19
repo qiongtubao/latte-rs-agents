@@ -13240,6 +13240,41 @@ async fn run_step_speaker(inp: SpeakerDispatch) -> Result<SpeakerOut, StepFail> 
                                 )));
                                 break;
                             }
+                            if let crate::error::AgentError::RequiredToolNotCalled {
+                                tools,
+                                calls_started,
+                                skips,
+                                partial,
+                            } = &e
+                            {
+                                // 与工具预算同款降级：跑了一大轮（也就烧了一大笔
+                                // token）却只是反复读、没调本步要求的工具，模型已
+                                // 产出的正文仍是唯一有用的东西——能采纳就采纳，
+                                // 别让整步作废重来（实测整步重来 = 重读同样的文件、
+                                // 撞同样的毛病）。
+                                let want = tools.join(" / ");
+                                if let Some((notice, adopted)) = degrade_partial_on_break(
+                                    &speaker,
+                                    &inp.step_id,
+                                    &format!(
+                                        "必需工具 [{want}] 始终没被调用（已启动 {calls_started} 次工具调用，跳过 {skips} 批偏离调用）"
+                                    ),
+                                    partial,
+                                ) {
+                                    let _ = inp
+                                        .event_tx
+                                        .send(ChatEvent::Status { message: notice });
+                                    attempt = Ok((adopted, tool_count, tool_summary));
+                                    break;
+                                }
+                                attempt = Err(StepFail::Failed(format!(
+                                    "subagent '{speaker}' 没有调用本步要求的工具 [{want}]：\
+                                     已启动 {calls_started} 次工具调用、跳过 {skips} 批只顾着读的批次，\
+                                     仍无产出。请检查本步的 require_tools 是否与 tools 白名单一致\
+                                     （摘掉工具却要求调用它，模型再怎么试也做不到），或把任务拆小"
+                                )));
+                                break;
+                            }
                             if let crate::error::AgentError::DeadlineExceeded {
                                 elapsed_secs,
                                 tool_rounds,
@@ -17586,6 +17621,46 @@ prompt = "x"
             checked > 0,
             "应至少扫到一组并发 step，实际 0 组（扫描逻辑可能失效）"
         );
+    }
+
+    /// 重读轻写类步骤必须带 `max_tool_calls` 硬预算。
+    ///
+    /// 修的事故：`learn_book_pages` 的 detail 步在 600s 里调了 78 次
+    /// read/search/code_graph、0 次 write，跑到整步超时。只读软提醒（已删除）
+    /// 被无视；循环内的必需工具门只对声明了 `require_tools` 的步骤生效；
+    /// 剩下的廉价精确刹车就是这个预算——所以「先大量读、最后才写」的步骤
+    /// 一个都不能漏。
+    ///
+    /// 顺带确认它们能过 `validate`：这几个字段只对有 speaker 的模型步骤
+    /// 生效（没有 speaker = 引擎机械步，给了也没人执行）。
+    #[test]
+    fn heavy_reading_steps_declare_tool_budgets() {
+        const EXPECTED: &[(&str, &str, usize)] = &[
+            ("learn_book_pages", "breakdown", 40),
+            ("learn_book_pages", "detail", 60),
+            ("task_refine", "refine", 40),
+            ("outline_split", "breakdown", 40),
+        ];
+        for (wf_name, step_id, expected) in EXPECTED {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../config/workflows/{wf_name}.toml"));
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+            let wf: WorkflowDef = toml::from_str(&raw)
+                .unwrap_or_else(|e| panic!("workflow '{wf_name}' 解析失败: {e}"));
+            wf.validate()
+                .unwrap_or_else(|e| panic!("workflow '{wf_name}' 校验失败: {e}"));
+            let step = wf
+                .steps
+                .iter()
+                .find(|s| s.id == *step_id)
+                .unwrap_or_else(|| panic!("workflow '{wf_name}' 缺 step '{step_id}'"));
+            assert_eq!(
+                step.max_tool_calls,
+                Some(*expected),
+                "workflow '{wf_name}' 的 step '{step_id}' 必须声明 max_tool_calls = {expected}"
+            );
+        }
     }
 
     /// 仓库里有**两份** workflow 副本：`config/workflows/`（权威）与

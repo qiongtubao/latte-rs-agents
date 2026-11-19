@@ -30,6 +30,9 @@ description = "task_planner 出结构化拆分草案（含 needs_split；本步�
 speakers = ["task_planner"]
 output_key = "draft"
 max_retries = 1
+# 硬预算：本步读代码摸底后**一次性**出任务树，40 次取证足够；
+# 超出说明它在发散检索，而不是在拆任务。
+max_tool_calls = 40
 # 本步硬性摘掉 plan 工具（引擎层 enforce）：草案要先过 review/gate，
 # 提交统一由 submit 步机械完成。
 tools = ["read", "search", "code_graph"]

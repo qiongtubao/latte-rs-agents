@@ -990,6 +990,17 @@ struct LoopDetector {
     /// 连击到 [`LOOP_NUDGE_AT`] 次时留下的一次性提醒，由调用方 [`LoopDetector::take_nudge`] 取走，
     /// 附在这次调用的 tool_result 末尾。
     nudge: Option<String>,
+    /// 本次连击的提醒是否**已经送达**（[`LoopDetector::take_nudge`] 被调用过）。
+    ///
+    /// 送达后才把「第 NUDGE_AT + 1 次相同调用」直接判熔断：提醒里写明了
+    /// 「再重复就中止」，模型在 tool_result 里看到了还照旧重复，就是不肯改
+    /// ——继续等到 `LOOP_STREAK_THRESHOLD` 只是多烧两轮请求（实测：单发软
+    /// 提醒被完全无视，见 read-only nudge 的教训）。
+    ///
+    /// 没有取走 nudge 的调用方（单元测试、只判不发的场景）不算送达，仍按
+    /// `LOOP_STREAK_THRESHOLD` 兜底——这是 5 次规则必须保留的原因，它覆盖
+    /// 「提醒没送出去」的那条路径。
+    nudged: bool,
 }
 
 const LOOP_WINDOW_SIZE: usize = 8;
@@ -1097,6 +1108,225 @@ fn required_tool_nudge(gap: &RequiredToolGap, attempt: u8) -> String {
     )
 }
 
+/// 一个短名是否满足某条必需工具要求。
+///
+/// `write` 的语义是「真把产出落盘」，`edit` 改已有文件同样落了盘——与
+/// [`AgentRunner::missing_required_tools`] 和 workflow `check_required_tools`
+/// 用的是**同一条判据**，三处不能漂移，否则「引擎说没写、模型说写了」。
+fn satisfies_required_tool(required: &str, called: &str) -> bool {
+    required == called || (required == "write" && called == "edit")
+}
+
+// ── 工具循环内的必需工具门 ──────────────────────────────────────────────
+//
+// 为什么必须有：`require_tools` 原先只在 turn 结束后的 `check_tool_usage`
+// 里判，于是「读了 78 次、一次没写」能一路白跑到 step 超时（实测：
+// `learn_book_pages` 的 detail 步，600s 里 78 次 read/search/code_graph、
+// 0 次 write，然后整步判死重来）。只读提醒是**单发软提醒**，模型直接无视
+// （已删除，见 commit message）。这里在**执行前**就把偏离目标的批次拦下来：
+// 不执行、回填合成结果、明确要求先调必需工具；连续跳过几批还没调，就带
+// partial 结束本 turn（workflow 据此降级采纳，而不是整步作废）。
+//
+// 做法借鉴 oh-my-pi 的 `SoftToolRequirement`：把「必需工具」做成**循环内**
+// 的硬约束，而不是事后一句判决。
+
+/// 本批之前已启动多少次工具调用后才开始拦。
+///
+/// 拆分类 / 写盘类步骤本来就要先读一批：`require_tools = ["write"]` 的步骤
+/// 前几次 `read` 是**必要**取证，过早拦截会把正常路径打断（那正是旧只读
+/// 提醒误伤的地方）。30 次已经很宽松——实测失控形态是 78 次，正常步骤的
+/// 取证很少超过 10~20 次。
+const REQUIRED_TOOL_GATE_AFTER_CALLS: usize = 30;
+
+/// 最多连续跳过几批偏离调用才放弃。
+///
+/// 2 批 = 两次自我纠正的机会（每批都是一整轮模型请求，模型能看到合成结果
+/// 里的明确要求）。第三次仍只调别的工具，说明它读不懂或不肯改，继续跑
+/// 只是烧钱——直接带 partial 结束本 turn，把决定权交回 workflow。
+const MAX_REQUIRED_TOOL_GATE_SKIPS: usize = 2;
+
+/// 工具循环内的必需工具门（借鉴 oh-my-pi 的 SoftToolRequirement）。
+///
+/// 三态而不是布尔：`Skip`（本批不执行、再给一次机会）与 `Abort`（别再跑了）
+/// 是**不同**的处置，前者要回填合成结果继续对话，后者要带 partial 结束 turn。
+/// 混成一个布尔，调用方就得到处猜"这次该放行还是该收摊"。
+#[derive(Debug, PartialEq, Eq)]
+enum RequiredToolGate {
+    /// 不干预：没有必需工具，或必需工具已调过，或还没走到刹车点。
+    Allow,
+    /// 本批不执行：合成"未执行"结果，要求先调必需工具。
+    Skip { missing: Vec<String> },
+    /// 放弃：已经跳过 N 批仍未满足，报错结束本 turn（带 partial）。
+    Abort { missing: Vec<String> },
+}
+
+/// 到刹车点后按已用跳过次数决定「跳过本批」还是「放弃」。
+///
+/// 两条分支共用同一段判断，`required_tool_gate`（AND 组）与
+/// `required_tool_gate_any`（OR 组）都走这里，避免两处阈值漂移。
+fn required_tool_gate_brake(
+    missing: Vec<String>,
+    calls_started: usize,
+    skips_used: usize,
+) -> RequiredToolGate {
+    if calls_started < REQUIRED_TOOL_GATE_AFTER_CALLS {
+        return RequiredToolGate::Allow;
+    }
+    if skips_used < MAX_REQUIRED_TOOL_GATE_SKIPS {
+        RequiredToolGate::Skip { missing }
+    } else {
+        RequiredToolGate::Abort { missing }
+    }
+}
+
+/// AND 组（`require_tools`）的必需工具门：**每个**都得调过。
+///
+/// 纯函数、不碰 `self`：这是把「读了 78 次没写」拦在循环内的判据本体，
+/// 单测直接钉住每种输入组合，不必起 wiremock。
+///
+/// - `required`：短名列表，AND 语义；
+/// - `already_called`：本 turn 已**成功执行**的工具短名；
+/// - `batch`：本批要执行的工具短名；
+/// - `calls_started`：本批之前已启动的调用数（本批尚未计入）；
+/// - `skips_used`：已经跳过几批。
+fn required_tool_gate(
+    required: &[String],
+    already_called: &[String],
+    batch: &[String],
+    calls_started: usize,
+    skips_used: usize,
+) -> RequiredToolGate {
+    // 没声明必需工具 → 绝大多数步骤走这条，一次都不干预。
+    if required.is_empty() {
+        return RequiredToolGate::Allow;
+    }
+    // 本批就带了必需工具：正在满足要求，放行（调用方据此清零 skips）。
+    if required
+        .iter()
+        .any(|r| batch.iter().any(|n| satisfies_required_tool(r, n)))
+    {
+        return RequiredToolGate::Allow;
+    }
+    // 前面已经调过 → 已满足。
+    let missing: Vec<String> = required
+        .iter()
+        .filter(|r| !already_called.iter().any(|n| satisfies_required_tool(r, n)))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return RequiredToolGate::Allow;
+    }
+    required_tool_gate_brake(missing, calls_started, skips_used)
+}
+
+/// OR 组（`require_tools_any`）的必需工具门：命中**任意一个**候选即可。
+///
+/// 判据与 AND 组根本不同（「任一」vs「全部」），所以不能塞进同一个列表——
+/// 否则「已调过 read」会被误当成「已满足 write」。`missing` 带的是**全部**
+/// 候选，让模型自己挑用哪个（理由同 [`RequiredToolGap::any_of`]）。
+fn required_tool_gate_any(
+    any_of: &[String],
+    already_called: &[String],
+    batch: &[String],
+    calls_started: usize,
+    skips_used: usize,
+) -> RequiredToolGate {
+    if any_of.is_empty() {
+        return RequiredToolGate::Allow;
+    }
+    let hit = any_of.iter().any(|r| {
+        batch
+            .iter()
+            .chain(already_called.iter())
+            .any(|n| satisfies_required_tool(r, n))
+    });
+    if hit {
+        return RequiredToolGate::Allow;
+    }
+    required_tool_gate_brake(any_of.to_vec(), calls_started, skips_used)
+}
+
+/// 合并两组的门：两组都要求时，拦得最狠的那个说了算（`Abort` > `Skip` > `Allow`）。
+///
+/// 只有两组**同时**没满足才可能双双非 `Allow`（任一组命中即满足 → 该组
+/// `Allow`），所以合并只是把 `missing` 拼齐，供文案一次点名两组。
+fn combine_required_tool_gates(a: RequiredToolGate, b: RequiredToolGate) -> RequiredToolGate {
+    let merge = |mut x: Vec<String>, y: Vec<String>| {
+        for t in y {
+            if !x.contains(&t) {
+                x.push(t);
+            }
+        }
+        x
+    };
+    match (a, b) {
+        (RequiredToolGate::Allow, g) | (g, RequiredToolGate::Allow) => g,
+        (RequiredToolGate::Skip { missing }, RequiredToolGate::Skip { missing: m2 }) => {
+            RequiredToolGate::Skip {
+                missing: merge(missing, m2),
+            }
+        }
+        (RequiredToolGate::Abort { missing }, RequiredToolGate::Abort { missing: m2 }) => {
+            RequiredToolGate::Abort {
+                missing: merge(missing, m2),
+            }
+        }
+        (RequiredToolGate::Abort { missing }, RequiredToolGate::Skip { missing: m2 })
+        | (RequiredToolGate::Skip { missing: m2 }, RequiredToolGate::Abort { missing }) => {
+            RequiredToolGate::Abort {
+                missing: merge(missing, m2),
+            }
+        }
+    }
+}
+
+/// 本批或本 turn 已调用的工具是否**已经满足了**必需工具要求。
+///
+/// `RequiredToolGate::Allow` 有两种成因：还没到刹车点、或已满足。只有后者
+/// 该把跳过计数清零——否则「读满 30 次 → 门放行 → 又读满 30 次」永远拿不到
+/// 第二次机会，而真正补齐了必需工具的 turn 也该重新记账。
+fn required_tools_satisfied(
+    all_of: &[String],
+    any_of: &[String],
+    already_called: &[String],
+    batch: &[String],
+) -> bool {
+    if all_of.is_empty() && any_of.is_empty() {
+        return false;
+    }
+    let covers = |req: &String| {
+        batch
+            .iter()
+            .chain(already_called.iter())
+            .any(|n| satisfies_required_tool(req, n))
+    };
+    all_of.iter().all(covers) && (any_of.is_empty() || any_of.iter().any(covers))
+}
+
+/// 合成 tool_result 的文案：先说要调什么，再说别的都别调。
+///
+/// 两组**分开**说，不能拼成一个列表：AND 组是「每个都得调」，OR 组是
+/// 「挑一个」，拼成 `call the a / b / c tools` 会被读成"三个都要"。
+fn required_tool_gate_text(all_of_missing: &[String], any_of_missing: &[String]) -> String {
+    let mut demand = String::new();
+    if !all_of_missing.is_empty() {
+        demand.push_str(&format!("call the `{}` tool", all_of_missing.join("` / `")));
+    }
+    if !any_of_missing.is_empty() {
+        if !demand.is_empty() {
+            demand.push_str(", or ");
+        }
+        demand.push_str(&format!(
+            "call one of the `{}` tools",
+            any_of_missing.join("` / `")
+        ));
+    }
+    if demand.is_empty() {
+        demand.push_str("call the required tool");
+    }
+    format!("Not executed: {demand} to resolve the pending action before using other tools.")
+}
+
 /// 归一必需工具名：去 `namespace.` 前缀与空白，丢掉空串。
 ///
 /// 与 workflow `check_required_tools` 共用同一套短名规则——那边比对的是
@@ -1189,6 +1419,18 @@ impl LoopDetector {
                     tool_name,
                     LOOP_STREAK_THRESHOLD - self.streak
                 ));
+            } else if self.streak == LOOP_NUDGE_AT + 1 && self.nudged {
+                // 提醒**刚送达**就原样重发：粘性熔断，不再等到 5 次。
+                //
+                // 与 5 次规则的分工：这条抓「读到提醒也不改」的形态（实测里
+                // 最常见——模型把「再重复就中止」当普通 tool_result 读过去），
+                // 5 次规则抓「提醒没送出去/被截断」的兜底。
+                return LoopDecision::Break(format!(
+                    "'{}' was called again with identical args right after being told the repetition \
+                     would abort the task; the model is not going to self-correct. \
+                     Breaking out so the user can intervene.",
+                    tool_name,
+                ));
             }
             if self.streak >= LOOP_STREAK_THRESHOLD {
                 return LoopDecision::Break(format!(
@@ -1199,6 +1441,8 @@ impl LoopDetector {
             }
         } else {
             self.streak = 1;
+            // 换了调用 = 有进展：提醒状态也归零，下一次连击重新走「先提醒」。
+            self.nudged = false;
         }
         self.history.push(key);
         if self.history.len() > LOOP_WINDOW_SIZE {
@@ -1249,7 +1493,13 @@ impl LoopDetector {
     }
 
     /// 取走（并清空）待发的连击提醒。
+    ///
+    /// 取走即视为**送达**（调用方紧接着把它拼进这次的 tool_result，模型下一轮
+    /// 请求必然看到），因此置位 `nudged`：再原样重复一次就直接熔断。
     fn take_nudge(&mut self) -> Option<String> {
+        if self.nudge.is_some() {
+            self.nudged = true;
+        }
         self.nudge.take()
     }
 
@@ -1259,6 +1509,7 @@ impl LoopDetector {
         self.history.clear();
         self.streak = 0;
         self.nudge = None;
+        self.nudged = false;
     }
 }
 
@@ -3550,6 +3801,19 @@ impl AgentRunner {
         self
     }
 
+    /// 本 turn 已**成功执行**过的工具短名（去重前的原始列表）。
+    ///
+    /// 依据是 `last_turn_tool_summaries`（只记执行成功的调用，续跑时由快照
+    /// 还原），与 workflow `check_required_tools` 用的是同一份事实。两处
+    /// 消费方（turn 末的文本提醒、循环内的必需工具门）共用这一个提取口径。
+    fn called_tool_short_names(&self) -> Vec<String> {
+        self.last_turn_tool_summaries
+            .iter()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|n| short_tool_name(n).to_string())
+            .collect()
+    }
+
     /// 本 turn 还没调用过、且本 runner 确实拿得到的必需工具（短名）。
     ///
     /// 依据是 `last_turn_tool_summaries`（只记**执行成功**的调用，续跑时由快照还原），
@@ -3559,15 +3823,15 @@ impl AgentRunner {
         if self.required_tools.is_empty() && self.required_tools_any.is_empty() {
             return RequiredToolGap::default();
         }
-        let called: Vec<&str> = self
-            .last_turn_tool_summaries
-            .iter()
-            .filter_map(|l| l.split_whitespace().next())
-            .map(short_tool_name)
-            .collect();
-        // `write` 的语义是「真把产出落盘」：`edit` 改已有文件同样落了盘。与
-        // workflow `check_required_tools` 同一条判据，两处不能漂移。
-        let satisfied = |r: &str| called.contains(&r) || (r == "write" && called.contains(&"edit"));
+        let called = self.called_tool_short_names();
+        // `write` 的语义是「真把产出落盘」：`edit` 改已有文件同样落了盘。
+        // 判据收在 `satisfies_required_tool` 里，与循环内的必需工具门、
+        // workflow `check_required_tools` 共用，三处不能漂移。
+        let satisfied = |r: &str| {
+            called
+                .iter()
+                .any(|c| satisfies_required_tool(r, c.as_str()))
+        };
         let has = |name: &str| available.iter().any(|t| short_tool_name(&t.name) == name);
         let all_of: Vec<String> = self
             .required_tools
@@ -5061,14 +5325,13 @@ impl AgentRunner {
         // continuation_prefix + 本轮 completion.content。空 = 未进入续写。
         let mut continuation_prefix = String::new();
 
-        // 只读工具防沉迷计数器：连续调用 read/search/glob 等无副作用探索工具的次数。
-        // 达到阈值时注入系统级提醒，打断穷尽式检索强迫症，催促尽快落笔修改。
-        let mut read_only_streak: usize = 0;
-        let mut read_only_nudge_sent = false;
         let mut deadline_hit = false;
         let mut tool_calls_started = 0usize;
         let mut tool_budget_hit: Option<(usize, usize)> = None;
         let mut last_executed_tool: Option<String> = None;
+        // 循环内必需工具门已经拦下过几批偏离目标的调用（见 `required_tool_gate`）。
+        // 必需工具真的被调到就清零，失控重新记账。
+        let mut required_gate_skips: usize = 0;
         // 死循环探测器：**整个 turn 共用一个**，streak 跨 round 累积。
         //
         // 这是 deadline-only 模式下唯一的自动刹车。轮次上限
@@ -5961,6 +6224,118 @@ impl AgentRunner {
             }
 
             if let Some(tm) = self.tool_manager.clone() {
+                // ── 必需工具门（循环内硬约束）─────────────────────────
+                //
+                // 放在 `max_tool_calls` 预检**之前**：被拦下的批次不执行，
+                // 不该占用工具预算，本 turn 该结束的原因也应是「必需工具
+                // 没调」而不是「工具调太多」。
+                //
+                // 修的事故：`require_tools` 原先只在 turn 结束后
+                // （workflow `check_tool_usage`）判，于是 600s 里 78 次
+                // read/search/code_graph、0 次 write 也能跑到超时；这里让
+                // 偏离目标的批次**不执行**，模型下一轮只能看到一句
+                // 「Not executed: …」。
+                //
+                // 热路径先短路：没声明必需工具的步骤（绝大多数）连 `batch`
+                // 都不计算——`already_called` 是每轮一次的小分配，没必要为
+                // 用不到它的步骤付。
+                let gate = if self.required_tools.is_empty() && self.required_tools_any.is_empty() {
+                    RequiredToolGate::Allow
+                } else {
+                    let batch: Vec<String> = post_parse_calls
+                        .iter()
+                        .map(|c| short_tool_name(&c.name).to_string())
+                        .collect();
+                    let already_called = self.called_tool_short_names();
+                    let gate = combine_required_tool_gates(
+                        required_tool_gate(
+                            &self.required_tools,
+                            &already_called,
+                            &batch,
+                            tool_calls_started,
+                            required_gate_skips,
+                        ),
+                        required_tool_gate_any(
+                            &self.required_tools_any,
+                            &already_called,
+                            &batch,
+                            tool_calls_started,
+                            required_gate_skips,
+                        ),
+                    );
+                    // 必需工具真的被调到了 → 跳过计数清零，下一次失控重新给两次机会。
+                    if required_tools_satisfied(
+                        &self.required_tools,
+                        &self.required_tools_any,
+                        &already_called,
+                        &batch,
+                    ) {
+                        required_gate_skips = 0;
+                    }
+                    gate
+                };
+                match gate {
+                    RequiredToolGate::Allow => {}
+                    RequiredToolGate::Skip { missing } => {
+                        required_gate_skips += 1;
+                        // 两组分开渲染：AND 组「每个都得调」，OR 组「挑一个」。
+                        let mut all_of_missing = Vec::new();
+                        let mut any_of_missing = Vec::new();
+                        for m in &missing {
+                            if self.required_tools.iter().any(|r| r == m) {
+                                all_of_missing.push(m.clone());
+                            } else {
+                                any_of_missing.push(m.clone());
+                            }
+                        }
+                        tracing::warn!(
+                            missing = ?missing,
+                            calls_started = tool_calls_started,
+                            skips = required_gate_skips,
+                            "tool batch skipped: required tool still not called"
+                        );
+                        // native 协议要求 assistant(tool_calls) 后面紧跟每条
+                        // tool_result；本批没执行，就回填合成结果保持闭环。
+                        messages.push(Message::assistant_with_tool_calls(
+                            final_response.clone(),
+                            tool_calls.clone(),
+                        ));
+                        let text = required_tool_gate_text(&all_of_missing, &any_of_missing);
+                        // 结果按下标对齐 `post_parse_calls`（与真正执行的路径同源：
+                        // PostParse hook 可能改过名字/参数，结果必须配它的 id）。
+                        for call in &post_parse_calls {
+                            messages.push(Message::tool_result(call.id.clone(), text.clone()));
+                        }
+                        // 再补一行 user 说得更直白：上面那条是"工具结果"，
+                        // 模型容易当噪声读过去；这里一句话点明"这批没执行"。
+                        messages.push(Message::user(format!(
+                            "上一批 {} 个工具调用**没有执行**：本步必须先调用 [{}]，再继续别的操作。",
+                            post_parse_calls.len(),
+                            missing.join(" / ")
+                        )));
+                        final_response.clear();
+                        continue;
+                    }
+                    RequiredToolGate::Abort { missing } => {
+                        tracing::warn!(
+                            missing = ?missing,
+                            calls_started = tool_calls_started,
+                            skips = required_gate_skips,
+                            "required tool never called inside the tool loop; aborting the turn with partial"
+                        );
+                        return Err(AgentError::RequiredToolNotCalled {
+                            tools: missing,
+                            calls_started: tool_calls_started,
+                            skips: required_gate_skips,
+                            partial: if last_substantive_response.is_empty() {
+                                final_response.clone()
+                            } else {
+                                last_substantive_response.clone()
+                            },
+                        });
+                    }
+                }
+
                 // 运行时工具硬预算：整批在任何 spawn/execute 之前预检。
                 // 若本批会跨过上限，整批都不启动，避免并行池一次越界多个
                 // 副作用调用。当前 turn 随后以带 partial 的错误结束。
@@ -6046,31 +6421,18 @@ impl AgentRunner {
                     )
                     .await?;
                 }
-                // ── 只读工具防沉迷催促（Read-Only Tool Runaway Nudge）──
-                // 对齐 oh-my-pi System Interrupt：防止模型在收到大量 issue 时陷入
-                // 连续几十甚至上百次 read/search 穷尽式探查而不动笔（如 196 次读搜事故）。
+                // 记下本批最后一个执行过的工具短名：工具预算 / 请求预算 /
+                // 超时这几条失败路径都要把它带出来，让「模型最后在干什么」
+                // 直接从错误里读得到。
+                //
+                // 只读提醒（连续 20 次 read/search/glob 注入一次催促）已删除：
+                // 三份参考实现（oh-my-pi / opencode / deepseek-harness）都没有
+                // 「只读 vs 落盘」的软提醒；实测里它只发一次就被完全无视
+                // （`learn_book_pages` 的 detail 步 78 次只读、0 次 write），
+                // 真正兜住这类失控的是循环内的必需工具门 + step 的
+                // `max_tool_calls` 硬预算。
                 for call in &post_parse_calls {
-                    let short = short_tool_name(&call.name);
-                    last_executed_tool = Some(short.to_string());
-                    if matches!(short, "read" | "search" | "glob") {
-                        read_only_streak += 1;
-                    } else if matches!(short, "edit" | "write" | "bash") {
-                        read_only_streak = 0;
-                        read_only_nudge_sent = false;
-                    }
-                }
-                const READ_ONLY_NUDGE_THRESHOLD: usize = 20;
-                if read_only_streak >= READ_ONLY_NUDGE_THRESHOLD && !read_only_nudge_sent {
-                    read_only_nudge_sent = true;
-                    tracing::warn!(
-                        read_only_streak,
-                        "read-only tool streak threshold reached; injecting steer nudge"
-                    );
-                    messages.push(Message::user(format!(
-                        "【系统提醒】你已连续执行了 {} 次只读查询（read/search/glob），但尚未对目标文件调用任何编辑工具（edit/write）。\n\
-                         请立即停止继续发散检索，基于当前已掌握的依据，针对已确认的问题调用 edit 或 write 工具开始落盘修改！",
-                        read_only_streak
-                    )));
+                    last_executed_tool = Some(short_tool_name(&call.name).to_string());
                 }
             }
 
@@ -10366,16 +10728,16 @@ mod tests {
             "{n}"
         );
         assert!(d.take_nudge().is_none(), "提醒是一次性的");
-        // 第 4 次不再提醒；第 5 次熔断
-        assert!(matches!(
-            d.record("edit", "{\"a\":1}"),
-            LoopDecision::Continue
-        ));
-        assert!(d.take_nudge().is_none());
-        assert!(matches!(
-            d.record("edit", "{\"a\":1}"),
-            LoopDecision::Break(_)
-        ));
+        // 提醒**已送达** → 第 4 次相同调用（LOOP_NUDGE_AT + 1）直接熔断：
+        // 「再重复就会中止」这句已经写进 tool_result，模型看到了还照旧重发，
+        // 就是不肯改，不必再等到 5 次。
+        match d.record("edit", "{\"a\":1}") {
+            LoopDecision::Break(reason) => assert!(
+                reason.contains("identical args"),
+                "原因要说明是提醒后仍原样重发: {reason}"
+            ),
+            LoopDecision::Continue => panic!("提醒送达后又一次相同调用必须熔断"),
+        }
         // 参数一变，连击清零，之后重新累计
         let mut d = LoopDetector::default();
         d.record("edit", "{\"a\":1}");
@@ -10383,6 +10745,84 @@ mod tests {
         d.record("edit", "{\"a\":2}");
         d.record("edit", "{\"a\":2}");
         assert!(d.take_nudge().is_none());
+    }
+
+    /// 粘性熔断：第 3 次相同调用留下提醒（送达），第 4 次立刻中止。
+    ///
+    /// 与 5 次规则的分工：这条抓「读到提醒也不改」（实测里最常见——模型把
+    /// 「再重复就中止」当成普通 tool_result 读过去），5 次规则抓「提醒没送
+    /// 出去」的兜底。
+    #[test]
+    fn loop_detector_breaks_right_after_nudge() {
+        let mut d = LoopDetector::default();
+        for i in 1..LOOP_NUDGE_AT {
+            assert!(
+                matches!(
+                    d.record("read", "{\"path\":\"a.rs\"}"),
+                    LoopDecision::Continue
+                ),
+                "第 {i} 次不该熔断"
+            );
+            assert!(d.take_nudge().is_none(), "第 {i} 次还不该提醒");
+        }
+        // 第 LOOP_NUDGE_AT 次：只提醒，不熔断。
+        assert!(matches!(
+            d.record("read", "{\"path\":\"a.rs\"}"),
+            LoopDecision::Continue
+        ));
+        assert!(d.take_nudge().is_some(), "第 {LOOP_NUDGE_AT} 次应留下提醒");
+        // 第 LOOP_NUDGE_AT + 1 次：提醒已送达，直接熔断。
+        match d.record("read", "{\"path\":\"a.rs\"}") {
+            LoopDecision::Break(reason) => {
+                assert!(
+                    reason.contains("identical args") && reason.contains("read"),
+                    "熔断原因要点名工具、说明是原样重发: {reason}"
+                );
+                assert!(
+                    !reason.contains("5 times in a row"),
+                    "粘性熔断不该报 5 次阈值: {reason}"
+                );
+            }
+            LoopDecision::Continue => panic!("提醒送达后的第 4 次相同调用必须熔断"),
+        }
+    }
+
+    /// 提醒后换了调用：`nudged` 与连击一起归零，下一次连击重新走「先提醒」。
+    #[test]
+    fn loop_detector_nudge_resets_on_different_call() {
+        let mut d = LoopDetector::default();
+        // 攒到第 3 次，取走提醒（= 送达）。
+        for _ in 0..LOOP_NUDGE_AT {
+            assert!(matches!(
+                d.record("read", "{\"path\":\"a.rs\"}"),
+                LoopDecision::Continue
+            ));
+        }
+        assert!(d.take_nudge().is_some());
+        // 换了调用 → 连击清零，粘性熔断状态一并清空。
+        assert!(matches!(
+            d.record("search", "{\"pattern\":\"x\"}"),
+            LoopDecision::Continue
+        ));
+        // 重新连击 read：第 1、2 次不提醒不熔断，第 3 次重新提醒而不是熔断。
+        for i in 1..LOOP_NUDGE_AT {
+            assert!(
+                matches!(
+                    d.record("read", "{\"path\":\"a.rs\"}"),
+                    LoopDecision::Continue
+                ),
+                "换调用后的第 {i} 次不该熔断"
+            );
+            assert!(d.take_nudge().is_none(), "换调用后的第 {i} 次不该提醒");
+        }
+        assert!(
+            matches!(
+                d.record("read", "{\"path\":\"a.rs\"}"),
+                LoopDecision::Continue
+            ),
+            "新一轮连击的第 {LOOP_NUDGE_AT} 次只提醒、不熔断"
+        );
+        assert!(d.take_nudge().is_some(), "新一轮连击应重新给出一次提醒");
     }
 
     /// 核心保证：**跨 round 的同参数死循环必须被抓到。**
@@ -10396,8 +10836,9 @@ mod tests {
     /// 一次都测不到——刹车形同虚设，turn 会无限空转（本测试在修复前会
     /// 一直打 wiremock 直到外层超时）。
     ///
-    /// 断言「模型每轮发一个完全相同的调用」这一最常见形态：连续
-    /// `LOOP_STREAK_THRESHOLD`(5) 轮后熔断，且点名肇事工具。
+    /// 断言「模型每轮发一个完全相同的调用」这一最常见形态：第
+    /// `LOOP_NUDGE_AT`(3) 轮在 tool_result 里提醒「再重复就中止」，第 4 轮
+    /// 仍原样重发即熔断（粘性规则，见 [`LoopDetector::nudged`]）。
     #[tokio::test]
     async fn identical_tool_call_across_rounds_trips_loop_detector() {
         use latte_rs_agent_tools::prelude::create_tool_manager;
@@ -10466,17 +10907,17 @@ mod tests {
             AgentError::ToolLoopDetected { tool, reason, .. } => {
                 assert_eq!(tool, "spin", "要点名肇事工具");
                 assert!(
-                    reason.contains("5 times in a row"),
-                    "应在第 5 次连续相同调用时熔断: {reason}"
+                    reason.contains("identical args") && reason.contains("right after being told"),
+                    "应在提醒送达后的下一次相同调用就熔断: {reason}"
                 );
             }
             other => panic!("expected ToolLoopDetected, got {other:?}"),
         }
-        // 熔断要快：5 轮就够，不该把几十轮 model call 都烧掉。
+        // 熔断要快：提醒在第 3 轮送达，第 4 轮就中止，不该把几十轮 model call 都烧掉。
         let n = server.received_requests().await.unwrap().len();
         assert!(
-            (5..=7).contains(&n),
-            "应在 ~5 轮内熔断，实际发了 {n} 次 model call"
+            (3..=6).contains(&n),
+            "应在 ~4 轮内熔断，实际发了 {n} 次 model call"
         );
     }
 
@@ -10759,8 +11200,16 @@ mod tests {
         }
     }
 
+    /// 循环内必需工具门的端到端证明：**偏离目标的批次一次都不执行**。
+    ///
+    /// 事故原型：`require_tools = ["write"]` 的步骤，模型一直在
+    /// read/search/code_graph（78 次、0 次 write）跑到超时。旧实现只在 turn
+    /// 结束后判，循环里唯一的手段是「连续 20 次只读发一条软提醒」——实测
+    /// 被完全无视，已删除（三份参考实现都没有这种提醒）。现在：
+    /// 30 次之后每一批「没带 write」的调用都不执行、回填合成结果，连续
+    /// 2 批仍不改就带 partial 中止。
     #[tokio::test]
-    async fn read_only_tool_streak_injects_steer_nudge() {
+    async fn required_tool_gate_blocks_detour_batches() {
         use latte_rs_agent_tools::prelude::create_tool_manager;
         use latte_rs_agent_tools::types::{
             SchemaType, SharedToolHandler, Tool, ToolInputSchema, ToolManager as _,
@@ -10769,7 +11218,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
 
-        let handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let counter = executed.clone();
+        let read_handler: SharedToolHandler = Arc::new(move |_input, _ctx| {
+            counter.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(serde_json::json!({ "content": "file text" })) })
         });
         let schema = ToolInputSchema {
@@ -10781,41 +11233,34 @@ mod tests {
         };
         let tm = create_tool_manager();
         tm.register(
-            Tool::builder("read", "read file", schema, handler).build(),
+            Tool::builder("read", "read file", schema.clone(), read_handler).build(),
+            None,
+        );
+        let write_handler: SharedToolHandler =
+            Arc::new(|_input, _ctx| Box::pin(async move { Ok(serde_json::json!({ "ok": true })) }));
+        tm.register(
+            Tool::builder("write", "write file", schema, write_handler).build(),
             None,
         );
 
+        // 每轮一个 read 调用、参数各不相同（避开死循环熔断，专门测工具门）。
         let req_count = Arc::new(AtomicUsize::new(0));
         let rc = req_count.clone();
-
         let server = wiremock::MockServer::start().await;
         server
             .register(
                 Mock::given(method("POST"))
                     .and(path("/chat/completions"))
-                    .respond_with(move |req: &wiremock::Request| {
+                    .respond_with(move |_req: &wiremock::Request| {
                         let cur = rc.fetch_add(1, Ordering::SeqCst);
-                        // 前 21 次全部发 read tool call，第 22 次给出结束正文
-                        if cur < 21 {
-                            ResponseTemplate::new(200).set_body_string(
-                                openai_completion_body(
-                                    "",
-                                    vec![serde_json::json!({
-                                        "id": format!("call_read_{cur}"),
-                                        "type": "function",
-                                        "function": { "name": "read", "arguments": format!("{{\"path\":\"f{cur}.txt\"}}") }
-                                    })],
-                                ),
-                            )
-                        } else {
-                            // 检查在第 21 次请求中是否已经收到了系统提醒
-                            let body_str = String::from_utf8_lossy(&req.body);
-                            let saw_nudge = body_str.contains("系统提醒") && body_str.contains("连续执行了 20 次只读查询");
-                            assert!(saw_nudge, "请求中必须包含系统防沉迷催促注入");
-                            ResponseTemplate::new(200).set_body_string(
-                                openai_completion_body("I will edit now and done.", vec![]),
-                            )
-                        }
+                        ResponseTemplate::new(200).set_body_string(openai_completion_body(
+                            "",
+                            vec![serde_json::json!({
+                                "id": format!("call_read_{cur}"),
+                                "type": "function",
+                                "function": { "name": "read", "arguments": format!("{{\"path\":\"f{cur}.txt\"}}") }
+                            })],
+                        ))
                     }),
             )
             .await;
@@ -10827,12 +11272,50 @@ mod tests {
             GenerateParams::default(),
         )
         .unwrap();
-        let mut runner = AgentRunner::new_with_tools(agent, tm);
-        let res = runner
-            .run_turn(&[Message::user("do work")], None)
-            .await
-            .unwrap();
-        assert!(res.contains("I will edit now and done."));
+        let mut runner =
+            AgentRunner::new_with_tools(agent, tm).with_required_tools(vec!["write".into()]);
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            runner.run_turn(&[Message::user("细化 ch08")], None),
+        )
+        .await
+        .expect("应先由工具门中止，而不是无限读下去")
+        .expect_err("必需工具始终没调，必须报错收尾");
+
+        match &err {
+            AgentError::RequiredToolNotCalled {
+                tools,
+                calls_started,
+                skips,
+                partial,
+            } => {
+                assert_eq!(tools, &vec!["write".to_string()], "要点名没调的工具");
+                assert_eq!(
+                    *calls_started, REQUIRED_TOOL_GATE_AFTER_CALLS,
+                    "已启动数应停在刹车点上（被拦的批次不计）"
+                );
+                assert_eq!(*skips, MAX_REQUIRED_TOOL_GATE_SKIPS, "跳过两次后放弃");
+                assert!(partial.is_empty(), "本次没有可采纳的正文: {partial:?}");
+            }
+            other => panic!("期望 RequiredToolNotCalled，实际 {other:?}"),
+        }
+        // 关键断言：被拦下的 3 批（2 次 Skip + 1 次 Abort）**一次都没执行**。
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            REQUIRED_TOOL_GATE_AFTER_CALLS,
+            "偏离目标的批次必须整批不执行（合成结果，不落盘不产生副作用）"
+        );
+        // 模型侧看到的是 30 轮正常 + 3 轮被拦。
+        assert_eq!(
+            req_count.load(Ordering::SeqCst),
+            REQUIRED_TOOL_GATE_AFTER_CALLS + MAX_REQUIRED_TOOL_GATE_SKIPS + 1,
+            "30 轮执行 + 2 轮被跳过 + 1 轮放弃"
+        );
+        // Display 不能内联正文，但要能读出缺什么、调了多少次。
+        let msg = err.to_string();
+        assert!(msg.contains("required tool not called"), "msg = {msg}");
+        assert!(msg.contains("write"), "msg 要点名缺的工具: {msg}");
     }
 
     /// 反向防线：参数**每次都变**的连续调用不是死循环，不得误杀。
@@ -13684,6 +14167,298 @@ tools = ["read", "write"]
                 "OR 组应列出全部候选（含 {name}）: {second}"
             );
         }
+    }
+
+    // ─── 循环内必需工具门 ─────────────────────────────────────────────
+    //
+    // 事故背景：`require_tools = ["write"]` 的步骤，模型 600s 内调了 78 次
+    // read/search/code_graph、0 次 write，然后整步超时。`require_tools`
+    // 当时只在 turn 结束后判（workflow `check_tool_usage`），循环里没有任何
+    // 东西拦得住，而只读软提醒发一次就被无视。这组测试钉住「循环内」的判据
+    // 本身（纯函数，不需要 mock server）。
+
+    fn gate_names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn required_tool_gate_allows_without_requirement() {
+        // 没声明必需工具 → 永远不干预，哪怕读了 1000 次。
+        assert_eq!(
+            required_tool_gate(&[], &[], &gate_names(&["read"]), 1000, 0),
+            RequiredToolGate::Allow
+        );
+        // OR 组也没声明时同理。
+        assert_eq!(
+            required_tool_gate_any(&[], &[], &gate_names(&["read"]), 1000, 0),
+            RequiredToolGate::Allow
+        );
+    }
+
+    #[test]
+    fn required_tool_gate_allows_before_brake_point() {
+        // 刹车点之前先让模型自己走：拆分类步骤本来就要先读一批。
+        for started in [0usize, 1, REQUIRED_TOOL_GATE_AFTER_CALLS - 1] {
+            assert_eq!(
+                required_tool_gate(
+                    &gate_names(&["write"]),
+                    &[],
+                    &gate_names(&["read"]),
+                    started,
+                    0
+                ),
+                RequiredToolGate::Allow,
+                "started={started} 时还不该拦"
+            );
+        }
+    }
+
+    #[test]
+    fn required_tool_gate_skips_then_aborts_after_max_skips() {
+        let required = gate_names(&["write"]);
+        let batch = gate_names(&["read"]);
+        let started = REQUIRED_TOOL_GATE_AFTER_CALLS;
+        // 到点：第一次 Skip（带上缺的工具名）。
+        assert_eq!(
+            required_tool_gate(&required, &[], &batch, started, 0),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["write"])
+            }
+        );
+        // 第二次仍是 Skip（两次自我纠正的机会）。
+        assert_eq!(
+            required_tool_gate(&required, &[], &batch, started, 1),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["write"])
+            }
+        );
+        // 第三次放弃：Abort 同样点名缺什么，供 workflow 的失败文案直接用。
+        assert_eq!(
+            required_tool_gate(
+                &required,
+                &[],
+                &batch,
+                started,
+                MAX_REQUIRED_TOOL_GATE_SKIPS
+            ),
+            RequiredToolGate::Abort {
+                missing: gate_names(&["write"])
+            }
+        );
+    }
+
+    #[test]
+    fn required_tool_gate_allows_when_batch_carries_required_tool() {
+        // 本批就调了必需工具 → 放行（哪怕已经到点、哪怕之前跳过几批）。
+        assert_eq!(
+            required_tool_gate(
+                &gate_names(&["write"]),
+                &[],
+                &gate_names(&["read", "write"]),
+                999,
+                5
+            ),
+            RequiredToolGate::Allow
+        );
+    }
+
+    #[test]
+    fn required_tool_gate_allows_when_already_called() {
+        // 前面已经调过 → 已满足，不再干预。
+        assert_eq!(
+            required_tool_gate(
+                &gate_names(&["write"]),
+                &gate_names(&["write"]),
+                &gate_names(&["read"]),
+                999,
+                0
+            ),
+            RequiredToolGate::Allow
+        );
+        // AND 组只调了一半 → 仍要拦，且只点名缺的那个。
+        assert_eq!(
+            required_tool_gate(
+                &gate_names(&["write", "plan"]),
+                &gate_names(&["plan"]),
+                &gate_names(&["read"]),
+                999,
+                0
+            ),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["write"])
+            }
+        );
+    }
+
+    #[test]
+    fn required_tool_gate_edit_satisfies_write() {
+        // 落盘判据与 `missing_required_tools` / workflow 一致：edit 也算。
+        assert_eq!(
+            required_tool_gate(&gate_names(&["write"]), &[], &gate_names(&["edit"]), 999, 0),
+            RequiredToolGate::Allow
+        );
+        assert_eq!(
+            required_tool_gate(
+                &gate_names(&["write"]),
+                &gate_names(&["edit"]),
+                &gate_names(&["read"]),
+                999,
+                0
+            ),
+            RequiredToolGate::Allow
+        );
+        // 反过来不成立：要求 edit 时 write 不算（语义不同）。
+        assert_eq!(
+            required_tool_gate(&gate_names(&["edit"]), &[], &gate_names(&["write"]), 999, 0),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["edit"])
+            }
+        );
+    }
+
+    #[test]
+    fn required_tool_gate_any_of_is_satisfied_by_any_candidate() {
+        let any = gate_names(&["read", "code_graph", "search"]);
+        // 任一候选出现在本批 → 满足（OR 语义）。
+        for cand in ["read", "code_graph", "search"] {
+            assert_eq!(
+                required_tool_gate_any(&any, &[], &gate_names(&[cand]), 999, 0),
+                RequiredToolGate::Allow,
+                "本批调了 {cand} 就该放行"
+            );
+        }
+        // 之前调过任一候选 → 满足。
+        assert_eq!(
+            required_tool_gate_any(
+                &any,
+                &gate_names(&["search"]),
+                &gate_names(&["write"]),
+                999,
+                0
+            ),
+            RequiredToolGate::Allow
+        );
+        // 一个都没调 → 到点就拦，并把**全部**候选列出来（让模型自己挑）。
+        assert_eq!(
+            required_tool_gate_any(&any, &[], &gate_names(&["bash"]), 999, 0),
+            RequiredToolGate::Skip {
+                missing: any.clone()
+            }
+        );
+        // 刹车点之前同样不拦。
+        assert_eq!(
+            required_tool_gate_any(&any, &[], &gate_names(&["bash"]), 3, 0),
+            RequiredToolGate::Allow
+        );
+    }
+
+    #[test]
+    fn combined_gate_takes_the_harsher_decision() {
+        // AND 组 Skip + OR 组 Skip → Skip，缺的工具合并（两组都要点名）。
+        assert_eq!(
+            combine_required_tool_gates(
+                RequiredToolGate::Skip {
+                    missing: gate_names(&["write"])
+                },
+                RequiredToolGate::Skip {
+                    missing: gate_names(&["read", "search"])
+                },
+            ),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["write", "read", "search"])
+            }
+        );
+        // 一边 Abort 就整体 Abort（已决定放弃，不该降级成「再给一次机会」）。
+        assert_eq!(
+            combine_required_tool_gates(
+                RequiredToolGate::Abort {
+                    missing: gate_names(&["write"])
+                },
+                RequiredToolGate::Skip {
+                    missing: gate_names(&["read"])
+                },
+            ),
+            RequiredToolGate::Abort {
+                missing: gate_names(&["write", "read"])
+            }
+        );
+        // 任一边放行 → 该组已满足，另一边说了算。
+        assert_eq!(
+            combine_required_tool_gates(
+                RequiredToolGate::Allow,
+                RequiredToolGate::Skip {
+                    missing: gate_names(&["read"])
+                },
+            ),
+            RequiredToolGate::Skip {
+                missing: gate_names(&["read"])
+            }
+        );
+        assert_eq!(
+            combine_required_tool_gates(RequiredToolGate::Allow, RequiredToolGate::Allow),
+            RequiredToolGate::Allow
+        );
+    }
+
+    #[test]
+    fn required_tools_satisfied_separates_skip_causes() {
+        // 已满足（本批或先前调过）→ 跳过计数该清零。
+        assert!(required_tools_satisfied(
+            &gate_names(&["write"]),
+            &gate_names(&["read"]),
+            &[],
+            &gate_names(&["read", "write"])
+        ));
+        assert!(required_tools_satisfied(
+            &gate_names(&["write"]),
+            &gate_names(&["read"]),
+            &gate_names(&["write"]),
+            &gate_names(&["read"])
+        ));
+        // 没满足 → 保留计数（这才是"还没到点就放行"的那条路）。
+        assert!(!required_tools_satisfied(
+            &gate_names(&["write"]),
+            &gate_names(&["read"]),
+            &[],
+            &gate_names(&["read"])
+        ));
+        // OR 组一个都没调 → 未满足。
+        assert!(!required_tools_satisfied(
+            &[],
+            &gate_names(&["read", "search"]),
+            &gate_names(&["write"]),
+            &gate_names(&["write"])
+        ));
+        // 两组都没声明 → 返回 false（调用方据此不重置）。
+        assert!(!required_tools_satisfied(
+            &[],
+            &[],
+            &[],
+            &gate_names(&["read"])
+        ));
+    }
+
+    #[test]
+    fn required_tool_gate_text_names_groups_separately() {
+        // AND 组：点名工具，措辞与 run_turn 的合成结果一致。
+        assert_eq!(
+            required_tool_gate_text(&gate_names(&["write"]), &[]),
+            "Not executed: call the `write` tool to resolve the pending action before using other tools."
+        );
+        // OR 组：「挑一个」，不能拼成一个"都要调"的列表。
+        let or_text = required_tool_gate_text(&[], &gate_names(&["read", "search"]));
+        assert!(
+            or_text.contains("one of the `read` / `search` tools"),
+            "{or_text}"
+        );
+        assert!(
+            !or_text.contains("call the `read`"),
+            "OR 组不能写成 AND（会被读成三个都要调）: {or_text}"
+        );
+        // 两组都有：分开说，且都点名。
+        let both = required_tool_gate_text(&gate_names(&["write"]), &gate_names(&["read"]));
+        assert!(both.contains("`write` tool"), "{both}");
+        assert!(both.contains("one of the `read` tools"), "{both}");
     }
 
     /// `write` 由 `edit` 满足；拿不到的工具不催；未声明时永不催。
