@@ -1413,11 +1413,9 @@ impl LoopDetector {
             if self.streak == LOOP_NUDGE_AT {
                 self.nudge = Some(format!(
                     "⚠️ 系统提示：你已连续 {} 次用逐字节相同的参数调用 `{}`，结果不会变。\
-                     再重复 {} 次本次任务就会被中止。换一种做法：重新 read 当前内容再改、换别的工具、\
+                     **再原样重复一次，本次任务就会被中止。**换一种做法：重新 read 当前内容再改、换别的工具、\
                      缩小/拆开参数，或者直接把进展和卡点讲清楚。",
-                    self.streak,
-                    tool_name,
-                    LOOP_STREAK_THRESHOLD - self.streak
+                    self.streak, tool_name
                 ));
             } else if self.streak == LOOP_NUDGE_AT + 1 && self.nudged {
                 // 提醒**刚送达**就原样重发：粘性熔断，不再等到 5 次。
@@ -10724,8 +10722,11 @@ mod tests {
         ));
         let n = d.take_nudge().expect("第 3 次相同调用应留下提醒");
         assert!(
-            n.contains("连续 3 次") && n.contains("`edit`") && n.contains("再重复 2 次"),
-            "{n}"
+            n.contains("连续 3 次")
+                && n.contains("`edit`")
+                && n.contains("再原样重复一次")
+                && n.contains("中止"),
+            "提醒必须与实际行为一致（再重复一次就中止）: {n}"
         );
         assert!(d.take_nudge().is_none(), "提醒是一次性的");
         // 提醒**已送达** → 第 4 次相同调用（LOOP_NUDGE_AT + 1）直接熔断：
