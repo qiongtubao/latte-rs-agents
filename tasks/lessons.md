@@ -267,3 +267,43 @@
   token 估算系统性偏低（工具 schema / 历史重传 / thinking 都不在里面），
   用它当硬闸门必然既漏又误杀。另：修一处事故时，先扫**同类工作流**有没有
   同一个洞——这次 `learn_loop` 修了、`learn` 没修，于是同一类事故原样重演。
+
+## 搜索扫爆与「只读空转」：两处结构性修复（实测 2026-11-18）
+
+- **现象**：`chat` 里让 manager 走 `learn_plan` 拆「读懂 `src/outline.rs`」，tutor 第一步就
+  执行 `search {"path": ".", "pattern": "outline"}`，**60s 硬超时**；第二次换模型重跑，
+  search 不超时了，但 tutor 78 次工具调用（read 50 / search 26 / code_graph 2）**零次
+  write**，跑满 600s 被 kill。
+- **搜索的根因不在 pattern，在 root**：模型传的是 `repo/.`（带尾随 `.`），而 gitignore
+  条目 `/target` 是**词法前缀**匹配——`repo/target` 命中、`repo/./target` 不命中；叠加
+  「只在文件级过滤、不剪目录」，等于先走进 `target/`（42 万个文件）再逐个 stat。
+  实测对照：正确 root 577 文件 / 15ms，带 `.` 时 428918 文件（415507 来自 target/）。
+  **修复**（`latte-rs-agent-tools` `dd3be9c`）：root 先做 `.` 段归一化，gitignore /
+  隐藏目录 / `.git` / `.latte` 的剪枝提前到 `filter_entry`（语义不变：被忽略目录里的
+  文件本来就会被逐文件过滤排除）。复验 `search {path:"."}` → 577 文件 / 349ms。
+- **只读空转的根因是「校验太晚」**：`require_tools` 只在 turn 结束后
+  （workflow `check_tool_usage`）判，拦不住已经烧掉的 600s；而唯一的过程性提醒
+  （read-only streak ≥ 20，**只发一次**）被模型无视。
+- **对标三个参考实现**：oh-my-pi / opencode / deepseek-harness **都没有**「只读 vs 写入」
+  的阶梯催促；它们做的是①在**循环内**强制必需工具（oh-my-pi `SoftToolRequirement`：
+  先提醒、再违例就把整批换成合成结果、3 次强制后报错），②同调用重复提醒**粘性化**
+  （提醒后再原样重发即中止；opencode 更进一步把它做成 `doom_loop` 权限事件）。
+- **修复**（`4abdb11`）：
+  1. **循环内必需工具门**：`required_tool_gate` / `required_tool_gate_any` 纯函数判据，
+     走满 30 次调用仍未满足 → 本批**不执行**、回填 `Not executed: …` 合成结果并提示，
+     连跳 2 批 → `AgentError::RequiredToolNotCalled`（带 partial，workflow 端按截断降级）。
+     实测用例 `required_tool_gate_blocks_detour_batches`：33 轮互不相同的 read，
+     **执行次数正好 30**（被拦批次零副作用），报错带 `calls_started=30, skips=2`。
+  2. **连击提醒粘性熔断**：提醒送达后再原样重发**下一次就中止**（原先要等到 5 次）；
+     提醒文案同步改成「再原样重复一次就中止」，不能让文案和行为打架。
+  3. **删除只读阶梯催促**（三处实现均无此机制，且实测单次提醒无效），改由
+     `max_tool_calls` 步骤预算兜住：`learn_book_pages` breakdown 40 / detail 60，
+     `task_refine.refine` 40，`outline_split.breakdown` 40。
+- **教训**：
+  - **护栏要放在能止损的那一层**。事后校验只能判定失败，不能阻止继续烧钱；
+    必需工具这类「过程约束」必须在工具循环内部生效。
+  - **归一化是便宜的前置条件**。一处 `Path::components()` 遍历（15ms）抵得上一整轮
+    60s 超时；凡是拿路径去和 gitignore / glob 做词法比较的地方，都必须先归一化。
+  - **剪枝与过滤不是一回事**。逐文件过滤的正确性等价于目录剪枝，但代价差三个数量级。
+  - **删掉无效提醒，不要升级它**。三个成熟实现的共识是「机械判定 + 升级为强制/中止」，
+    而不是「同一句话多说几次」。
