@@ -39,7 +39,7 @@ require_learn_skeleton = ".latte/learn-plan/chapters.json"
 max_retries = 2
 # 硬预算：本步只读骨架、不逐文件深读（见 task），取证很少超过 10~20 次。
 # 实测失控形态是 78 次只读、0 次 write 跑满 600s，故给一条廉价精确的刹车。
-max_tool_calls = 40
+max_tool_calls = 80
 tools = ["read", "code_graph", "search", "write"]
 require_tools = ["write"]
 require_tools_any = ["read", "code_graph", "search"]
@@ -102,6 +102,12 @@ chapters.json 的硬规则（外层 assemble 机械校验，违反整单打回�
 - 章名/brief **不要点名内部函数、宏、符号**；paths 只写核实过存在的文件/目录
   （尤其别猜 test/ 下的文件名，实测反复幻觉）。
 - 章数由学习目标覆盖面决定（一章一次 learn_loop 的体量），上限 60 章。
+- **一次写完，不要试探。** `chapters.json` 用**一次** `write` 写完（3–10 章通常 2–8KB，
+  远低于工具输出上限）。**禁止**为了试探工具行为去写临时文件（`_probe*`、`tmp*`、`x`）：
+  实测有会话为搞清 append 语义写了 6 个探针文件、白烧十余次工具调用，最后撞上工具
+  调用预算被中止。`.latte/learn-plan/` 下只允许出现 `chapters.json`。
+- 若一次确实写不下（> 20 章）：先 `write` 写前半（含 `{"chapters":[` 与前 N 章），
+  再用 `edit` 在末尾插入剩余章节并补上 `]}`；**不要**用第二次 `write` 覆盖。
 
 如果本次是返工（任务末尾带【上轮审查反馈】）：反馈里的事实性结论**先回源码核实
 再改**（审查也会错，实测出现过把「可选参数」改成「必须参数」的矫枉过正）；核实属实
@@ -121,7 +127,7 @@ depends_on = ["breakdown"]
 max_retries = 2
 # 硬预算：每章子会话只做「read/search 轻量核实 + write 落盘」，
 # 60 次已远超正常体量（实测失控形态：一个子会话 78 次只读、0 次 write）。
-max_tool_calls = 60
+max_tool_calls = 100
 tools = ["read", "search", "write"]
 require_tools = ["write"]
 # 扇出 N 个有界单章子会话，下游还有 assemble 机械校验 + verdict 抽查 +

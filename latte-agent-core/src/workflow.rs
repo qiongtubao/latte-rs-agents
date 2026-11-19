@@ -17631,13 +17631,20 @@ prompt = "x"
     /// 剩下的廉价精确刹车就是这个预算——所以「先大量读、最后才写」的步骤
     /// 一个都不能漏。
     ///
+    /// 数值是实测校准的，不是拍的：首次给 40 时，breakdown 的正常一轮就用了
+    /// 37 次（15 read + 12 search + 3 code_graph + 7 write，最后几次是为修复
+    /// 截断的 write 重试），**恰好在第 40 次被预算卡住、降级采纳 79 字符**，
+    /// 后面 output_contract 与骨架校验连环打回，整轮白跑。预算要卡的是
+    /// 「只读不写」的失控（这类形态在 30 次左右就该由必需工具门拦下），
+    /// 不是正常工作流，所以取实测值的 2 倍左右留出重试余量。
+    ///
     /// 顺带确认它们能过 `validate`：这几个字段只对有 speaker 的模型步骤
     /// 生效（没有 speaker = 引擎机械步，给了也没人执行）。
     #[test]
     fn heavy_reading_steps_declare_tool_budgets() {
         const EXPECTED: &[(&str, &str, usize)] = &[
-            ("learn_book_pages", "breakdown", 40),
-            ("learn_book_pages", "detail", 60),
+            ("learn_book_pages", "breakdown", 80),
+            ("learn_book_pages", "detail", 100),
             ("task_refine", "refine", 40),
             ("outline_split", "breakdown", 40),
         ];
