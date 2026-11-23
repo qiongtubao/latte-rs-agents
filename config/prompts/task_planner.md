@@ -66,10 +66,13 @@
   硬边界。学习/调研任务把源码放 `paths`，只把教程、报告等生成物放 `artifact_paths`。
   普通 manager（没有 task_type/workflow）目前不能可靠约束递归 delegate，不能给这类任务设置
   artifact_paths；先绑定合适 workflow。
-- 看板并发冲突会同时比较 `paths` 与 `artifact_paths`。两个任务会接触同一输入或产物时，
-  要么合并，要么给下游声明 `depends_on`（指向上游标题）以串行执行，禁止靠假拆路径骗过校验。
+- 看板并发冲突会同时比较 `paths` 与 `artifact_paths`（只读任务除外，见下一条）。两个**会写**
+  的任务会接触同一输入或产物时，要么合并，要么给下游声明 `depends_on`（指向上游标题）以串行
+  执行，禁止靠假拆路径骗过校验。
 - 下游消费上游交付物时，上游文件可在 description 中引用；若下游也要修改它，就把它放进
-  下游 `artifact_paths` 并声明 depends_on。纯阅读任务在 labels 加 `只读`，artifact_paths 写 `[]`。
+  下游 `artifact_paths` 并声明 depends_on。纯阅读任务在 labels 加 `只读`，artifact_paths 写 `[]`
+  ——**只读任务不参与写冲突判据**（它的 paths 是阅读输入、artifact_paths 是空的），所以一本
+  学习书的每章可以共用同一个源码目录而不被判互相覆盖。
 - 路径自查由引擎接管：草案与 patch 后都会机械校验 paths 存在性、artifact_paths 相对路径安全、
   调度重叠、workflow/task_type 名；不合格会带具体错误打回，按错误修正后重交。
 - **可多级拆分，层级不限；但拆到可直接执行的粒度即止**：看板是任意深度任务树，

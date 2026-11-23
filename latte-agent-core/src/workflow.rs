@@ -177,7 +177,8 @@ fn check_required_tools(required: &[String], summary: &str) -> Result<(), String
     if required.is_empty() {
         return Ok(());
     }
-    let called = called_tool_names(summary);
+    // 只认成功调用：失败的 `write` 没落盘、失败的 `ask` 没问到人。
+    let called = succeeded_tool_names(summary);
     // `write` 的语义是「真把产出落盘」：用 `edit` 改已有文件同样落了盘。返工时
     // 只改被点名的字段就该用 edit——否则只能为补几个字段整份重写（实测 LAT-110
     // cli-23288：为补 3 个 `wins_when` 把 19KB 的 plan.json 整份重写，第一次撞
@@ -185,7 +186,10 @@ fn check_required_tools(required: &[String], summary: &str) -> Result<(), String
     let missing: Vec<&str> = required
         .iter()
         .map(|r| short_tool_name(r))
-        .filter(|r| !(called.contains(r) || (*r == "write" && called.contains(&"edit"))))
+        .filter(|r| {
+            !(called.iter().any(|c| c == r)
+                || (*r == "write" && called.iter().any(|c| c == "edit")))
+        })
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -208,7 +212,13 @@ fn short_tool_name(n: &str) -> &str {
     n.rsplit_once('.').map(|(_, s)| s).unwrap_or(n)
 }
 
-/// 从 runner 的工具摘要里取出实际调用过的工具短名（按调用顺序，含重复）。
+/// 从 runner 的工具摘要里取出**实际发生过**的工具短名（按调用顺序，含重复）。
+///
+/// **含失败调用**（行内带 `→ ✗`）：一次失败的 `read` 也真的执行了、也真的
+/// 花了预算，所以「次数上限」（[`check_tool_call_limits`]）必须把它算进去。
+/// 但「要求真的办成事」的两条判据（[`check_required_tools`] /
+/// [`check_required_tools_any`]）必须用 [`succeeded_tool_names`]——失败的
+/// 调用没有产生证据。
 ///
 /// 跳过占位行：一次工具都没调时 runner 给的是 `"[本 step 工具调用数: 0]"`，
 /// 按空白切会得到 `[本` 这种伪工具名，混进"实际调用了"清单里既误导人、
@@ -232,6 +242,23 @@ fn called_tool_names(summary: &str) -> Vec<&str> {
         .collect()
 }
 
+/// 只取**成功**的调用（排除 `→ ✗` 行）。
+///
+/// 失败行是引擎为区分「尝试过但失败」与「压根没试」而记的
+/// （见 `agent.rs` 的 `last_turn_tool_summaries`），但它不能证明取证成立：
+/// 一次 `code_graph` 因路径不存在而失败，等于没查到任何东西。
+fn succeeded_tool_names(summary: &str) -> Vec<String> {
+    let ok_summary: String = summary
+        .lines()
+        .filter(|l| !l.contains("→ ✗"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    called_tool_names(&ok_summary)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 /// 校验本步是否**至少调用过一个** `any_of` 里的工具（OR 语义）。
 ///
 /// 与 [`check_required_tools`]（AND）的分工：有些"动作"有多条合法实现
@@ -247,22 +274,49 @@ fn check_required_tools_any(any_of: &[String], summary: &str) -> Result<(), Stri
     if any_of.is_empty() {
         return Ok(());
     }
-    let called = called_tool_names(summary);
     let wanted: Vec<&str> = any_of.iter().map(|r| short_tool_name(r)).collect();
-    if wanted.iter().any(|w| called.contains(w)) {
-        Ok(())
-    } else {
-        Err(format!(
-            "本步要求至少调用 [{}] 之中的一个工具，但本轮一个都没调用\
-             （实际调用了 [{}]）。产出必须建立在真实取证之上，不能凭记忆写。",
-            wanted.join(" / "),
-            if called.is_empty() {
-                "无".to_string()
-            } else {
-                called.join(", ")
-            },
-        ))
+    // 只认**成功**调用：`called_tool_names` 里现在也含失败行（引擎为区分
+    // 「尝试过但失败」而记录），失败行带 `→ ✗`，必须排除掉，否则一次失败
+    // 的 `code_graph` 就能让 OR 判据通过——取证支撑并不存在。
+    let called = succeeded_tool_names(summary);
+    if wanted.iter().any(|w| called.iter().any(|c| c == w)) {
+        return Ok(());
     }
+    // 尝试过但全部失败：与「压根没尝试」区分开。
+    //
+    // 只报「一个都没调用」是假话——它调了，只是路径/参数错了。这条错误会
+    // 让引擎整步重做（产出被丢弃），而重做拿到的仍是同一批猜测，于是反复
+    // 失败。实测 2026-11-22 linux 学习书：reviewer 交了一份含 8 处
+    // `file:line` 的完整裁决，`code_graph` 全因路径不存在而失败，摘要里
+    // 没有成功行 → 被判「没取证」→ 整步重做 3 次，每次 10-15 分钟。
+    //
+    // 现在的批注点名「哪些调用失败了」，并给出可执行的下一步（换真实路径
+    // 或改用 read/search），而不是笼统要求「必须取证」。
+    let failed: Vec<&str> = summary
+        .lines()
+        .filter(|l| l.contains("→ ✗"))
+        .filter_map(|s| s.split_whitespace().next())
+        .map(short_tool_name)
+        .collect();
+    if !failed.is_empty() {
+        return Err(format!(
+            "本步要求至少调用 [{}] 之中的一个工具。你确实调用了 [{}]，但全部失败\
+             （见摘要里的 ✗ 行）——产出因此没有真实取证支撑。请改用仓库里\n             **真实存在**的路径重试（错误里给了「相近的真实路径」），或换 \
+             `search` 按符号名定位，不要凭记忆猜路径。",
+            wanted.join(" / "),
+            failed.join(", ")
+        ));
+    }
+    Err(format!(
+        "本步要求至少调用 [{}] 之中的一个工具，但本轮一个都没调用\
+         （实际调用了 [{}]）。产出必须建立在真实取证之上，不能凭记忆写。",
+        wanted.join(" / "),
+        if called.is_empty() {
+            "无".to_string()
+        } else {
+            called.join(", ")
+        },
+    ))
 }
 
 /// 校验单个工具在本步的调用次数上限（`工具短名 → 最大次数`）。
@@ -279,6 +333,7 @@ fn check_tool_call_limits(
     if limits.is_empty() {
         return Ok(());
     }
+    // **含失败调用**：失败的调用同样消耗了预算，不该被排除在计数外。
     let called = called_tool_names(summary);
     for (name, max) in limits {
         let short = short_tool_name(name);
@@ -2900,6 +2955,14 @@ pub struct CollectOnFail {
     /// 最多定向返工几次（缺省 2、硬上限 5）；耗尽仍失败则判死。
     #[serde(default)]
     pub max_attempts: Option<usize>,
+    /// 错误**点不出章号**时的去处（可选）：跳回这一步、带上错误全文，
+    /// **不删任何产物**。典型是跨任务判据（写冲突、共享锚点、书结构），
+    /// 病灶在骨架或模板而不是某一章条目上——按单章返工只会空转。
+    ///
+    /// 不设时的旧行为是直接 `step_failed`：2026-11-22 linux 学习书即
+    /// 86 处写冲突 → 无章号 → 整单判死，`max_attempts` 一次没用上。
+    #[serde(default)]
+    pub global_rework: Option<String>,
 }
 
 /// 从装配校验错误里取病灶章：每条 `- ` 开头的错误行取第一个 `chNN`
@@ -4138,6 +4201,19 @@ impl WorkflowDef {
                             step.id
                         ));
                     }
+                    if let Some(step_id) = &of.global_rework {
+                        let me = self.steps.iter().position(|s| s.id == step.id);
+                        let target = self.steps.iter().position(|s| s.id == step_id.as_str());
+                        match (me, target) {
+                            (Some(m), Some(t)) if t < m => {}
+                            _ => {
+                                return Err(format!(
+                                    "step '{}': collect_plan_tasks.on_fail.global_rework '{step_id}' 必须是本步之前的某个 step",
+                                    step.id
+                                ))
+                            }
+                        }
+                    }
                 }
             }
             // 结构化裁决 / 机械终审门 / 收敛度量 / 历史反馈：都只在串行
@@ -4907,6 +4983,13 @@ fn run_nested_workflow(
     // 发起 step 的 id：续跑时按 `父workflow名:step_id:嵌套workflow名`
     // 找上次没跑完的那次嵌套 run 的 checkpoint，跳过它已完成的 step。
     step_id: String,
+    // 是否允许从嵌套 checkpoint 续跑。**返工时必须 false**：续跑会跳过
+    // 子流程的骨架步、扇出又因 `skip_fresh` 全命中而不做事，于是子流程
+    // 「成功」返回同一份旧产物——父级再判一次，得到同一个驳回，直到
+    // `max_iterations` 耗尽（2026-11-22 linux 学习书实测：gate 判
+    // rework=pages 后，pages 下的 learn_book_pages 连跑两轮
+    // 「跳过已完成的 1 步 / 扇出 0 个任务」，verdict 审的还是同一份清单）。
+    allow_resume: bool,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -4967,12 +5050,18 @@ fn run_nested_workflow(
             "{}:{step_id}:{name}",
             crate::step_journal::workflow_name_of(&parent_wf_id)
         );
-        let resume_nested = crate::step_journal::take_carried_nested(&ctx.cwd, &root_wf_id, &link)
-            .and_then(|old_id| match load_checkpoint(&ctx.cwd, &old_id) {
-                Ok(state) if state.workflow_name == name => Some(old_id),
-                _ => None,
-            })
-            .or_else(|| find_incomplete_nested_run(&ctx.cwd, ctx.session_id.as_deref(), &name));
+        let resume_nested = if allow_resume {
+            crate::step_journal::take_carried_nested(&ctx.cwd, &root_wf_id, &link)
+                .and_then(|old_id| match load_checkpoint(&ctx.cwd, &old_id) {
+                    Ok(state) if state.workflow_name == name => Some(old_id),
+                    _ => None,
+                })
+                .or_else(|| find_incomplete_nested_run(&ctx.cwd, ctx.session_id.as_deref(), &name))
+        } else {
+            // 返工轮：不吃旧 checkpoint，也不留 carry 链接，让子流程从头跑。
+            let _ = crate::step_journal::take_carried_nested(&ctx.cwd, &root_wf_id, &link);
+            None
+        };
         if let Some(rid) = &resume_nested {
             let _ = ctx.event_tx.send(ChatEvent::Status {
                 message: format!("嵌套 workflow '{name}' 从断点续跑（checkpoint {rid}）"),
@@ -5148,6 +5237,27 @@ enum CheckpointRecord {
         output: String,
         finished_at: u64,
     },
+    /// 一个 `loop_until` step 的返工迭代计数与收敛度量，**每轮判定后落盘**。
+    ///
+    /// 为什么必须持久化：`loop_iters` / `loop_metrics` 是 run 内内存状态，
+    /// `/wf-resume` 起的是新 run，计数从 0 重来——`max_iterations` 等于
+    /// 每次续跑都重新发满配额，`max_iterations_on_progress` 的「BLOCKING
+    /// 严格下降才延长」也永远拿不到上一轮读数。实测 2026-11-22 linux
+    /// 学习书：第 1 轮返工后续跑，计数器归零，收敛判据失效。
+    ///
+    /// 后写覆盖（同一 step 只认最后一条）。旧 checkpoint 无此记录，读不到
+    /// 就按 0 起算——与旧行为一致。
+    LoopIter {
+        wf_id: String,
+        /// 用 step id 而不是下标：checkpoint 是跨版本可读的，下标会在
+        /// 骨架调整后错位。
+        step_id: String,
+        /// 已发生的返工轮数（含已放行的最后一轮）。
+        iters: u64,
+        /// 最近一轮的收敛度量读数（`loop_progress_marker` 后的整数）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metric: Option<i64>,
+    },
     /// Terminal workflow failure. This is diagnostic state only: it never
     /// counts as a completed step. Resume reads it as targeted repair context,
     /// but does not copy the old terminal record into the new run.
@@ -5266,6 +5376,9 @@ pub struct CheckpointState {
     /// Persisted task-level write boundary. Old checkpoints are unscoped.
     artifact_paths: Option<Vec<String>>,
     started_at: u64,
+    /// `loop_until` step 的返工进度：step id → (已返工轮数, 最近收敛度量)。
+    /// 续跑时按 step id 恢复，避免每次 resume 都重新发满 `max_iterations`。
+    loop_iters: std::collections::HashMap<String, (u64, Option<i64>)>,
 }
 
 impl CheckpointState {
@@ -5298,6 +5411,8 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
     let mut fan_out: std::collections::HashMap<String, Vec<(String, String)>> =
         std::collections::HashMap::new();
     let mut last_failure: Option<CheckpointFailure> = None;
+    let mut loop_iters: std::collections::HashMap<String, (u64, Option<i64>)> =
+        std::collections::HashMap::new();
     for (lineno, line) in raw.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -5353,6 +5468,15 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
                     tokens_used,
                 });
             }
+            CheckpointRecord::LoopIter {
+                step_id,
+                iters,
+                metric,
+                ..
+            } => {
+                // 后写覆盖：只认最后一轮的进度。
+                loop_iters.insert(step_id, (iters, metric));
+            }
             CheckpointRecord::FanOutItem {
                 step_id,
                 item_id,
@@ -5380,6 +5504,7 @@ pub fn load_checkpoint(cwd: &Path, wf_id: &str) -> Result<CheckpointState, Strin
         session_id,
         artifact_paths,
         started_at,
+        loop_iters,
     })
 }
 
@@ -5661,6 +5786,23 @@ impl CheckpointLog {
             },
         );
         self.completed.lock().insert(step_id.to_string());
+    }
+
+    /// 落盘一个 `loop_until` step 的返工进度（迭代轮数 + 收敛度量）。
+    ///
+    /// 每轮判定后调用一次：续跑据此恢复 `loop_iters`/`loop_metrics`，否则
+    /// `max_iterations` 每次 resume 都重新发满、收敛判据也拿不到上一轮读数。
+    fn record_loop_iter(&self, step_id: &str, iters: usize, metric: Option<i64>) {
+        append_checkpoint(
+            &self.cwd,
+            &self.wf_id,
+            &CheckpointRecord::LoopIter {
+                wf_id: self.wf_id.clone(),
+                step_id: step_id.to_string(),
+                iters: iters as u64,
+                metric,
+            },
+        );
     }
 
     /// 已完成的不同 step 数（返工重跑不重复计）。
@@ -13792,10 +13934,40 @@ async fn run_workflow_serial(
     let rework_pending = resume
         .map(|state| learn_rework_invalidated(&wf.name, &state.completed))
         .unwrap_or_default();
+    // 带 `loop_until` 的裁决步（learn_plan 的 gate）**永远不进跳过集**：
+    // 它在判定之前就已写进 checkpoint，续跑时若被当成「已完成」直接越过，
+    // 那份 `VERDICT: REJECT` 就成了最终结论——返工永远不会发生，后面
+    // `pending_feedback` 也没人消费。每轮重跑它只是重新读一次上游裁决
+    // 再判定，零模型调用，代价可忽略。
+    //
+    // 2026-11-22 linux 学习书实测：`/wf-resume` 后 gate 被跳过，骨架一次
+    // 没重写，BLOCKING 从 2 涨到 7 直到轮次耗尽。
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
     if let Some(state) = resume {
+        // **从失败点起，之后的所有步都不算完成**。
+        //
+        // 为什么：checkpoint 是「成功过就记一条」，而续跑会从失败步重跑。
+        // 失败步之后那些步的产出依赖它——它们记在 checkpoint 里，但输入已
+        // 变了，绝不能跳过。
+        //
+        // 实测 2026-11-23：learn_plan 的 audit 步失败后续跑，audit 重新执行
+        // 成功（20 章证据重取），但 `verdict` 仍在 done_steps 里被跳过 →
+        // `[step 4/7] audit → [step 6/7] gate` 中间没有 verdict → gate 拿到
+        // 上一轮的旧裁决，返工等于没发生。
+        // `None` = checkpoint 里没有结构化失败记录（手工裁剪、旧格式、或
+        // 用户主动中断）——这种情形沿用旧语义「已完成的都跳过」，不要凭空
+        // 重跑。只有明确记录了失败步，才从它开始重跑。
+        let resume_idx: Option<usize> = state
+            .last_failure
+            .as_ref()
+            .and_then(|f| f.step_id.as_deref())
+            .and_then(|id| wf.steps.iter().position(|s| s.id == id));
         for (step_id, output_key, output) in &state.completed {
-            if !rework_pending.contains(step_id.as_str()) {
+            let at = wf.steps.iter().position(|s| s.id == *step_id);
+            let looping = at.is_some_and(|i| wf.steps[i].loop_until.is_some());
+            let before_failure =
+                resume_idx.is_none_or(|r| at.is_some_and(|i| i < r));
+            if !rework_pending.contains(step_id.as_str()) && !looping && before_failure {
                 done_steps.insert(step_id.as_str());
             }
             if let Some(key) = output_key {
@@ -13823,13 +13995,47 @@ async fn run_workflow_serial(
         // step 会重新调用 `run_step_speaker`，所以这不是 held runner 的
         // 续作：每次 doc_write / proofread 都是新的 subsession，只重读
         // 当前文件并消费本轮反馈。
-        let mut loop_iters: HashMap<usize, usize> = HashMap::new();
+        // 续跑时按 step id 恢复返工进度：不恢复的话每次 `/wf-resume`
+        // 都把 `max_iterations` 重新发满，`max_iterations_on_progress`
+        // 的「度量严格下降才延长」也拿不到上一轮读数（实测 2026-11-22
+        // linux 学习书：第 1 轮返工后续跑，计数归零、收敛判据失效）。
+        let mut loop_iters: HashMap<usize, usize> = resume
+            .map(|state| {
+                wf.steps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, st)| {
+                        let (iters, _) = state.loop_iters.get(&st.id)?;
+                        usize::try_from(*iters).ok().map(|n| (i, n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         // 收敛度量（loop_progress_marker）的上一轮读数与历史反馈
         // （loop_carry_history），key 同为 loop_until 所在 step 下标。
-        let mut loop_metrics: HashMap<usize, i64> = HashMap::new();
+        let mut loop_metrics: HashMap<usize, i64> = resume
+            .map(|state| {
+                wf.steps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, st)| {
+                        let (_, metric) = state.loop_iters.get(&st.id)?;
+                        metric.map(|m| (i, m))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut feedback_history: HashMap<usize, Vec<String>> = HashMap::new();
         // 机械装配步（collect_plan_tasks.on_fail）已定向返工的次数，key = step 下标。
         let mut collect_fail_iters: HashMap<usize, usize> = HashMap::new();
+        // 每个 step 被**进入**过几次（含跳回重做）。嵌套 workflow step 用它
+        // 区分「首轮」与「返工轮」：`round` 在这里不能用——learn_plan 是
+        // `max_rounds = 1`，gate 驳回走的是 `loop_back_to` 跳回同一轮内，
+        // round 恒为 0，于是返工轮照样去续跑旧 checkpoint、骨架步被跳过、
+        // 扇出全命中 `skip_fresh`，子流程「成功」交回同一份旧产物
+        // （2026-11-22 linux 学习书：gate 判 rework=pages 后连跑两轮
+        // 「跳过已完成的 1 步 / 扇出 0 个任务」，verdict 审的还是同一份清单）。
+        let mut step_entries: HashMap<usize, usize> = HashMap::new();
         let mut pending_feedback: Option<String> = None;
         // 文档步刚写完才算新的一版。resume 跳过已完成的文档步时保持 false，
         // read_confirm 不递增 round，题面不变，旧的「开始答题」可以被回放。
@@ -13842,6 +14048,13 @@ async fn run_workflow_serial(
                     return WfOutcome::step_failed(&step.id, format!("step '{}': {e}", step.id));
                 }
             }
+            // 本次进入是第几次（0 = 首轮）。跳回重做会再次走到这里。
+            let entry = {
+                let n = step_entries.entry(idx).or_insert(0);
+                let cur = *n;
+                *n += 1;
+                cur
+            };
             if wf.name == "learn_loop"
                 && matches!(
                     step.id.as_str(),
@@ -13885,10 +14098,30 @@ async fn run_workflow_serial(
                                     &last_output,
                                     &mut feedback_history,
                                 ));
-                                done_steps.remove(wf.steps[target].id.as_str());
+                                // 落盘返工进度：续跑要按 step id 恢复，否则
+                                // `max_iterations` 每次 resume 都重新发满。
+                                ckpt.record_loop_iter(
+                                    &step.id,
+                                    loop_iters.get(&idx).copied().unwrap_or(0),
+                                    loop_metrics.get(&idx).copied(),
+                                );
+                                // 清从目标到本步的全部 done_steps（同 gate 分支：
+                                // 中间确定性步的产出随上游失效）。
+                                for i in target..idx {
+                                    done_steps.remove(wf.steps[i].id.as_str());
+                                }
                                 idx = target;
                             }
-                            Err(msg) => return WfOutcome::step_failed(&step.id, msg),
+                            Err(msg) => {
+                                // 判死轮同样落盘：这一轮也递增了计数，
+                                // 续跑必须看到它，否则会重发配额。
+                                ckpt.record_loop_iter(
+                                    &step.id,
+                                    loop_iters.get(&idx).copied().unwrap_or(0),
+                                    loop_metrics.get(&idx).copied(),
+                                );
+                                return WfOutcome::step_failed(&step.id, msg);
+                            }
                         }
                         continue;
                     }
@@ -13964,10 +14197,24 @@ async fn run_workflow_serial(
                         Ok(SerialLoopNav::Advance) => idx += 1,
                         Ok(SerialLoopNav::Rework(target)) => {
                             pending_feedback = Some(last_output.clone());
-                            done_steps.remove(wf.steps[target].id.as_str());
+                            ckpt.record_loop_iter(
+                                &step.id,
+                                loop_iters.get(&idx).copied().unwrap_or(0),
+                                loop_metrics.get(&idx).copied(),
+                            );
+                            for i in target..idx {
+                                done_steps.remove(wf.steps[i].id.as_str());
+                            }
                             idx = target;
                         }
-                        Err(msg) => return WfOutcome::step_failed(&step.id, msg),
+                        Err(msg) => {
+                            ckpt.record_loop_iter(
+                                &step.id,
+                                loop_iters.get(&idx).copied().unwrap_or(0),
+                                loop_metrics.get(&idx).copied(),
+                            );
+                            return WfOutcome::step_failed(&step.id, msg);
+                        }
                     }
                     continue;
                 }
@@ -14115,9 +14362,60 @@ async fn run_workflow_serial(
                             &last_output,
                             &mut feedback_history,
                         ));
+                        // 落盘返工进度（同上）：gate 是 learn_plan 唯一的
+                        // `loop_until` 步，续跑后计数必须接上。
+                        ckpt.record_loop_iter(
+                            &step.id,
+                            loop_iters.get(&idx).copied().unwrap_or(0),
+                            loop_metrics.get(&idx).copied(),
+                        );
+                        // 跳回目标必须**重新执行**：目标步（learn_plan 的
+                        // pages）早就记进 `done_steps`，不清掉就会被循环顶部
+                        // 「已完成跳过」静默越过。且这里必须 `continue`——
+                        // 缺了它，下一行的 `idx += 1` 会把 `idx = target` 覆盖
+                        // 成 target+1，等于跳过返工目标本身。
+                        //
+                        // 2026-11-22 linux 学习书实测：gate 判 REWORK: pages，
+                        // 日志只有「↩ 第 1 轮返工…跳回 'pages'」，随后直接
+                        // `[step 4/6] verdict`——pages/rechapter/assemble 三个
+                        // 都已完成、被静默跳过，骨架一次没重写，BLOCKING 从
+                        // 2 涨到 7，直到 max_iterations 耗尽。
+
+                        // **必须清掉从目标步到本步（不含本步）的全部
+                        // done_steps**，不能只清目标步本身。
+                        //
+                        // 返工改了上游产物，中间步骤（assemble 这类确定性
+                        // 装配步）的产出随之失效——它们若仍留在 done_steps
+                        // 里就会被跳过，本步拿到的还是**旧清单**。
+                        //
+                        // 实测 2026-11-22 linux 学习书：gate 判
+                        // `REWORK: rechapter` → 只清了 rechapter → 循环回到
+                        // `[step 2/6] rechapter` 重做 7 章，然后**直接跳到**
+                        // `[step 4/6] verdict`（assemble 被跳过），verdict 审的
+                        // 仍是返工前的 20 章清单，gate 再次驳回同一批问题。
+                        // 区间是 `target..=idx`（**含本步**）：本步是
+                        // `loop_until` 裁决门时，它自己的产出也要重算——否则
+                        // 返工后重新走到它，`serial_loop_decision` 读到的仍是
+                        // 上一轮那份 `VERDICT: REJECT`。
+                        //
+                        // 实测 2026-11-22 linux 学习书（audit 拆分后）：gate
+                        // 判 rework → 清 target..gate（不含 gate）→ audit 重跑
+                        // → **verdict 仍在 done_steps 里被跳过** → gate 拿旧
+                        // 裁决再驳一次，返工等于没发生。
+                        for i in target..=idx {
+                            done_steps.remove(wf.steps[i].id.as_str());
+                        }
                         idx = target;
+                        continue;
                     }
-                    Err(msg) => return WfOutcome::step_failed(&step.id, msg),
+                    Err(msg) => {
+                        ckpt.record_loop_iter(
+                            &step.id,
+                            loop_iters.get(&idx).copied().unwrap_or(0),
+                            loop_metrics.get(&idx).copied(),
+                        );
+                        return WfOutcome::step_failed(&step.id, msg);
+                    }
                 }
                 continue;
             }
@@ -14150,19 +14448,23 @@ async fn run_workflow_serial(
                         continue;
                     }
                     Err(e) => {
-                        // 定向返工：校验错误点名的章删掉产物、带错误跳回
-                        // on_fail.rework 重做（有次数上限）；点不出章或已耗尽
-                        // 才判死。
-                        if let Some(of) = &cp.on_fail {
+                        // 分两路，按**归因**选路：
+                        //   ① 错误能点名章（单章 paths 幻觉、description 引用）
+                        //      → 删该章产物、带错误跳回 on_fail.rework 只重做它；
+                        //   ② 点不出章（跨任务判据：写冲突 / 共享锚点 / 书结构）
+                        //      → 病灶在骨架或模板上，删单章只会空转，跳回
+                        //        on_fail.global_rework 全量返工且不失效任何产物。
+                        // 两路都无可用去处（或配额耗尽）才判死。
+                        let step_idx_of = |id: &str| wf.steps.iter().position(|s| s.id == id);
+                        let routed = cp.on_fail.as_ref().and_then(|of| {
                             let max = of.max_attempts.unwrap_or(2).min(5);
-                            let used = collect_fail_iters.entry(idx).or_insert(0);
                             let targets = collect_fail_targets(&e);
-                            let target_idx = wf.steps.iter().position(|s| s.id == of.rework);
-                            if let (false, true, Some(t)) =
-                                (targets.is_empty(), *used < max, target_idx)
-                            {
-                                *used += 1;
-                                let attempt = *used;
+                            let used = *collect_fail_iters.entry(idx).or_insert(0);
+                            if used >= max {
+                                return None;
+                            }
+                            if !targets.is_empty() {
+                                let t = step_idx_of(&of.rework)?;
                                 let paths: Vec<String> = targets
                                     .iter()
                                     .filter(|t| is_safe_target_id(t))
@@ -14178,29 +14480,52 @@ async fn run_workflow_serial(
                                 warn_unremoved_artifacts(&ctx.event_tx, &step.id, &failed);
                                 let _ = ctx.event_tx.send(ChatEvent::Status {
                                     message: format!(
-                                        "↩ step '{}' 装配校验未通过，定向返工 {targets:?}（第 {attempt}/{max} 次，失效 {} 个产物）：跳回 '{}' 重做",
+                                        "↩ step '{}' 装配校验未通过，定向返工 {targets:?}（第 {}/{max} 次，失效 {} 个产物）：跳回 '{}' 重做",
                                         step.id,
+                                        used + 1,
                                         removed.len(),
                                         of.rework
                                     ),
                                 });
-                                pending_feedback = Some(format!(
+                                let feedback = format!(
                                     "【装配机械校验未通过——只修点名章 {}】\n{e}\n\n\
-                                     注意：title / depends_on 以骨架为准，装配时会被覆盖，章条目里改了也无效；\
-                                     description 只能引用本章 depends_on **直接列出**的章，引用不到的就改写成\
-                                     不依赖它的表述。",
+                                     注意：title / depends_on / labels 的层级位以骨架为准，装配时会被覆盖，\
+                                     章条目里改了也无效；description 只能引用本章 depends_on **直接列出**的章，\
+                                     引用不到的就改写成不依赖它的表述。",
                                     targets.join("、")
-                                ));
-                                // 续跑时目标步可能已在 `done_steps` 里（checkpoint
-                                // 记过完成）—— 不摘掉就会被循环顶部的「已完成跳过」
-                                // 直接越过，返工空转（2026-11-16 实测：resume 后
-                                // assemble 连报两次「定向返工 ["ch08"]」，rechapter
-                                // 一步没跑，最后死于「缺章 ch08」）。其它 rework 路径
-                                // （loop_until / gate / 契约返工）都摘了，这里漏了。
-                                done_steps.remove(wf.steps[t].id.as_str());
-                                idx = t;
-                                continue;
+                                );
+                                return Some((t, of.rework.clone(), feedback, true));
                             }
+                            let to = of.global_rework.clone()?;
+                            let t = step_idx_of(&to)?;
+                            let _ = ctx.event_tx.send(ChatEvent::Status {
+                                message: format!(
+                                    "↩ step '{}' 装配校验失败且错误点不出章号（跨任务判据）：第 {}/{max} 次跳回 '{to}' 全量返工，不失效任何章产物",
+                                    step.id,
+                                    used + 1
+                                ),
+                            });
+                            let feedback = format!(
+                                "【装配机械校验未通过——这是全书级问题，不是某一章条目的错】\n{e}\n\n\
+                                 要点：跨任务判据（写冲突 / 共享锚点 / 书结构 / 层级标签）的病灶在\
+                                 **骨架 chapters.json 或模板**上，重做单章条目改不掉。按错误原文改骨架\
+                                 （层级标签照抄 layer；只读章不参与写冲突判据，别给它声明产物前缀），\
+                                 再重写整份 chapters.json。"
+                            );
+                            Some((t, to, feedback, false))
+                        });
+                        if let Some((t, _to, feedback, _targeted)) = routed {
+                            *collect_fail_iters.entry(idx).or_insert(0) += 1;
+                            pending_feedback = Some(feedback);
+                            // 续跑时目标步可能已在 `done_steps` 里（checkpoint
+                            // 记过完成）—— 不摘掉就会被循环顶部的「已完成跳过」
+                            // 直接越过，返工空转（2026-11-16 实测：resume 后
+                            // assemble 连报两次「定向返工 ["ch08"]」，rechapter
+                            // 一步没跑，最后死于「缺章 ch08」）。其它 rework 路径
+                            // （loop_until / gate / 契约返工）都摘了，这里漏了。
+                            done_steps.remove(wf.steps[t].id.as_str());
+                            idx = t;
+                            continue;
                         }
                         return WfOutcome::step_failed(
                             &step.id,
@@ -14330,6 +14655,10 @@ async fn run_workflow_serial(
                     step.export.clone(),
                     wf_id.to_string(),
                     step.id.clone(),
+                    // 首轮才允许断点续跑（真的跑到一半挂了）。返工轮必须
+                    // 从头跑，否则骨架步被跳过、扇出全命中 skip_fresh，
+                    // 子流程「成功」交回同一份旧产物，父级重判必再驳回。
+                    entry == 0,
                 )
                 .await
                 {
@@ -15403,11 +15732,25 @@ async fn run_workflow_serial(
                         &last_output,
                         &mut feedback_history,
                     ));
-                    done_steps.remove(wf.steps[target_idx].id.as_str());
+                    ckpt.record_loop_iter(
+                        &step.id,
+                        loop_iters.get(&idx).copied().unwrap_or(0),
+                        loop_metrics.get(&idx).copied(),
+                    );
+                    for i in target_idx..idx {
+                        done_steps.remove(wf.steps[i].id.as_str());
+                    }
                     idx = target_idx;
                     continue;
                 }
-                Err(msg) => return WfOutcome::step_failed(&step.id, msg),
+                Err(msg) => {
+                    ckpt.record_loop_iter(
+                        &step.id,
+                        loop_iters.get(&idx).copied().unwrap_or(0),
+                        loop_metrics.get(&idx).copied(),
+                    );
+                    return WfOutcome::step_failed(&step.id, msg);
+                }
             }
             if wf.name == "learn_loop" {
                 material_refreshed = true;
@@ -15533,6 +15876,33 @@ fn collect_plan_tasks_mechanical(
         // 覆盖后不变式闭合：骨架是结构字段的唯一真相，detail 无权扩写锚点。
         if let Some(p) = elem.get("paths") {
             obj.insert("paths".into(), p.clone());
+        }
+        // 层级标签同样以骨架为准**归一**（不是报错）：`layer` 是骨架权威
+        // 字段，扇出子会话把「层-树干」抄成「层-主干」这类漂移，报错出来
+        // 只会指名一章、而 detail 无权改骨架（2026-11-22 linux：ch02 抄成
+        // `层-主干`，`BOOK_LAYERS` 里没有，本会被判「必须带且只带一个层级
+        // 标签」且无法定向修复）。骨架给了合法 layer 就按它覆盖 labels 里的
+        // 层级位；骨架没给或给错则保持原样，交给书结构校验报错。
+        if let Some(layer) = elem
+            .get("layer")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|l| BOOK_LAYERS.contains(l))
+        {
+            let mut labels: Vec<serde_json::Value> = obj
+                .get("labels")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter(|v| v.is_string()).cloned().collect())
+                .unwrap_or_default();
+            // 层级位一律按 `层-` 前缀识别（不是只认四个合法值）：detail 抄错的
+            // 「层-主干」不在 BOOK_LAYERS 里，只按精确匹配删不掉，会留下两个
+            // 层级标签反而更糟。
+            labels.retain(|v| {
+                v.as_str()
+                    .is_none_or(|s| !s.trim().starts_with("层-"))
+            });
+            labels.push(serde_json::Value::String(layer.to_string()));
+            obj.insert("labels".into(), serde_json::Value::Array(labels));
         }
         tasks.push(val);
     }
@@ -15910,6 +16280,8 @@ async fn run_dag_step(
             step.export.clone(),
             inp.wf_id.clone(),
             step.id.clone(),
+            // 与串行引擎同一条规则：返工轮从头跑，不吃旧 checkpoint。
+            inp.round == 0,
         )
         .await
         .map_err(|e| {
@@ -16482,10 +16854,25 @@ async fn run_workflow_dag(
     let rework_pending = resume
         .map(|state| learn_rework_invalidated(&wf.name, &state.completed))
         .unwrap_or_default();
+    // 与串行引擎同一条规则：带 `loop_until` 的裁决步不进跳过集——它写在
+    // 判定之前，续跑时若被当成「已完成」直接越过，那份 `VERDICT: REJECT`
+    // 就成了最终结论，返工永远不会发生。
     let mut done_steps: std::collections::HashSet<&str> = std::collections::HashSet::new();
     if let Some(state) = resume {
+        // 失败点之后的所有步都不算完成（与串行引擎同一条规则：
+        // 续跑会从失败步重跑，其下游的旧产出依赖已变）。
+        // `None` = 没有结构化失败记录 → 沿用「已完成的都跳过」。
+        let resume_idx: Option<usize> = state
+            .last_failure
+            .as_ref()
+            .and_then(|f| f.step_id.as_deref())
+            .and_then(|id| wf.steps.iter().position(|s| s.id == id));
         for (step_id, output_key, output) in &state.completed {
-            if !rework_pending.contains(step_id.as_str()) {
+            let at = wf.steps.iter().position(|s| s.id == *step_id);
+            let looping = at.is_some_and(|i| wf.steps[i].loop_until.is_some());
+            let before_failure = resume_idx.is_none_or(|r| at.is_some_and(|i| i < r));
+            // 与串行引擎同一条规则：失败点之后的所有步都不算完成。
+            if !rework_pending.contains(step_id.as_str()) && !looping && before_failure {
                 done_steps.insert(step_id.as_str());
             }
             outputs.insert(step_id.clone(), output.clone());
@@ -16506,7 +16893,19 @@ async fn run_workflow_dag(
         // loop_until 所在 step 的完成次数计（key = step 下标）；
         // pending_feedback 是跳回时预置进目标 step prompt 的
         // 「上轮审查反馈」（key = 目标 step id）。
-        let mut loop_iters: HashMap<usize, usize> = HashMap::new();
+        // 与串行引擎同一条规则：按 step id 从 checkpoint 恢复返工进度。
+        let mut loop_iters: HashMap<usize, usize> = resume
+            .map(|state| {
+                wf.steps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, st)| {
+                        let (iters, _) = state.loop_iters.get(&st.id)?;
+                        usize::try_from(*iters).ok().map(|n| (i, n))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut pending_feedback: HashMap<String, String> = HashMap::new();
         let mut wave_idx = 0;
         while wave_idx < waves.len() {
@@ -16584,6 +16983,27 @@ async fn run_workflow_dag(
                     }
                 }
                 // 动态扇出：每个元素一个任务，共用同一个信号量（对象池）。
+                // 已完成的元素：两个来源都要看。
+                //
+                // 1. `resume.fan_out`——上一轮 checkpoint 里记过的元素结果。
+                // 2. **`skip_fresh` 命中的产物文件**（下面在 `items` 过滤前补入）
+                //    ——续跑换了新 `wf_id`，旧 run 的 fan_out 记录不在本 run 的
+                //    checkpoint 里，于是 `prior_items` 为空、`item_vars` 又因
+                //    `skip_fresh` 被全部过滤成空。两头都空 → 引擎记了
+                //    `fan_out_expected=20` 却永远收不到 join，最终
+                //    「扇出 0 个任务」+ 子流程 ok，但 `output_key` 从未写入。
+                //    实测 2026-11-23：20 章证据全部落盘后，外层报
+                //    「没有 output_key 'audit' 的产出（可用：manifest）」。
+                let mut prior_items: Vec<(String, String)> =
+                    if wf.steps[idx].fan_out.is_some() {
+                        resume
+                            .and_then(|s| s.fan_out.get(wf.steps[idx].id.as_str()))
+                            .cloned()
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+
                 // MODE: PATCH 时只留下 feedback.md 里 `## <id>` 点名的章。
                 let mut patch_skipped = false;
                 let mut item_vars: Vec<Option<(usize, String, String)>> = match &wf.steps[idx]
@@ -16599,6 +17019,30 @@ async fn run_workflow_dag(
                                 &ctx.cwd,
                                 &vars,
                             );
+                            // 先把「已有新鲜产物」的元素单独收出来，补进
+                            // `prior_items`——它们不会被派发，但结果必须计入
+                            // 扇出产出（否则 `output_key` 永不写入）。
+                            //
+                            // 必须在下面的 `filter` **之前**做：那个 filter 会把
+                            // 新鲜元素直接从 `items` 里删掉，之后再也拿不到它们的 id。
+                            if let Some(tpl) = &fo.skip_fresh {
+                                for (id, _) in &items {
+                                    if prior_items.iter().any(|(done, _)| done == id) {
+                                        continue;
+                                    }
+                                    if !fan_out_item_is_fresh(fo, &vars, &ctx.cwd, id) {
+                                        continue;
+                                    }
+                                    let mut rel = tpl.clone();
+                                    for (k, v) in &vars {
+                                        rel = rel.replace(&format!("{{{{{k}}}}}"), v);
+                                    }
+                                    let rel = rel.replace("{{item_id}}", id);
+                                    if let Ok(text) = std::fs::read_to_string(ctx.cwd.join(&rel)) {
+                                        prior_items.push((id.clone(), text));
+                                    }
+                                }
+                            }
                             let mut kept: Vec<Option<(usize, String, String)>> = items
                                 .into_iter()
                                 .enumerate()
@@ -16654,14 +17098,6 @@ async fn run_workflow_dag(
                             );
                         }
                     },
-                };
-                let prior_items: Vec<(String, String)> = if wf.steps[idx].fan_out.is_some() {
-                    resume
-                        .and_then(|s| s.fan_out.get(wf.steps[idx].id.as_str()))
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    Vec::new()
                 };
                 let pending_items: Vec<Option<(usize, String, String)>> = if prior_items.is_empty()
                 {
@@ -17043,6 +17479,12 @@ async fn run_workflow_dag(
                     .position(|w| w.iter().any(|&i| wf.steps[i].id == target_id))
                     .expect("validate 已保证 loop_back_to/loop_back_routes 指向存在的 step");
                 pending_feedback.insert(target_id.clone(), out.clone());
+                // 落盘返工进度（与串行引擎同款）：续跑按 step id 恢复。
+                let metric = step
+                    .loop_progress_marker
+                    .as_deref()
+                    .and_then(|m| parse_progress_metric(out, m));
+                ckpt.record_loop_iter(&step.id, count, metric);
                 rework_notes.push(format!(
                     "step '{}' 未满足「{cond}」（第 {count}/{max} 轮），跳回 '{target_id}'",
                     step.id
@@ -17643,8 +18085,19 @@ prompt = "x"
     #[test]
     fn heavy_reading_steps_declare_tool_budgets() {
         const EXPECTED: &[(&str, &str, usize)] = &[
-            ("learn_book_pages", "breakdown", 80),
+            // 80 → 40：实测本步每次都跑到 30~31 次调用后被
+            // `tool batch skipped: missing=["write"]` 拦下（读太多、迟迟不写），
+            // 80 等于没有刹车。40 够覆盖 20 章的正常核实（目录树 + 模块清单 +
+            // code_graph 索引 + 每章路径核实），又远低于能一口气深读 6 个大
+            // 文件的 80。（20 试过：会把「读 Makefile」也挤掉。）
+            ("learn_book_pages", "breakdown", 40),
             ("learn_book_pages", "detail", 100),
+            // verdict 必须有运行中硬刹车：实测同一份 20 章清单，reviewer 三轮
+            // 调用量 25 → 63 → 92 次，逐轮递增无上界；而 `tool_call_limits`
+            // 是跑完才判，拦不住过程（配额从 8 调到 60 都追不上）。
+            // audit 已改为嵌套子流程（learn_audit），预算在子流程的 fan_out
+            // 步里逐章执行；这里改查它确实声明了预算。
+            ("learn_audit", "audit", 60),
             ("task_refine", "refine", 40),
             ("outline_split", "breakdown", 40),
         ];
@@ -18583,6 +19036,76 @@ role = "reviewer"
         assert!(check_tool_call_limits(&Default::default(), dup).is_ok());
     }
 
+    /// 三条工具判据对「失败调用」的处理**必须不同**：
+    /// - `check_required_tools`（要求真办成事）→ 失败不算；
+    /// - `check_required_tools_any`（要求真取证）→ 失败不算；
+    /// - `check_tool_call_limits`（次数上限）→ 失败**要算**，它也花了预算。
+    ///
+    /// 回归 2026-11-22：`called_tool_names` 开始记录失败行（为了让 OR 判据
+    /// 能区分「尝试过但失败」），若三处共用它，AND 判据会把失败的 `write`
+    /// 当成已落盘——那正是它要防的「只在正文里描述结果」。
+    #[test]
+    fn failed_calls_count_for_limits_but_not_for_requirements() {
+        let failed_write = "write {\"path\":\"plan.json\"} → ✗ disk full";
+
+        // AND：失败的 write 不算落盘。
+        let err = check_required_tools(&["write".to_string()], failed_write).unwrap_err();
+        assert!(err.contains("write"), "{err}");
+
+        // OR：失败的 read 不算取证。
+        let err = check_required_tools_any(&["read".to_string()], failed_write).unwrap_err();
+        assert!(err.contains("write") || err.contains("read"), "{err}");
+
+        // 次数上限：失败调用照样计数（上限 0 = 禁止，失败也算违规）。
+        let mut forbid = std::collections::BTreeMap::new();
+        forbid.insert("write".to_string(), 0usize);
+        let err = check_tool_call_limits(&forbid, failed_write).unwrap_err();
+        assert!(err.contains("禁止调用"), "{err}");
+
+        // 上限 1：一次成功 + 一次失败 = 2 次，超限。
+        let mut cap = std::collections::BTreeMap::new();
+        cap.insert("write".to_string(), 1usize);
+        let mixed = "write {\"path\":\"a\"} → ok\nwrite {\"path\":\"b\"} → ✗ denied";
+        let err = check_tool_call_limits(&cap, mixed).unwrap_err();
+        assert!(err.contains("最多 1 次"), "{err}");
+    }
+
+    /// 尝试过但全部失败 ≠ 压根没尝试：批注必须点名失败的工具，并给出
+    /// 可执行的下一步，而不是笼统说「一个都没调用」。
+    ///
+    /// 回归 2026-11-22 linux 学习书：reviewer 交出含 8 处 `file:line` 的
+    /// 完整裁决，`code_graph` 全因路径不存在而失败 → 摘要无成功行 → 被判
+    /// 「没取证」→ 整步重做 3 次（每次 10-15 分钟）。它明明取证了，只是
+    /// 路径猜错。
+    #[test]
+    fn required_tools_any_distinguishes_failed_attempts_from_no_attempt() {
+        let any = vec!["read".to_string(), "code_graph".to_string(), "search".to_string()];
+
+        // 完全没调用：沿用原措辞。
+        let err = check_required_tools_any(&any, "[本 step 工具调用数: 0]").unwrap_err();
+        assert!(err.contains("一个都没调用"), "{err}");
+
+        // 调了但失败：批注要点名失败的调用，并指向真实路径 / search。
+        let failed = "code_graph {\"path\":\"arch/x86/entry/common.c\"} → ✗ path 不存在：相近的真实路径 arch/x86/entry/syscall_64.c";
+        let err = check_required_tools_any(&any, failed).unwrap_err();
+        assert!(
+            err.contains("code_graph"),
+            "必须点名失败的工具，而不是说「一个都没调用」：{err}"
+        );
+        assert!(
+            !err.contains("一个都没调用"),
+            "尝试过就不能说「一个都没调用」：{err}"
+        );
+        assert!(err.contains("真实存在"), "要给出可执行的下一步：{err}");
+        assert!(err.contains("search"), "要提示换 search 定位：{err}");
+
+        // 成功调用照常放行。
+        assert!(check_required_tools_any(&any, "read {\"path\":\"a.c\"} → ok").is_ok());
+        // 成功 + 失败混合：成功行满足 OR 语义，直接放行。
+        let mixed = "read {\"path\":\"a.c\"} → ok\ncode_graph {\"path\":\"nope\"} → ✗ 不存在";
+        assert!(check_required_tools_any(&any, mixed).is_ok());
+    }
+
     /// `check_tool_usage`：三条工具行为按"批注指导性"排序——完全没调 >
     /// 没取证 > 调多了。顺序错了模型会先去修次要问题。
     #[test]
@@ -18701,6 +19224,8 @@ role = "reviewer"
         let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
         wf.validate().expect("learn should validate");
         let ids: Vec<&str> = wf.steps.iter().map(|s| s.id.as_str()).collect();
+        // `release` 是 0d465e4 加的零模型机械门（`gate_from = "report"`，
+        // REJECT 跳回 `fix`）。它必须留在末尾——放行判定只能在最后一步。
         assert_eq!(
             ids,
             [
@@ -18709,7 +19234,8 @@ role = "reviewer"
                 "write",
                 "verify",
                 "fix",
-                "recheck"
+                "recheck",
+                "release"
             ]
         );
         // investigate：防幻觉——要求行号锚点
@@ -18739,6 +19265,17 @@ role = "reviewer"
         assert_eq!(wf.steps[3].roles(), vec!["reviewer"], "verify 独立审");
         assert_eq!(wf.steps[4].roles(), vec!["programmer"], "fix 只改");
         assert_eq!(wf.steps[5].roles(), vec!["reviewer"], "recheck 独立复核");
+        // release：零模型机械门，读 report 的结构化裁决；驳回跳回 fix。
+        let release = &wf.steps[6];
+        assert!(release.roles().is_empty(), "release 是机械门，不派 speaker");
+        assert_eq!(release.gate_from.as_deref(), Some("report"));
+        assert_eq!(release.loop_until.as_deref(), Some("VERDICT: PASS"));
+        assert_eq!(release.loop_back_to.as_deref(), Some("fix"));
+        assert_eq!(
+            release.loop_no_release_on.as_deref(),
+            Some("VERDICT: REJECT"),
+            "硬拒绝不许被 advisor 复核放行"
+        );
     }
     /// learn_loop v2：文档驱动学习循环——plan（取证+拆解+出题）→ annotate（默认：
     /// 注释版代码副本，不改源码）→ doc（写/增强
@@ -33449,6 +33986,86 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
         assert!(err.contains("缺章 ch02"), "{err}");
     }
 
+    /// 层级标签以骨架为准归一：detail 把「层-树干」抄成「层-主干」这类
+    /// 漂移不该让装配失败。
+    ///
+    /// 回归 2026-11-22 linux 学习书：ch02 的 `labels` 写 `层-主干`，而
+    /// `BOOK_LAYERS` 只有 层-地基/层-树干/层-枝干/层-树叶 → 书结构校验报
+    /// 「必须带且只带一个层级标签」，但 detail 无权改骨架、定向返工改不动。
+    #[test]
+    fn collect_plan_tasks_normalizes_layer_label_from_skeleton() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let base = root.join(".latte/learn-plan");
+        std::fs::create_dir_all(base.join("tasks")).unwrap();
+        std::fs::write(
+            base.join("chapters.json"),
+            serde_json::json!({"chapters":[
+                {"id":"ch01","title":"ch01 推导","depends_on":[],"paths":[],"layer":"层-树干"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            base.join("tasks/ch01.json"),
+            serde_json::json!({
+                "title": "ch01 推导", "description": "推导章，能讲清四条事实如何逼出内核形态",
+                "priority": 2, "labels": ["学习","只读","第2编-主干","层-主干"],
+                "task_type": "learn", "workflow": "", "depends_on": [],
+                "paths": [], "artifact_paths": [], "subtasks": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let cp = CollectPlanTasks {
+            order_file: ".latte/learn-plan/chapters.json".into(),
+            order_items: "chapters".into(),
+            order_id: "id".into(),
+            task_file: ".latte/learn-plan/tasks/{{id}}.json".into(),
+            on_fail: None,
+        };
+        let fence = collect_plan_tasks_mechanical(&cp, &HashMap::new(), root, true, false)
+            .expect("层级标签应被骨架归一后通过");
+        let (_, tasks) = find_tasks_fence(&fence).unwrap();
+        let labels = tasks[0]["labels"].as_array().unwrap();
+        assert!(
+            labels.iter().any(|l| l == "层-树干"),
+            "骨架 layer 必须覆盖到 labels：{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l == "层-主干"),
+            "非法的层级标签必须被剔除：{labels:?}"
+        );
+        // 编标签（第2编-主干）不是层级标签，必须保留。
+        assert!(labels.iter().any(|l| l == "第2编-主干"), "{labels:?}");
+    }
+
+    /// 点不出章号的错误（跨任务判据）要有 `global_rework` 这个去处，
+    /// 否则整条 workflow 判死、`max_attempts` 一次都用不上。
+    #[test]
+    fn collect_on_fail_accepts_global_rework_before_assemble() {
+        let raw = include_str!("../../config/workflows/learn_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).unwrap();
+        wf.validate().expect("global_rework 指向前序 step 应通过");
+        let assemble = wf
+            .steps
+            .iter()
+            .find(|s| s.id == "assemble")
+            .expect("assemble step");
+        let of = assemble
+            .collect_plan_tasks
+            .as_ref()
+            .and_then(|cp| cp.on_fail.as_ref())
+            .expect("assemble 必须配 on_fail");
+        assert_eq!(of.global_rework.as_deref(), Some("pages"));
+
+        // 指到本步自身 / 后面的 step 必须被 validate() 拒绝。
+        let bad = raw.replace("global_rework = \"pages\"", "global_rework = \"verdict\"");
+        let wf_bad: WorkflowDef = toml::from_str(&bad).unwrap();
+        let err = wf_bad.validate().unwrap_err();
+        assert!(err.contains("global_rework"), "{err}");
+    }
+
     /// 单章 paths 幻觉（只读任务的整条路径不存在）必须把错误归到章号上：
     /// assemble 的 `collect_plan_tasks.on_fail` 只能按报错里的 chNN 定向返工
     /// 到 rechapter，报错里没有章号就整单判死（2026-11-15 linux 会话实测：
@@ -33521,6 +34138,10 @@ collect_plan_tasks = {{ order_file = "c.json", task_file = "t/{{{{id}}}}.json", 
                 "pages",
                 "rechapter",
                 "assemble",
+                // audit：把「取证」与「判断」拆开——单步同时做时，reviewer 把
+                // 全部工具预算花在取证上，被硬刹车掐断时裁决正文还没开始写
+                // （实测 40/40 → 32 字符、79/80 → 70 字符、78/80 → 75 字符）。
+                "audit",
                 "verdict",
                 "gate",
                 "submit"
@@ -33866,5 +34487,982 @@ mod request_budget_tests {
         .unwrap();
         let err = wf.validate().unwrap_err();
         assert!(err.contains("huge") && err.contains("small"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod gate_rework_skip_regression_tests {
+    //! gate 驳回后的跳回**必须真的重跑目标步**。
+    //!
+    //! 回归 2026-11-22 linux 学习书：`gate` 的 `Rework` 分支既没清
+    //! `done_steps`、也没 `continue`，于是 `idx = target` 被紧随的
+    //! `idx += 1` 覆盖，`pages`/`rechapter`/`assemble` 三个已完成步被静默
+    //! 跳过——日志只有「↩ 第 1 轮返工…跳回 'pages'」，紧接着就是
+    //! `[step 4/6] verdict`，骨架一次没重写，BLOCKING 从 2 涨到 7。
+    //!
+    //! 这个缺陷在配置层测不出来（路由表是对的），必须跑到执行层。
+    use super::*;
+    use crate::config::{ModelCatalog, ModelDef};
+    use crate::role::RoleTemplate;
+    use std::sync::atomic::AtomicBool;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn openai_body(content: &str) -> String {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 }
+        })
+        .to_string()
+    }
+
+    fn bodies_containing(requests: &[wiremock::Request], pat: &str) -> Vec<String> {
+        requests
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).to_string())
+            .filter(|b| b.contains(pat))
+            .collect()
+    }
+
+    fn config_at(base_url: &str) -> Arc<AgentConfig> {
+        let roles = HashMap::from([(
+            "worker".to_string(),
+            RoleTemplate {
+                id: "worker".into(),
+                name: "Worker".into(),
+                category: "execution".into(),
+                model_tier: "premium".into(),
+                model_chain: vec![],
+                prompt_file: None,
+                temperature: None,
+                tools: vec![],
+                icon: String::new(),
+                skills: vec![],
+                code_paths: vec![],
+                description: String::new(),
+            },
+        )]);
+        Arc::new(AgentConfig {
+            advisor: Default::default(),
+            compaction: Default::default(),
+            token_budget: Default::default(),
+            models: ModelCatalog {
+                models: vec![ModelDef {
+                    name: "Test Premium".into(),
+                    api: "openai".into(),
+                    provider: "test".into(),
+                    base_url: base_url.into(),
+                    api_key: "test-key".into(),
+                    context_window: 32000,
+                    max_tokens: 4096,
+                    omit_max_tokens: false,
+                    max_tokens_field: Default::default(),
+                    prompt_cache: false,
+                    prompt_cache_key: None,
+                    supports_thinking: false,
+                    supports_vision: false,
+                    supports_image_generation: false,
+                    cost_per_million_input: None,
+                    cost_per_million_output: None,
+                    tier: Some("premium".into()),
+                    timeout_secs: None,
+                }],
+                tiers: Some(HashMap::from([(
+                    "premium".to_string(),
+                    "Test Premium".to_string(),
+                )])),
+                role_tiers: None,
+            },
+            roles,
+        })
+    }
+
+    fn ctx_at(base_url: &str, cwd: std::path::PathBuf) -> WorkflowRunContext {
+        let config = config_at(base_url);
+        let resolver = Arc::new(crate::model_resolver::ModelResolver::from_config(&config).unwrap());
+        let (event_tx, _rx) = broadcast::channel(256);
+        WorkflowRunContext {
+            merged: config,
+            resolver,
+            default_params: GenerateParams::default(),
+            cwd,
+            artifact_paths: None,
+            event_tx,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            turn_cancel_flag: None,
+            agent_pause_gate: None,
+            depth: 0,
+            subsession_store: None,
+            session_id: None,
+            advisor_gate: None,
+            advisor_pause: None,
+            staging: None,
+            dispatch_budget: None,
+            token_budget: None,
+            root_wf_id: None,
+        }
+    }
+
+    /// gate 驳回 → 跳回上游 `skeleton` → 该步必须被**再调用一次**。
+    ///
+    /// 非续跑路径（`done_steps` 为空）：抓的是「`idx = target` 之后必须
+    /// `continue`」——少了它，紧随的 `idx += 1` 会把跳转目标吃掉。
+    #[tokio::test]
+    async fn gate_rework_reruns_the_target_step() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出骨架"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("骨架产出（第 N 版）")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues":[{"id":"B1","severity":"blocking","rework":"skeleton","summary":"骨架残缺","evidence":"实测","fix":"补章"}]}
+```"#,
+            )))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues": []}
+```"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "gate_rework_demo"
+[[steps]]
+id = "skeleton"
+role = "worker"
+task = "出骨架：{{topic}}"
+output_key = "plan"
+[[steps]]
+id = "review"
+role = "worker"
+task = "出裁决：{{plan}}"
+output_key = "verdict"
+require_verdict_json = true
+[[steps]]
+id = "gate"
+task = ""
+output_key = "gate_out"
+gate_from = "verdict"
+loop_until = "VERDICT: PASS"
+loop_back_to = "skeleton"
+loop_back_routes = { "REWORK: skeleton" = "skeleton" }
+max_iterations = 3
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let cwd = tempfile::tempdir().expect("tempdir").path().to_path_buf();
+        let ctx = ctx_at(&server.uri(), cwd);
+        let out = run_workflow(&wf, "测试", &ctx)
+            .await
+            .expect("驳回后重跑应最终放行");
+        assert!(out.starts_with("VERDICT: PASS"), "{out}");
+
+        let requests = server.received_requests().await.unwrap();
+        let skeleton_calls = bodies_containing(&requests, "出骨架");
+        assert_eq!(
+            skeleton_calls.len(),
+            2,
+            "gate 驳回后 skeleton 必须被重跑一次（实际 {} 次，共 {} 请求）",
+            skeleton_calls.len(),
+            requests.len()
+        );
+        assert!(
+            skeleton_calls[1].contains("【上轮审查反馈】"),
+            "重跑必须带 gate 的驳回理由：{}",
+            skeleton_calls[1]
+        );
+    }
+
+    /// 续跑必须从**失败点**重跑，其下游的旧产出不能跳过。
+    ///
+    /// 回归 2026-11-23：learn_plan 的 audit 步失败后续跑，audit 重新执行
+    /// 成功（20 章证据重取），但 `verdict` 仍在 `done_steps` 里被跳过 →
+    /// `[step 4/7] audit → [step 6/7] gate` 中间没有 verdict → gate 拿到
+    /// 上一轮的旧裁决，返工等于没发生。
+    ///
+    /// 反向约束同样重要：没有结构化失败记录时（手工裁剪 checkpoint、旧格式）
+    /// **不能**凭空重跑——沿用「已完成的都跳过」。
+    #[tokio::test]
+    async fn resume_reruns_steps_after_the_failed_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("第一阶段"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("一阶段产出")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("第二阶段"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("二阶段产出")))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "resume_after_failure"
+[[steps]]
+id = "one"
+role = "worker"
+task = "第一阶段：{{topic}}"
+output_key = "o1"
+max_retries = 1
+[[steps]]
+id = "two"
+role = "worker"
+task = "第二阶段：{{o1}}"
+output_key = "o2"
+max_retries = 1
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+
+        // 第 1 轮：两步行都成功，checkpoint 记下它们。
+        run_workflow(&wf, "主题", &ctx).await.expect("first run");
+        let wf_id = latest_checkpoint_id(root, "resume_after_failure").expect("checkpoint");
+
+        // 手工追加一条「step two 失败」记录，模拟中途失败后续跑。
+        let path = root
+            .join(".latte/workflow-runs")
+            .join(format!("{wf_id}.jsonl"));
+        let extra = serde_json::json!({
+            "type": "failure",
+            "wf_id": wf_id,
+            "step_id": "two",
+            "reason": "模拟失败",
+            "failed_at": 0
+        });
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!("{extra}
+"));
+        std::fs::write(&path, text).unwrap();
+
+        let before = bodies_containing(&server.received_requests().await.unwrap(), "第二阶段").len();
+        let _ = run_workflow_resume(&wf, "主题", &ctx, &wf_id).await;
+        let after = bodies_containing(&server.received_requests().await.unwrap(), "第二阶段").len();
+        assert!(
+            after > before,
+            "失败步 two 必须重跑（失败前 {before} 次，失败后 {after} 次）"
+        );
+
+        // 反向：没有 failure 记录时不应重跑任何已完成步。
+        let wf_id2 = latest_checkpoint_id(root, "resume_after_failure").unwrap();
+        let path2 = root
+            .join(".latte/workflow-runs")
+            .join(format!("{wf_id2}.jsonl"));
+        let raw2 = std::fs::read_to_string(&path2).unwrap();
+        let cleaned: Vec<&str> = raw2
+            .lines()
+            .filter(|l| !l.contains("\"type\":\"failure\""))
+            .collect();
+        std::fs::write(&path2, format!("{}\n", cleaned.join("\n"))).unwrap();
+        let before2 = bodies_containing(&server.received_requests().await.unwrap(), "第一阶段").len();
+        let _ = run_workflow_resume(&wf, "主题", &ctx, &wf_id2).await;
+        let after2 = bodies_containing(&server.received_requests().await.unwrap(), "第一阶段").len();
+        assert_eq!(
+            before2, after2,
+            "没有失败记录时已完成步不该重跑"
+        );
+    }
+
+    /// 续跑时 `skip_fresh` 命中的产物必须计入扇出结果，否则 `output_key` 永不写入。
+    ///
+    /// 回归 2026-11-23：learn_audit 续跑时 20 章产物全部已落盘，`skip_fresh`
+    /// 把它们全过滤掉 → `pending_items` 为空；而 `prior_items` 取自
+    /// `resume.fan_out`，续跑换了新 `wf_id`、旧 run 的 fan_out 记录不在本
+    /// run 的 checkpoint 里 → 也为空。两头都空时引擎记了
+    /// `fan_out_expected=20` 却永远收不到 join，于是「扇出 0 个任务」+
+    /// 子流程 ok，但 `output_key` 从未写入，外层报
+    /// 「没有 output_key 'audit' 的产出（可用：manifest）」。
+    ///
+    /// 修法：`skip_fresh` 命中的元素直接回读产物文件补进 `prior_items`。
+    #[tokio::test]
+    async fn resume_fan_out_reads_skip_fresh_artifacts() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("不该被调用")))
+            .mount(&server)
+            .await;
+
+        // 内层：单步扇出，产物写 out/<id>.txt。
+        let inner: WorkflowDef = toml::from_str(
+            r#"
+name = "inner_fanout"
+[[steps]]
+id = "seed"
+role = "worker"
+task = "确认清单：{{topic}}"
+output_key = "manifest"
+[[steps]]
+id = "items"
+role = "worker"
+depends_on = ["seed"]
+output_key = "collected"
+task = "处理 {{item_id}}"
+[steps.fan_out]
+file = "items.json"
+items = "items"
+id_key = "id"
+skip_fresh = "out/{{item_id}}.txt"
+"#,
+        )
+        .expect("inner TOML");
+        inner.validate().expect("inner validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("out")).unwrap();
+        std::fs::write(
+            root.join("items.json"),
+            serde_json::json!({"items":[{"id":"a"},{"id":"b"}]}).to_string(),
+        )
+        .unwrap();
+        // 两个元素产物都「新鲜」——续跑时会被 skip_fresh 全部跳过。
+        // 必须让产物 mtime 严格晚于数据文件（`fan_out_item_is_fresh` 比的是
+        // `a >= s`，同一毫秒内写入会得到不确定结果）。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("out/a.txt"), "A 的证据").unwrap();
+        std::fs::write(root.join("out/b.txt"), "B 的证据").unwrap();
+
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+        // 直接跑内层：模拟「续跑时产物已新鲜」。
+        let (out, keyed) = run_workflow_inner(&inner, "测试", &ctx, None, None)
+            .await
+            .expect("全 skip_fresh 时应成功且产出非空");
+        let _ = out;
+        let collected = keyed
+            .get("collected")
+            .expect("output_key 'collected' 必须写入——即使所有元素都被 skip_fresh 跳过");
+        assert!(collected.contains("A 的证据"), "应回读到 a 的产物：{collected}");
+        assert!(collected.contains("B 的证据"), "应回读到 b 的产物：{collected}");
+
+    }
+
+    /// 嵌套步的 `output_from` 必须指向子 workflow 里**真实存在的 output_key**。
+    ///
+    /// 回归 2026-11-23：learn_audit 的扇出步没绑 `output_key`，外层
+    /// `output_from = "audit"` 取不到——20 章取证全部完成后才报
+    /// 「nested workflow 'learn_audit' 没有 output_key 'audit' 的产出
+    /// （可用：manifest）」，整单判死，白跑一轮扇出。
+    ///
+    /// `validate()` 查不出这个（它不知道子 workflow 内容），所以在这里
+    /// 按内置文件静态核对。
+    #[test]
+    fn nested_output_from_resolves_to_a_real_output_key() {
+        let outer_raw = include_str!("../../config/workflows/learn_plan.toml");
+        let outer: WorkflowDef = toml::from_str(outer_raw).expect("learn_plan TOML");
+        for step in &outer.steps {
+            let (Some(sub_name), Some(from)) =
+                (step.workflow.as_deref(), step.output_from.as_deref())
+            else {
+                continue;
+            };
+            let sub_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../config/workflows/{sub_name}.toml"));
+            let sub_raw = std::fs::read_to_string(&sub_path)
+                .unwrap_or_else(|e| panic!("读不到 {}: {e}", sub_path.display()));
+            let sub: WorkflowDef = toml::from_str(&sub_raw)
+                .unwrap_or_else(|e| panic!("workflow '{sub_name}' 解析失败: {e}"));
+            assert!(
+                sub.steps
+                    .iter()
+                    .any(|s| s.output_key.as_deref() == Some(from)),
+                "step '{}' 的 output_from='{from}' 在子流程 '{sub_name}' 里不存在\
+                 （它有的 output_key：{:?}）——扇出步最容易漏绑",
+                step.id,
+                sub.steps
+                    .iter()
+                    .filter_map(|s| s.output_key.as_deref())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// 需要落盘的扇出步，角色必须有 `write`。
+    ///
+    /// 回归 2026-11-23：learn_audit 的 audit 步原本用 `role = "reviewer"`，
+    /// 而 reviewer 的工具集是 `["read","search","code_graph"]`——没有 `write`。
+    /// 引擎会把 step 请求的 `write` 静默忽略（只打一条 warning），于是
+    /// `require_tools = ["write"]` **永远无法满足**，4 个并发会话全部零产物，
+    /// 整步必然作废重做。这类配置错误必须在提交前机械拦住。
+    #[test]
+    fn fan_out_steps_that_require_write_use_a_role_with_write() {
+        let raw = include_str!("../../config/workflows/learn_audit.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("learn_audit should validate");
+        let step = wf
+            .steps
+            .iter()
+            .find(|s| s.fan_out.is_some())
+            .expect("learn_audit 应有 fan_out 步");
+        assert!(
+            step.require_tools.iter().any(|t| t == "write"),
+            "扇出步必须落盘（证据表要传给下游）"
+        );
+        // reviewer 只有 read/search/code_graph；tutor 才有 write。
+        let role = step.role.as_deref().unwrap_or("");
+        assert_ne!(
+            role, "reviewer",
+            "reviewer 没有 write 工具，require_tools=[\"write\"] 永远无法满足"
+        );
+        assert_eq!(role, "tutor", "落盘步沿用 learn_book_pages 的 tutor 组合");
+    }
+
+    /// 返工必须让**裁决门自己也重算**：`target..=idx` 而不是 `target..idx`。
+    ///
+    /// 回归 2026-11-22 linux 学习书（audit 拆分后实测）：gate 判
+    /// `REWORK: rechapter` → 清 `target..gate`（不含 gate）→ rechapter/
+    /// assemble/audit 都重跑了，但 **verdict 仍在 `done_steps` 里被跳过**
+    /// → gate 拿的仍是上一轮那份 `VERDICT: REJECT`，返工等于没发生。
+    ///
+    /// 断言方式是看 checkpoint 里 verdict 的记录数：返工一次就该多一条。
+    #[tokio::test]
+    async fn gate_rework_recomputes_the_verdict_step() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出骨架"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("骨架")))
+            .mount(&server)
+            .await;
+        // 裁决恒 blocking：每轮 gate 都驳回，逼出多次返工。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues":[{"id":"B1","severity":"blocking","rework":"skeleton","summary":"残缺","evidence":"实测","fix":"补"}]}
+```"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "gate_self_recompute_demo"
+[[steps]]
+id = "skeleton"
+role = "worker"
+task = "出骨架：{{topic}}"
+output_key = "plan"
+[[steps]]
+id = "assemble"
+task = ""
+output_key = "tasks"
+require_plan_tasks = true
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json" }
+[[steps]]
+id = "review"
+role = "worker"
+task = "出裁决：{{tasks}}"
+output_key = "verdict"
+require_verdict_json = true
+[[steps]]
+id = "gate"
+task = ""
+output_key = "gate_out"
+gate_from = "verdict"
+loop_until = "VERDICT: PASS"
+loop_back_to = "skeleton"
+loop_back_routes = { "REWORK: skeleton" = "skeleton" }
+max_iterations = 3
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        std::fs::write(
+            root.join("chapters.json"),
+            serde_json::json!({"chapters":[{"id":"ch01","title":"ch01 章","depends_on":[]}]})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tasks/ch01.json"),
+            serde_json::json!({
+                "title": "ch01 章", "description": "学什么+能讲清什么",
+                "priority": 2, "labels": ["学习","只读","层-树干"],
+                "task_type": "learn", "workflow": "", "depends_on": [],
+                "paths": [], "artifact_paths": [], "subtasks": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+        let err = run_workflow(&wf, "测试", &ctx)
+            .await
+            .expect_err("恒驳回应耗尽轮次判死");
+        assert!(err.contains("循环条件") || err.contains("VERDICT"), "{err}");
+
+        let wf_id = latest_checkpoint_id(root, "gate_self_recompute_demo")
+            .expect("应留下 checkpoint");
+        let state = load_checkpoint(root, &wf_id).expect("读回 checkpoint");
+        let review_records = state
+            .completed
+            .iter()
+            .filter(|(step, _, _)| step == "review")
+            .count();
+        assert!(
+            review_records >= 2,
+            "每轮返工都必须重算裁决（max_iterations=3 应至少 2 次），实际 {review_records} 次"
+        );
+    }
+
+    /// `verdict` 必须**零工具调用**：取证在 `audit` 步，裁决只做判断。
+    ///
+    /// 回归 2026-11-22 linux 学习书：单步同时做取证+裁决时，reviewer 把全部
+    /// 工具预算花在取证上，被硬刹车掐断时裁决正文还没开始写——实测三轮
+    /// 40/40 → 32 字符、79/80 → 70 字符、78/80 → 75 字符。加预算追不上
+    /// （20 章深度取证要 90+ 次，无约束时会一路涨到 92+）。
+    ///
+    /// 拆开后 audit 有独立预算（120）、verdict 零工具，两者都必然收尾完整。
+    #[test]
+    fn verdict_is_pure_judgment_after_audit_evidence() {
+        let raw = include_str!("../../config/workflows/learn_plan.toml");
+        let wf: WorkflowDef = toml::from_str(raw).expect("valid TOML");
+        wf.validate().expect("learn_plan should validate");
+        let step = |id: &str| {
+            wf.steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("缺 step {id}"))
+        };
+
+        // audit 是嵌套子流程（按章扇出），不是单步模型调用——20 章在
+        // 单个会话里要 120~160 次调用，必然被硬刹车掐断。
+        let audit = step("audit");
+        assert_eq!(
+            audit.workflow.as_deref(),
+            Some("learn_audit"),
+            "audit 必须是按章扇出的嵌套子流程"
+        );
+        assert_eq!(audit.output_from.as_deref(), Some("audit"));
+        assert!(
+            audit.roles().is_empty(),
+            "嵌套步不直接派 speaker（扇出在内层）"
+        );
+
+        let verdict = step("verdict");
+        assert!(
+            verdict.require_tools_any.is_empty(),
+            "verdict 必须零工具：取证在 audit，这里只判断"
+        );
+        assert!(
+            verdict.max_tool_calls.is_none(),
+            "verdict 不该有工具预算（它不调工具）"
+        );
+        assert!(
+            verdict.task_text().contains("{{audit}}"),
+            "verdict 必须消费 audit 的证据表"
+        );
+        assert!(verdict.require_verdict_json, "verdict 仍要产出结构化裁决");
+
+        // 顺序：audit 必须在 verdict 之前，gate 在最后。
+        let pos = |id: &str| wf.steps.iter().position(|s| s.id == id).unwrap();
+        assert!(pos("assemble") < pos("audit"));
+        assert!(pos("audit") < pos("verdict"));
+        assert!(pos("verdict") < pos("gate"));
+    }
+
+    /// 返工改了上游产物后，**中间的确定性步必须重跑**——否则下游拿到旧产物。
+    ///
+    /// 回归 2026-11-22 linux 学习书：gate 判 `REWORK: rechapter` 后只清了
+    /// rechapter 的 `done_steps`，`assemble` 仍在里面 → 被跳过 → verdict
+    /// 审的仍是返工前的 20 章清单，gate 再次驳回同一批问题。
+    ///
+    /// **必须走续跑路径**：单次运行里 `done_steps` 始终为空（只有 resume 从
+    /// checkpoint 填充），所以「跳回后中间步被跳过」只在续跑时暴露。
+    #[tokio::test]
+    async fn rework_reruns_intermediate_deterministic_steps() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出骨架"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body("骨架")))
+            .mount(&server)
+            .await;
+        // review 恒给 blocking：第 1 轮耗尽 max_iterations 判死，续跑后继续
+        // 驳回。这样两轮都会触发 gate → skeleton 返工，才能观察 assemble
+        // 是否被重跑。
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues":[{"id":"B1","severity":"blocking","rework":"skeleton","summary":"残缺","evidence":"实测","fix":"补"}]}
+```"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "rework_intermediate_demo"
+[[steps]]
+id = "skeleton"
+role = "worker"
+task = "出骨架：{{topic}}"
+output_key = "plan"
+[[steps]]
+id = "assemble"
+task = ""
+output_key = "tasks"
+require_plan_tasks = true
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json" }
+[[steps]]
+id = "review"
+role = "worker"
+task = "出裁决：{{tasks}}"
+output_key = "verdict"
+require_verdict_json = true
+[[steps]]
+id = "gate"
+task = ""
+output_key = "gate_out"
+gate_from = "verdict"
+loop_until = "VERDICT: PASS"
+loop_back_to = "skeleton"
+loop_back_routes = { "REWORK: skeleton" = "skeleton" }
+max_iterations = 2
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        std::fs::write(
+            root.join("chapters.json"),
+            serde_json::json!({"chapters":[{"id":"ch01","title":"ch01 章","depends_on":[]}]})
+                .to_string(),
+        )
+        .unwrap();
+        let task_json = serde_json::json!({
+            "title": "ch01 章", "description": "学什么+能讲清什么",
+            "priority": 2, "labels": ["学习","只读","层-树干"],
+            "task_type": "learn", "workflow": "", "depends_on": [],
+            "paths": [], "artifact_paths": [], "subtasks": []
+        })
+        .to_string();
+        std::fs::write(root.join("tasks/ch01.json"), &task_json).unwrap();
+
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+        // 第 1 轮：max_iterations=2 内 gate 恒驳回 → 判死，四步都进 checkpoint。
+        let err = run_workflow(&wf, "测试", &ctx)
+            .await
+            .expect_err("gate 恒驳回应判死");
+        assert!(err.contains("循环条件") || err.contains("VERDICT"), "{err}");
+        let wf_id = latest_checkpoint_id(root, "rework_intermediate_demo")
+            .expect("应留下 checkpoint");
+
+        // 第 2 轮：续跑。此时 assemble 在 done_steps 里。gate 驳回跳回
+        // skeleton 后，assemble 必须被清掉重跑——否则 review 拿到旧 tasks。
+        let _ = run_workflow_resume(&wf, "测试", &ctx, &wf_id).await;
+
+        // 续跑是新 wf_id，要看**续跑那一轮**的 checkpoint。取最新的一个。
+        let resumed_id = latest_checkpoint_id(root, "rework_intermediate_demo")
+            .expect("续跑应留下 checkpoint");
+        let state = load_checkpoint(root, &resumed_id).expect("读回 checkpoint");
+        let assemble_records = state
+            .completed
+            .iter()
+            .filter(|(step, _, _)| step == "assemble")
+            .count();
+        assert!(
+            assemble_records >= 2,
+            "续跑后 gate 驳回必须让 assemble 重新装配（首轮 1 次 + 返工后 1 次），\
+             实际只有 {assemble_records} 次"
+        );
+    }
+
+    /// 续跑场景：gate 驳回后跳回的目标步必须被**真重新执行**。
+    ///
+    /// 为什么必须是续跑：`done_steps` 只在 `resume` 时从 checkpoint 填充，
+    /// 单次运行里它始终为空——「跳回后目标步被静默跳过」这个缺陷只在
+    /// `/wf-resume` 时暴露。
+    ///
+    /// 构造要点：让第 1 轮在 gate **之前**失败（`assemble` 缺章），于是
+    /// `skeleton` 已进 checkpoint 而 gate 从未跑过（`loop_iters` 为空，
+    /// 不受续跑计数恢复影响）。续跑后 gate 首次驳回 → Rework 到
+    /// `skeleton` → 不清 `done_steps` 就会被静默越过。
+    #[tokio::test]
+    async fn gate_rework_reruns_target_after_resume() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出骨架"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("骨架产出（第 N 版）")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues":[{"id":"B1","severity":"blocking","rework":"skeleton","summary":"骨架残缺","evidence":"实测","fix":"补章"}]}
+```"#,
+            )))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出裁决"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(openai_body(
+                r#"```json
+{"issues": []}
+```"#,
+            )))
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "gate_rework_resume_demo"
+[[steps]]
+id = "skeleton"
+role = "worker"
+task = "出骨架：{{topic}}"
+output_key = "plan"
+[[steps]]
+id = "assemble"
+task = ""
+output_key = "tasks"
+require_plan_tasks = true
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json" }
+[[steps]]
+id = "review"
+role = "worker"
+task = "出裁决：{{tasks}}"
+output_key = "verdict"
+require_verdict_json = true
+[[steps]]
+id = "gate"
+task = ""
+output_key = "gate_out"
+gate_from = "verdict"
+loop_until = "VERDICT: PASS"
+loop_back_to = "skeleton"
+loop_back_routes = { "REWORK: skeleton" = "skeleton" }
+max_iterations = 3
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        // 第 1 轮：chapters.json 只有 ch01，但任务文件缺 ch01 → assemble 失败。
+        std::fs::write(
+            root.join("chapters.json"),
+            serde_json::json!({"chapters":[{"id":"ch01","title":"ch01 章","depends_on":[]}]})
+                .to_string(),
+        )
+        .unwrap();
+
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+        let err = run_workflow(&wf, "测试", &ctx)
+            .await
+            .expect_err("缺章应让 assemble 失败");
+        assert!(err.contains("缺章 ch01"), "{err}");
+
+        let wf_id = latest_checkpoint_id(root, "gate_rework_resume_demo")
+            .expect("第 1 轮应留下 checkpoint");
+        // 补上任务文件，让续跑能过 assemble。
+        std::fs::write(
+            root.join("tasks/ch01.json"),
+            serde_json::json!({
+                "title": "ch01 章",
+                "description": "学什么 + 能讲清什么",
+                "priority": 2,
+                "labels": ["学习", "只读", "层-树干"],
+                "task_type": "learn",
+                "workflow": "",
+                "depends_on": [],
+                "paths": [],
+                "artifact_paths": [],
+                "subtasks": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let before = bodies_containing(&server.received_requests().await.unwrap(), "出骨架").len();
+        let out = run_workflow_resume(&wf, "测试", &ctx, &wf_id)
+            .await
+            .expect("续跑：gate 驳回 → skeleton 重跑 → 放行");
+        assert!(out.starts_with("VERDICT: PASS"), "{out}");
+
+        let after = bodies_containing(&server.received_requests().await.unwrap(), "出骨架").len();
+        assert_eq!(
+            after - before,
+            1,
+            "续跑后 gate 驳回必须重跑 skeleton（续跑前 {before} 次，现在 {after} 次）"
+        );
+    }
+
+    /// `assemble` 的机械校验失败、且错误**点不出章号**时，必须跳回
+    /// `on_fail.global_rework`（这里是 `pages`）而不是判死整单。
+    ///
+    /// 回归 2026-11-22 linux 学习书：15 章共用 `artifact_paths: ["docs/learn"]`
+    /// 被判 86 处写冲突，错误里一个 `chNN` 都没有 → `collect_fail_targets`
+    /// 返回空 → 旧代码直接 `step_failed`，`on_fail.max_attempts` 一次没用上。
+    ///
+    /// 这里用「书结构校验」制造同类错误：`chapters.json` 里所有章都标
+    /// 「层-地基」（超 `BOOK_MAX_FOUNDATION = 2`），错误文案是
+    /// 「地基章有 N 章，最多 2 章」，不含任何章号。
+    #[tokio::test]
+    async fn assemble_global_failure_routes_to_pages_not_death() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::body_string_contains("出骨架"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("骨架已重写")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(openai_body("其他产出")),
+            )
+            .mount(&server)
+            .await;
+
+        let wf: WorkflowDef = toml::from_str(
+            r#"
+name = "global_rework_demo"
+[[steps]]
+id = "pages"
+role = "worker"
+task = "出骨架：{{topic}}"
+output_key = "plan"
+[[steps]]
+id = "assemble"
+task = ""
+output_key = "tasks"
+require_plan_tasks = true
+require_learn_book = true
+require_learn_chapters = true
+collect_plan_tasks = { order_file = "chapters.json", order_items = "chapters", order_id = "id", task_file = "tasks/{{id}}.json", on_fail = { rework = "pages", invalidate = "tasks/{{target}}.json", max_attempts = 1, global_rework = "pages" } }
+"#,
+        )
+        .expect("valid TOML");
+        wf.validate().expect("workflow must validate");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("tasks")).unwrap();
+        // 3 章全标「层-地基」→ 书结构校验报「地基章有 3 章，最多 2 章」，
+        // 这句话里没有任何 chNN。
+        let chapters = serde_json::json!({"chapters":[
+            {"id":"ch01","title":"ch01 a","depends_on":[],"paths":[],"layer":"层-地基","task_type":"learn"},
+            {"id":"ch02","title":"ch02 b","depends_on":[],"paths":[],"layer":"层-地基","task_type":"learn"},
+            {"id":"ch03","title":"ch03 c","depends_on":[],"paths":[],"layer":"层-地基","task_type":"learn"}
+        ]});
+        std::fs::write(root.join("chapters.json"), chapters.to_string()).unwrap();
+        for id in ["ch01", "ch02", "ch03"] {
+            std::fs::write(
+                root.join("tasks").join(format!("{id}.json")),
+                serde_json::json!({
+                    "title": format!("{id} 章"),
+                    "description": "学什么 + 能讲清什么",
+                    "priority": 2,
+                    "labels": ["学习", "只读", "层-地基"],
+                    "task_type": "learn",
+                    "workflow": "",
+                    "depends_on": [],
+                    "paths": [],
+                    "artifact_paths": [],
+                    "subtasks": []
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let ctx = ctx_at(&server.uri(), root.to_path_buf());
+        let err = run_workflow(&wf, "测试", &ctx)
+            .await
+            .expect_err("max_attempts=1 耗尽后应判死");
+
+        // 判死是预期的（配额只有 1），但**必须先真的跳回 pages 跑一轮**。
+        let skeleton_calls = bodies_containing(&server.received_requests().await.unwrap(), "出骨架").len();
+        assert_eq!(
+            skeleton_calls, 2,
+            "无章号错误必须跳回 pages 重跑一轮（实际 {skeleton_calls} 次）"
+        );
+        assert!(
+            err.contains("地基章") || err.contains("结构校验") || err.contains("机械装配"),
+            "错误应保留书结构校验的原文：{err}"
+        );
+    }
+
+    /// 从 `.latte/workflow-runs/` 里挑某个 workflow 最新 checkpoint 的 id。
+    fn latest_checkpoint_id(cwd: &std::path::Path, name: &str) -> Option<String> {
+        let dir = crate::workflow::checkpoint_dir(cwd);
+        let mut best: Option<(u64, String)> = None;
+        for ent in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = ent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(state) = load_checkpoint(cwd, id) else {
+                continue;
+            };
+            if state.workflow_name != name {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(t, _)| state.started_at >= *t) {
+                best = Some((state.started_at, id.to_string()));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 }

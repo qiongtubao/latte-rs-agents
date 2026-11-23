@@ -1,0 +1,141 @@
+# Workflow: learn_audit （learn_plan 的内层子流程，一般不单独调用）
+# 职责：**逐章取证**，每章一个独立 subsession，把自己那章的「锚点是否真的
+# 支撑验收」核实清楚，落盘到 .latte/learn-audit/<chNN>.md。
+#
+# 为什么要单独一层：取证是真读源码，20 章实测要 120~160 次工具调用。放在
+# 一个会话里时，reviewer 会把全部预算花在取证上、被硬刹车掐断，裁决正文
+# 还没开始写（实测 40/40→32 字符、79/80→70 字符、78/80→70 字符、
+# 120/120→0 字符，四轮全是这个形态）。加预算追不上——模型不遵守
+# 「每章最多 5 次」的算术约束。
+#
+# 拆成按章扇出后：每章一个会话、独立预算（30 次），各自必然收尾；
+# 单章失败不拖死整单（`tolerate_failures`），缺章会在下游被点出来。
+#
+# 本层是 DAG（audit.depends_on = breakdown）：
+#   breakdown → 确认章清单（零模型：只写一个清单文件供扇出）
+#   audit     → 按 chapters.json 每章扇出一个 subsession，写 audits/<chNN>.md
+#
+# 与 learn_book_pages 的分工：那边产出**任务条目**（怎么学），这边产出
+# **取证结论**（锚点对不对）。两者都由外层 learn_plan 装配/消费。
+
+name = "learn_audit"
+description = "learn_plan 内层：按章扇出逐章取证（锚点是否支撑验收），产物供 verdict 判断｜落点：.latte/learn-audit/<chNN>.md"
+max_rounds = 1
+
+# ── breakdown：确认章清单（零模型，连接串行外层与 DAG 扇出）──────────
+# 本步不写新内容：`chapters.json` 由外层 learn_plan 的 pages 步产出，
+# 这里只把它转成扇出所需的输入形状（并把清单落一份到 audit 目录，
+# 便于续跑时判断"这批取证针对哪版骨架"）。
+[[steps]]
+id = "breakdown"
+description = "确认待取证章清单（零模型）"
+role = "tutor"
+output_key = "manifest"
+# 外层 rechapter 定向返工时同样跳过（骨架未变）。
+unless_any = ["[[learn_plan:reaudit]]"]
+tools = ["read"]
+task = """零模型步：读 `.latte/learn-plan/chapters.json`，把章清单（id + title + paths）
+落一份到 `.latte/learn-audit/manifest.json`，供本层扇出与续跑判新旧。
+
+只做搬运，不做判断。若 chapters.json 不存在，在产出正文里写明并让本步失败。"""
+
+# ── audit：按章扇出（每章一个 subsession，独立工具预算）────────────────
+[[steps]]
+id = "audit"
+description = "逐章扇出：每章核实「锚点是否真的支撑验收」，落盘 audits/<chNN>.md"
+# **必须是 tutor 而不是 reviewer**：reviewer 的工具集是
+# `["read","search","code_graph"]`——没有 `write`。而本步必须落盘
+# （证据表要传给 verdict），`require_tools = ["write"]` 在 reviewer 下
+# 永远无法满足，整步必然作废（实测：引擎日志连续刷
+# 「step 请求了角色 'reviewer' 没有的工具，已忽略：write」，
+# 4 个并发会话全部零产物）。
+#
+# tutor 带 `read/code_graph/search/edit/write/ask`——取证与落盘都够，
+# 且 learn_book_pages 的 breakdown/detail 两步同样用 tutor 落盘，
+# 是同一套已验证的组合。
+role = "tutor"
+depends_on = ["breakdown"]
+# **扇出步必须绑 output_key**：外层 learn_plan 的 audit 步用
+# `output_from = "audit"` 取本层产出。不绑的话扇出结果只进 `keyed` 的
+# 默认键，外层报「nested workflow 'learn_audit' 没有 output_key 'audit'
+# 的产出（可用：manifest）」——20 章取证全部完成后才失败（实测
+# 2026-11-23：`[workflow learn_audit] ok` 紧接着外层判死）。
+#
+# 扇出步的产出是各元素结果 `\n\n` 拼接（见引擎 `carried_fan_out`），
+# 正是 verdict 需要的证据表合集。
+output_key = "audit"
+max_retries = 2
+# 单章取证的硬刹车。实测单章实际用 12~29 次（read 目录 + 读文件头 +
+# search/code_graph 定位），而 30 次时会卡在边界——模型把额度全花在取证上，
+# **永远轮不到 write**（实测 4 个并发会话：24/12/29/25 次，无一写盘）。
+#
+# 给到 60：留足取证（实测峰值 29 × 2）并保证 write 有机会执行。
+# `require_tools = ["write"]` 是硬门禁——必须真落盘，所以预算必须够
+# 覆盖「取证 + 写盘」两件事，不能按取证峰值卡死。
+max_tool_calls = 60
+tools = ["read", "search", "code_graph", "write"]
+require_tools = ["write"]
+require_tools_any = ["read", "search", "code_graph"]
+no_advisor = true
+task = """你是**单章取证员**。本次只负责一章：核实它的锚点是否真的支撑它的验收要求。
+
+本章骨架（权威，不用再去读 chapters.json，也不要读别的章）：
+{{item_json}}
+
+**只查事实，不下裁决**（裁决由外层 verdict 步做）。要回答三个问题：
+
+1. **锚点文件是否存在**？`paths` 里每个文件/目录核实存在性。
+   - `read {"path":".../mm"}` 读目录会列出条目——**不确定文件名时先用它**，
+     比 `search` 猜路径便宜得多。实测猜路径的失败率很高
+     （`mm/slab.c`、`arch/x86/entry/common.c`、`include/asm-generic/pgtable_types.h`
+     都不存在，猜一次废一次）。
+2. **锚点内容是否支撑验收**？`read` 每个锚点文件的**头 40 行**（文件头注释
+   通常直接自述「这个文件讲什么」），再看验收点名的关键函数是否存在：
+   - `search {"pattern":"函数名","paths":["目录"]}` —— `paths` **只给目录**；
+   - 或 `code_graph {"kind":"function","path":"真实文件"}`。
+   典型错配（务必识别）：验收要「A 机制的完整链路」而锚点是「B 机制的参数表」
+   （如 `mm/swap.c` 自述 'default values for the operation of the Linux VM
+   subsystem'，不含伙伴算法）；验收要「完整调用链」而锚点只有其中一环
+   （如 `mm/mmap.c` 有 VMA 创建、没有缺页处理，那在 `mm/memory.c`）。
+3. **验收要求的事实是否成立**？如「画出五级页表」——查本仓库
+   `arch/x86/Kconfig` / `pgtable_types.h` 确认实际几级（本树 x86 未启用五级）。
+
+预算 60 次调用（运行中硬刹车）。一章的核实通常 10~30 次：
+1 次 read 目录 + 每锚点 1 次 read 文件头 + 1~2 次 search 定位验收点名的函数。
+
+**务必留出写盘**：`write` 是硬门禁，**一次都没调 = 整步作废重做**。
+取证到 40 次左右就停下，把已有发现写成表格落盘——**表格里没查的锚点标
+「未覆盖」也行**，比整步作废强得多。实测有会话把 30 次全花在 search 上、
+`write` 一次没调，白跑三轮。
+
+**用 `write` 落盘**到 `.latte/learn-audit/audits/{{item_id}}.md`，内容**只有**这段：
+
+```
+# {{item_id}} 取证
+
+| 锚点 | 存在 | 自述/关键函数 | 是否支撑验收 |
+|---|---|---|---|
+| mm/swap.c | 是 | 文件头 'default values … VM subsystem'；无 __free_one_page | **否**（伙伴算法在 mm/page_alloc.c:945） |
+
+**结论**：错配 / 部分支撑 / 相符 / 无锚点
+**依据**：<一到两句话，带 file:line>
+```
+
+不要写建议、不要写 fix、不要写 issues json——那是 verdict 的事。
+**必须先 `write` 落盘**，落盘后再写一句确认。只有确认文字、没有 write 调用的产出视为失败。"""
+
+[steps.fan_out]
+file = ".latte/learn-plan/chapters.json"
+items = "chapters"
+id_key = "id"
+max_items = 60
+# 扇出前校验章清单形状（章号连续、depends_on 只指向前序）——坏清单在
+# 派发任何子会话之前就失败。
+require_learn_chapters = true
+# 增量扇出：audits/<chNN>.md 已存在且不早于 chapters.json → 跳过。
+# 定向返工时只重做被点名章（外层会删掉它们的产物）。
+skip_fresh = ".latte/learn-audit/audits/{{item_id}}.md"
+# 单章取证失败不拖死整单：其余章照常收尾，缺失的章由 verdict 标「未覆盖」。
+# 这条与 learn_book_pages 的 detail 步同一考量（实测 15 章里 1 章失败
+# 会让整条流程判死、14 章产物全部失效）。
+tolerate_failures = true

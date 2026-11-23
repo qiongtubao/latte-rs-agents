@@ -37,9 +37,25 @@ unless_any = ["[[learn_plan:rechapter]]"]
 # 不合格带批注在本步重试，而不是让扇出前校验判死整单（实测 ch01 验收前指 ch02）。
 require_learn_skeleton = ".latte/learn-plan/chapters.json"
 max_retries = 2
-# 硬预算：本步只读骨架、不逐文件深读（见 task），取证很少超过 10~20 次。
-# 实测失控形态是 78 次只读、0 次 write 跑满 600s，故给一条廉价精确的刹车。
-max_tool_calls = 80
+# 硬预算：本步只读骨架、不逐文件深读（见 task）。
+#
+# 80 → 20 的理由：80 等于没有刹车。实测（2026-11-22 linux 学习书，5 轮）
+# 本步每次都跑到 30~31 次调用后被 `tool batch skipped: required tool still
+# not called missing=["write"]` 拦下——正是「读太多、迟迟不写」的失控形态。
+# 而 advisor 的返回审查每次都判 intervene，理由一致：委派要求「只读骨架 +
+# code_graph 索引」，实际却深读了 namei.c / open.c / fair.c / page_alloc.c /
+# fork.c / entry_64.S。
+#
+# 骨架阶段的取证只需三样：顶层目录树、各模块 Makefile/Kbuild 的模块清单、
+# code_graph 的模块符号索引。按 20 章算：3 次读构建文件 + 2~3 次 code_graph
+# + 每章 1~2 次核实路径存在与行数 ≈ 30~40 次。
+#
+# 取 40 而不是 20：实测 20 会把「读 Makefile」也挤掉（advisor 随即判
+# intervene「工具记录中没有 Makefile/Kbuild 内容读取」），模型只能在
+# 「不取证」和「不落盘」之间二选一。40 够覆盖 20 章的正常核实，又远低于
+# 80 那种能一口气深读 6 个大文件（namei.c/open.c/fair.c/page_alloc.c/
+# fork.c/entry_64.S）的失控空间。
+max_tool_calls = 40
 tools = ["read", "code_graph", "search", "write"]
 require_tools = ["write"]
 require_tools_any = ["read", "code_graph", "search"]
@@ -102,6 +118,18 @@ chapters.json 的硬规则（外层 assemble 机械校验，违反整单打回�
 - 章名/brief **不要点名内部函数、宏、符号**；paths 只写核实过存在的文件/目录
   （尤其别猜 test/ 下的文件名，实测反复幻觉）。
 - 章数由学习目标覆盖面决定（一章一次 learn_loop 的体量），上限 60 章。
+- **先取证、再落盘，总调用不超过 40 次。** 本步的取证**只做这三样**，按顺序：
+  1. 顶层目录树（`ls` 一级目录，或读顶层 `Makefile` 的 `core-y`/`drivers-y` 行）；
+  2. 各模块 `Makefile`/`Kbuild` 的模块清单（`mm/Makefile`、`kernel/Makefile`、
+     `fs/Makefile` 等，一次 `read` 读一个）；
+  3. `code_graph` 的模块符号索引（按 `kind` 或 `pattern` 查，不要按路径猜）。
+  **这三样必须真的发生**——advisor 会核对工具记录，只写「已核实」而没读过
+  构建文件会被判越界。
+  **不要逐文件深读源码**（那是每章 `learn_loop` 的事）：实测有会话深读了
+  `namei.c`/`open.c`/`fair.c`/`page_alloc.c`/`fork.c`/`entry_64.S`，跑到 30 次
+  调用还没 `write`，被预算拦下、整步重做。
+  **paths 只需要「文件存在 + 行数在区间内」**，用 `ls`/`wc -l` 级别的核实即可；
+  想确认某章该锚哪个文件，看模块清单和 code_graph 的符号归属，不必打开文件读实现。
 - **一次写完，不要试探。** `chapters.json` 用**一次** `write` 写完（3–10 章通常 2–8KB，
   远低于工具输出上限）。**禁止**为了试探工具行为去写临时文件（`_probe*`、`tmp*`、`x`）：
   实测有会话为搞清 append 语义写了 6 个探针文件、白烧十余次工具调用，最后撞上工具
@@ -164,13 +192,14 @@ task = """你是章节细化者，本次**只负责一章**。这一章的骨架
      "workflow": "",
      "depends_on": [ /* 原样照抄骨架的 depends_on */ ],
      "paths": [ /* 原样照抄骨架 paths（骨架权威，装配时覆盖） */ ],
-     "artifact_paths": ["docs/learn"],
+     "artifact_paths": [],
      "subtasks": []
    }
 
 硬规则：
 - `title` / `depends_on` / `paths` **原样照抄骨架**（装配时引擎会以骨架为准覆盖，你别改——改了只会被覆盖回去，白费 token）。
-- `artifact_paths` 固定写 `["docs/learn"]`；源码锚点只能放 `paths`，不得把源码输入误写成产物授权。
+- `artifact_paths` 一律写 `[]`（= 明确只读，本任务不写项目文件）：这一章的学习文档由它自己的 learn_loop 流水线在 `docs/learn/` 下产出，不需要本章任务声明写边界。源码锚点只能放 `paths`，不得把源码输入误写成产物授权。
+  **不要**抄成 `["docs/learn"]`：那是引擎产物目录，15 章共用同一个前缀会被装配期的写冲突校验判成 15 个任务互相覆盖（2026-11-22 linux 学习书实测 86 处误判、整单判死）。
 - `labels` 必须含「学习」「只读」，并带**且只有一个**层级标签（层-地基 / 层-树干 / 层-枝干 / 层-树叶，照抄骨架的 layer）。
 - 枝干章的 description **以「回应事实N：」开头**（照抄骨架的 responds_to），这句要一路传给后面精读这一章的流程，别省。
 - `description` 提到其他章只能写 chNN，且只许提本章骨架 `depends_on` **直接列出**的章；要用后章才讲的产物（如基准），别写进本章验收。

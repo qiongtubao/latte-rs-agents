@@ -4518,6 +4518,7 @@ fn is_ancestor_of(store: &TaskStore, ancestor: &str, id: &str) -> bool {
 /// 返回 `(在跑任务 id, 冲突原因)`，无冲突 → None。
 ///
 /// 判据（对家族内每个在跑任务逐个判）：
+/// - 有一方**不写项目文件**（见 [`task_writes_nothing`]）→ **放行**；
 /// - 双方都声明了 `paths` 且不重叠 → **放行**（各写各的文件）；
 /// - 否则（任一方未声明、或声明了但重叠）→ 冲突。
 ///
@@ -4533,7 +4534,13 @@ fn is_ancestor_of(store: &TaskStore, ancestor: &str, id: &str) -> bool {
 /// 完成"的聚合节点）处于 in_progress 时，**不阻塞其后代**派发——
 /// 否则子任务永远无法开跑（见 [`dispatch_task`] 的容器分流）。
 /// 同树其他分支、以及后代在跑反过来阻塞祖先被当叶子派发，仍然有效。
+///
+/// 只读任务若也参与判据，一本 15 章的学习书会被排成严格串行：每章带
+/// 「只读」却因模板共享同一个 `docs/learn` 产物前缀（2026-11-22 linux）。
 fn task_conflict_paths(task: &Task) -> Vec<String> {
+    if task_writes_nothing(task) {
+        return Vec::new();
+    }
     let mut paths = task.paths.clone();
     if let Some(artifacts) = &task.artifact_paths {
         for path in artifacts {
@@ -4545,8 +4552,33 @@ fn task_conflict_paths(task: &Task) -> Vec<String> {
     paths
 }
 
+/// 该任务**不会写项目文件**：写冲突判据对它没有意义。
+///
+/// 与 `latte-agent-core` 的 `plan_task_writes_nothing` 同一套判据（core 不能
+/// 反向依赖 ui-server，两处各写一份，注释互相指认）：只读 label、
+/// `artifact_paths: []`、或只读 task_type。只读语义的正确载体是「没有写
+/// 能力」，而不是「声明了写边界却要求它别撞车」。
+fn task_writes_nothing(task: &Task) -> bool {
+    const MARKERS: &[&str] = &["只读", "readonly", "read-only", "学习", "learning", "调研"];
+    task.labels
+        .iter()
+        .any(|l| MARKERS.iter().any(|m| l.trim().eq_ignore_ascii_case(m)))
+        || task
+            .artifact_paths
+            .as_deref()
+            .is_some_and(<[String]>::is_empty)
+        || matches!(
+            task.task_type.as_deref().map(str::trim),
+            Some("learn") | Some("learn_loop") | Some("research")
+        )
+}
+
 fn family_running_conflict(store: &TaskStore, id: &str) -> Option<(String, String)> {
     let me = store.get(id)?;
+    // 自己不写项目文件 → 与谁都能并行（只读任务之间天然共存）。
+    if task_writes_nothing(me) {
+        return None;
+    }
     let root = store.root_of(id);
     std::iter::once(root.clone())
         .chain(store.descendants_of(&root))
@@ -4558,6 +4590,10 @@ fn family_running_conflict(store: &TaskStore, id: &str) -> Option<(String, Strin
             }
             // 容器祖先在跑只是聚合标记，不阻塞后代派发。
             if is_ancestor_of(store, &oid, id) {
+                return None;
+            }
+            // 对方不写项目文件 → 同样无可覆盖。
+            if task_writes_nothing(o) {
                 return None;
             }
             let mine_paths = task_conflict_paths(me);
@@ -7684,6 +7720,39 @@ mod tests {
             family_running_conflict(&store, &c2.id).is_some(),
             "一方未声明 paths 时必须保守串行"
         );
+    }
+
+    /// 只读任务不参与写冲突：一本学习书每章都带「只读」+ 同一个产物前缀
+    /// （`docs/learn`），不该被排成串行。
+    ///
+    /// 回归 2026-11-22 linux 学习书：前置的 plan 校验已修好只读豁免，但看板
+    /// 侧 `task_conflict_paths` 仍无条件拼 `paths + artifact_paths`，15 章会
+    /// 互相 409、被 scheduler 排成严格串行。
+    #[test]
+    fn readonly_siblings_run_in_parallel() {
+        let (_dir, mut store) = tmp_store();
+        let p = make_task(&mut store, "学习书");
+        let c1 = make_child(&mut store, &p, "ch01");
+        let c2 = make_child(&mut store, &p, "ch02");
+        for c in [&c1, &c2] {
+            let t = store.get_mut(&c.id).unwrap();
+            t.labels = vec!["学习".into(), "只读".into()];
+            t.artifact_paths = Some(vec!["docs/learn".into()]);
+        }
+        store
+            .get_mut(&c1.id)
+            .unwrap()
+            .set_state("in_progress", "user", None, now_ms());
+        assert!(
+            family_running_conflict(&store, &c2.id).is_none(),
+            "只读任务共用 docs/learn 不该互斥"
+        );
+
+        // 去掉只读标记 → 同一产物前缀必须重新互斥。
+        store.get_mut(&c1.id).unwrap().labels = vec![];
+        store.get_mut(&c2.id).unwrap().labels = vec![];
+        let (cid, _why) = family_running_conflict(&store, &c2.id).expect("非只读须仍互斥");
+        assert_eq!(cid, c1.id);
     }
 
     /// 跨层（根与孙）冲突：家族 = 同一 root 的整棵任务树。

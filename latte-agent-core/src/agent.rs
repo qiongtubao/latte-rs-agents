@@ -3804,9 +3804,18 @@ impl AgentRunner {
     /// 依据是 `last_turn_tool_summaries`（只记执行成功的调用，续跑时由快照
     /// 还原），与 workflow `check_required_tools` 用的是同一份事实。两处
     /// 消费方（turn 末的文本提醒、循环内的必需工具门）共用这一个提取口径。
+    /// 本 turn **成功**调用过的工具短名。
+    ///
+    /// 必须排除失败行（带 `→ ✗`）：summary 里现在也记失败调用（为了让
+    /// workflow 的 `require_tools_any` 能区分「尝试过但失败」与「压根没试」），
+    /// 但「必需工具」这条判据问的是「它拿到证据了吗」——失败的 `code_graph`
+    /// 没有。混进来会让必需工具门误以为已满足、不再催促模型换真实路径重试
+    /// （2026-11-22 linux 学习书：reviewer 的 code_graph 全因路径不存在失败，
+    /// 若算作已调用，就不会被提醒改用真实路径）。
     fn called_tool_short_names(&self) -> Vec<String> {
         self.last_turn_tool_summaries
             .iter()
+            .filter(|l| !l.contains("→ ✗"))
             .filter_map(|l| l.split_whitespace().next())
             .map(|n| short_tool_name(n).to_string())
             .collect()
@@ -4182,6 +4191,29 @@ impl AgentRunner {
                     name,
                     flat(truncate_tool_summary(args, 160)),
                     flat(truncate_tool_summary(result_str, 240)),
+                ));
+            }
+        }
+        // 2b. 失败调用也记一行（用 `✗` 标记），但**不计入**
+        //     `last_turn_tool_count`（那个数被 Supervisor/预算当"有效工作"用）。
+        //
+        // 为什么必须记：`require_tools_any` 查的是"这一步到底有没有取证"，
+        // 而它只看得见成功行。实测 2026-11-22 linux 学习书：reviewer 交了
+        // 一份含 8 处 `file:line` 的完整裁决，它确实调了 `code_graph`，只是
+        // 路径全猜错（`arch/x86/entry/common.c` 等不存在）→ 全部失败 → 摘要
+        // 里没有成功行 → 被判「一个工具都没调用」→ 整步重做，白烧 10-15
+        // 分钟模型时间。「尝试过但路径猜错」和「压根没尝试」必须区分开。
+        if !r.executed_ok {
+            if let Some((name, args)) = r.loop_records.first() {
+                let flat = |s: String| s.replace(['\n', '\r'], " ");
+                let detail = match &r.outcome {
+                    Err((_kind, d)) => d.clone(),
+                    Ok(d) => d.clone(),
+                };
+                self.last_turn_tool_summaries.push(format!(
+                    "{name} {} → ✗ {}",
+                    flat(truncate_tool_summary(args, 160)),
+                    flat(truncate_tool_summary(&detail, 160)),
                 ));
             }
         }
@@ -14464,6 +14496,51 @@ tools = ["read", "write"]
 
     /// `write` 由 `edit` 满足；拿不到的工具不催；未声明时永不催。
     /// 与 workflow `check_required_tools` 同一份判据，避免两处口径漂移。
+    /// 失败调用不算「已满足必需工具」：必须继续催，让模型换真实路径重试。
+    ///
+    /// 回归 2026-11-22 linux 学习书：summary 现在也记失败行（供 workflow 的
+    /// `require_tools_any` 区分「尝试过但失败」），但必需工具门问的是「拿到
+    /// 证据了吗」——失败的 `code_graph` 没有。
+    #[test]
+    fn failed_tool_calls_do_not_satisfy_required_tools() {
+        use latte_ai::models::Tool as WireTool;
+        let wire = |name: &str| WireTool {
+            name: name.into(),
+            description: None,
+            parameters: serde_json::json!({}),
+            strict: None,
+        };
+        let agent = Agent::new_with_chain(
+            "t".into(),
+            test_role(),
+            vec![test_model()],
+            GenerateParams::default(),
+        )
+        .unwrap();
+        let mut runner = AgentRunner::new(agent).with_required_tools_any(vec![
+            "read".into(),
+            "code_graph".into(),
+        ]);
+
+        // 只有失败行：仍算未满足，要催。
+        runner.last_turn_tool_summaries = vec![
+            "code_graph {\"path\":\"mm/slab.c\"} → ✗ path 不存在".to_string(),
+        ];
+        let gap = runner.missing_required_tools(&[wire("read"), wire("code_graph")]);
+        assert!(
+            !gap.any_of.is_empty(),
+            "失败调用不得算作已满足：{gap:?}"
+        );
+
+        // 有成功行：满足，不再催。
+        runner.last_turn_tool_summaries = vec![
+            "code_graph {\"path\":\"nope.c\"} → ✗ 不存在".to_string(),
+            "read {\"path\":\"mm/slab_common.c\"} → ok".to_string(),
+        ];
+        let gap = runner.missing_required_tools(&[wire("read"), wire("code_graph")]);
+        assert!(gap.any_of.is_empty(), "成功调用应满足 OR：{gap:?}");
+    }
+
     #[test]
     fn missing_required_tools_respects_edit_and_available_tools() {
         use latte_ai::models::Tool as WireTool;

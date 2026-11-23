@@ -79,26 +79,72 @@ require_learn_chapters = true
 # 骨架扇出前已校验）时，删掉被点名章的条目、带着校验错误跳回 rechapter 只重做
 # 它们，最多 2 次；不再一失败就判死整单（jemalloc ui-248856：ch32 description
 # 引用了不在先修链里的 ch31，整条 workflow 直接 failed）。
-collect_plan_tasks = { order_file = ".latte/learn-plan/chapters.json", order_items = "chapters", order_id = "id", task_file = ".latte/learn-plan/tasks/{{id}}.json", on_fail = { rework = "rechapter", invalidate = ".latte/learn-plan/tasks/{{target}}.json", max_attempts = 2 } }
+# on_fail：装配校验失败时按**归因**分流（只在串行引擎实现）：
+#   - 错误点得出章号（单章 paths 幻觉、层级标签、description 引用）→ 删掉该章
+#     条目、带错误跳回 rechapter 只重做它们，最多 2 次；
+#   - 错误点不出章号（跨任务判据：paths/artifact_paths 写冲突、共享锚点、
+#     书结构、章号链）→ 病灶在骨架 chapters.json 或模板上，删单章只会空转，
+#     跳回 pages 全量重生成，同样最多 2 次。
+# 2026-11-22 linux 学习书：15 章共用 `artifact_paths: ["docs/learn"]` 被判 86
+# 处写冲突，错误无章号 → 旧行为直接判死，两次配额一次没用上，224 万 token
+# 白烧。global_rework 就是补这条路由。
+collect_plan_tasks = { order_file = ".latte/learn-plan/chapters.json", order_items = "chapters", order_id = "id", task_file = ".latte/learn-plan/tasks/{{id}}.json", on_fail = { rework = "rechapter", invalidate = ".latte/learn-plan/tasks/{{target}}.json", max_attempts = 2, global_rework = "pages" } }
 
-# ── verdict：终审（学习类检查清单，结构化裁决）─────────────────────────
+# ── audit：取证（嵌套 DAG 子流程 learn_audit，按章扇出）───────────────
+#
+# 为什么不是单步：取证是真读源码，20 章实测要 120~160 次调用。单个会话里
+# reviewer 会把全部预算花在取证上、被硬刹车掐断时裁决正文还没开始写——
+# 实测四轮全是这个形态（40/40→32 字符、79/80→70 字符、120/120→0 字符）。
+# 加预算追不上：模型不遵守「每章最多 5 次」的算术约束。
+#
+# 改成按章扇出后：每章一个 subsession、独立 30 次预算，各自必然收尾；
+# 单章失败不拖死整单。这是 learn_book_pages 已验证过的同一套结构
+# （串行外层 + DAG 内层嵌套），不是新机制。
+#
+# 产物落在 `.latte/learn-audit/audits/<chNN>.md`，由本步正文汇总带出。
+[[steps]]
+id = "audit"
+description = "逐章取证（嵌套 DAG 子流程）：核对每章锚点是否真的支撑其验收"
+workflow = "learn_audit"
+output_key = "audit"
+output_from = "audit"
+task = "为下面这份学习计划逐章取证：{{topic}}"
+
+# ── verdict：终审（学习类清理单，结构化裁决）─────────────────────────
 [[steps]]
 id = "verdict"
 description = "终审（学习类检查清单，结构化裁决，抽查不全量核验）"
 speakers = ["reviewer"]
 output_key = "verdict"
 max_retries = 2
-tool_call_limits = { read = 8, search = 8, code_graph = 8 }
-require_tools_any = ["read", "code_graph", "search"]
+# **零工具调用**：取证已由上游 `audit` 步完成，本步只做判断。
+#
+# 为什么不让它取证（实测三轮，2026-11-22 linux 学习书）：
+#   max_tool_calls=40 → 硬刹车 40/40，正文 32 字符（裁决还没开始写）
+#   max_tool_calls=80 → 硬刹车 79/80，正文 70 字符
+#   无上限        → 一路刷到 92 次，跑完才判超限，整步重做
+# 加预算没用：20 章的深度取证要 90+ 次，而无约束时它会一直查下去。
+# 拆成「audit 取证 → verdict 判断」后，本步不再消耗工具预算，
+# 产出必然完整（不需要在取证中途留余量）。
+require_tools_any = []
 # 结构化裁决硬校验：下游 gate_from 机械判定的输入，格式不合格就带批注重做本步。
 require_verdict_json = true
-prompt = """终审这份学习计划：
-【拆解骨架】{{plan}}
-【装配后的任务清单】{{tasks}}
+prompt = """**裁决**这份学习计划。取证已由上游 `audit` 步完成，证据表在下面——
+**不要再去调工具核实**（本步不消耗工具预算，也没有工具）；若某章证据表里
+标「未覆盖」，在 summary 里写明「需下轮取证」，不要去猜。
 
-**抽查即可，不要逐项全量核验**：paths/符号存在性抽 3-5 处验证（优先抽看起来最可疑的），工具调用总量控制在 10 次以内；章名若点名了具体符号则抽查其存在性（查不到的按实测错误处理）。
+【拆解骨架】
+{{plan}}
+
+【装配后的任务清单】
+{{tasks}}
+
+【取证表（上游 audit 步实测）】
+{{audit}}
+**你只做判断，不做取证**：证据表已经给出每章「锚点是否支撑验收」的实测结论，
+凡是标「错配」的直接按 blocking 处理（`evidence` 引用证据表里的 `文件:行号`）。
 **引擎已机械校验过、不必再查**：章号 chNN 连续、depends_on 只指向前序章、description 里的 chNN 引用都在先修闭包内、各章条目与骨架一致、层级先地基/树干后枝叶、树干有推导章、锚点体量在区间内、没有大文件整份当锚点。
-你要查的是机器查不出的**语义**问题——尤其是没写章号、但验收**实际上**要用到后面章节才讲的知识/产物（如要求"跑基准"而基准在后章才写）。
+你要判的是机器查不出的**语义**问题——尤其是没写章号、但验收**实际上**要用到后面章节才讲的知识/产物（如要求"跑基准"而基准在后章才写）。
 
 学习类检查清单：① 目录是否覆盖学习目标（有没有漏掉核心机制）；② 编的顺序是否符合认知规律（环境/补课→地图→主线→外围→底层→验证输出）；③ 先修关系是否完整（后章真用到前章概念却没写 depends_on）；④ 每章验收是否是「能讲清/能推出什么」、有没有语义上依赖未学知识；⑤ 章之间阅读落点是否重复（复读 = important，应合并或改写为进阶深化）；⑥ 有没有「验证与输出」收尾章；⑦ 事实性结论（构建选项、平台差异等）与源码是否一致；⑧ 某章条目是否明显是扇出失败的残次（如 description 空洞、与 brief 完全脱节）。
 
@@ -108,7 +154,7 @@ prompt = """终审这份学习计划：
 - nit：措辞、计数口径、格式。
 **不要写「通过/有条件通过/不通过」之类的总裁决**——放行由引擎按「有无 blocking」推导。
 
-输出：先写简短的抽查记录（查了什么、实测结果），然后在末尾输出**唯一一个** ```json 代码块：
+输出：先写简短的判断说明（依据证据表的哪些行、为什么定为 blocking/important），然后在末尾输出**唯一一个** ```json 代码块：
 {"issues": [{"id": "B1", "severity": "blocking|important|nit", "rework": "pages|rechapter", "targets": ["chNN"], "summary": "一句话问题", "evidence": "file:line 实测或清单原文（blocking 必填）", "fix": "具体改法"}]}
 - rework（病灶步）二选一，**能定向就定向**：
   - `rechapter`：问题**局限在个别章的条目内容**（某章 description/验收写错、事实/路径错误、description 空洞残次、与 brief 脱节等），且**骨架里这一章的 title/brief/accept/paths/depends_on 本身没问题**。定向重做的章条目**无权改 title 和 depends_on**（照抄骨架、装配时以骨架覆盖），所以 fix 里只要需要增删 depends_on（补先修、去掉倒置依赖），就**必须**写 `pages`。**必须**在 `targets` 里列出要重做的章号（如 `["ch03","ch07"]`）——只重做这几章，其余章不动。没给 targets 的 rechapter 会被引擎降级为全量返工；同一章上一轮刚定向重做过又被点名，引擎也会自动升级为全量返工。

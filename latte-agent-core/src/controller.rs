@@ -7198,16 +7198,28 @@ fn validate_plan_paths_impl(
     // `include/foo/internal` 被判 45 处冲突，5855 字错误回喂时又
     // 被中段省略，模型看不全、改不动，连撞两次 plan 后靠蒙才过。）
     //
+    // 只读任务的 `paths` 是**阅读输入**：两章都读同一个文件不会互相覆盖，
+    // 因此不参与写冲突判据（实测 2026-09：8 个纯阅读学习任务因为都要读
+    // `include/foo/internal` 被判 45 处冲突，5855 字错误回喂时又被中段
+    // 省略，模型看不全、改不动，连撞两次 plan 后靠蒙才过）。
+    //
+    // `artifact_paths` 同理：它是**写授权**，而只读任务没有写能力，声明了
+    // 也只是一句自相矛盾的话，不该让它参与「谁会跟谁撞车」的判断。2026-11-22
+    // linux 学习书：15 章全带「学习/只读」，模板又要求每章声明同一个
+    // `artifact_paths: ["docs/learn"]`，105 对里 86 对被判重叠，整条
+    // learn_plan 判死、224 万 token 白烧——只读豁免只做了一半（丢 paths、
+    // 留 artifact_paths）正是病根。
+    //
     // **声明了依赖关系的一对任务同样跳过**：重叠只在两个任务*同时*跑
     // 的时候有害，而看板保证有依赖的任务串行执行（依赖 done 才派发）。
     // 「实现」与「为它补测试」天然要改同一批文件，逼模型把它们的 paths
     // 拆开只会得到假声明；正确的表达是 depends_on。
     let conflict_paths = |task: &PlanTask| -> Vec<String> {
-        let source_paths = (!is_readonly_plan_task(task))
-            .then_some(task.paths.as_slice())
-            .into_iter()
-            .flatten();
-        source_paths
+        if plan_task_writes_nothing(task) {
+            return Vec::new();
+        }
+        task.paths
+            .iter()
             .chain(task.artifact_paths.as_deref().unwrap_or_default().iter())
             .map(|path| normalize(path))
             .filter(|path| !path.is_empty())
@@ -7262,11 +7274,31 @@ fn validate_plan_paths_impl(
             .collect::<Vec<_>>()
             .join("、");
         return Err(format!(
-            "paths/artifact_paths 范围重叠 {pairs} 处，集中在：{head}。并行会互相覆盖（派发被看板 409），\
-             请让各任务范围互不重叠；纯阅读任务的 labels 加「只读」可跳过本校验"
+            "paths/artifact_paths 范围重叠 {pairs} 处，集中在：{head}。并行会互相覆盖；\
+             请让范围互不重叠，只读任务（「只读」/ artifact_paths=[]）豁免"
         ));
     }
     Ok(())
+}
+
+/// 该任务**不会写项目文件**：写冲突判据对它没有意义。
+///
+/// 三种表达任一即可：
+/// - labels 含只读标记（「只读」/「学习」/「调研」…）；
+/// - `artifact_paths: []`（值空间里就是「明确只读」）；
+/// - 无写工具可用的 `task_type`（learn / learn_loop / research）。
+///
+/// 为什么按这套判据：只读语义的正确载体是「没有写能力」，而 plan 阶段的
+/// 唯一信号就是这几个字段。反过来，让只读任务持有 `artifact_paths` 前缀却
+/// 又要求它别跟别人撞，是把两个语义压进一个字段——半边豁免（2026-11-22
+/// linux 学习书 86 处误判）就是这么长出来的。
+fn plan_task_writes_nothing(t: &PlanTask) -> bool {
+    is_readonly_plan_task(t)
+        || t.artifact_paths.as_deref().is_some_and(<[String]>::is_empty)
+        || matches!(
+            t.task_type.as_deref().map(str::trim),
+            Some("learn") | Some("learn_loop") | Some("research")
+        )
 }
 
 /// 纯阅读类任务判定：labels 里带只读标记的任务不参与 paths 重叠校验。
@@ -11469,6 +11501,58 @@ pub(crate) mod tests {
             plan_task("P2 改内部头", &[], &["include/foo/internal"]),
         ];
         assert!(validate_plan_paths(cwd, &writing).is_err());
+    }
+
+    /// 只读任务即使声明了**同一个** `artifact_paths` 前缀也不算写冲突。
+    ///
+    /// 回归 2026-11-22 linux 学习书：`learn_book_pages` 的模板要求每章
+    /// `artifact_paths: ["docs/learn"]`（引擎产物目录），15 章 × 105 对里
+    /// 86 对被判重叠 → assemble 判死、224 万 token 白烧，而每一章都是
+    /// 「学习/只读」任务、根本不写项目文件。只读豁免原先只丢 `paths`、
+    /// 留着 `artifact_paths`，等于半边豁免。
+    #[test]
+    fn readonly_tasks_skip_artifact_path_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("docs/learn")).unwrap();
+        let mut tasks: Vec<PlanTask> = (0..15)
+            .map(|i| {
+                let mut t = plan_task(
+                    &format!("ch{i:02} 一章很长的学习标题"),
+                    &["学习", "只读", "层-枝干"],
+                    &[],
+                );
+                t.task_type = Some("learn_loop".into());
+                t.artifact_paths = Some(vec!["docs/learn".into()]);
+                t
+            })
+            .collect();
+        assert!(
+            validate_plan_paths(cwd, &tasks).is_ok(),
+            "只读任务共用 docs/learn 不该算冲突"
+        );
+
+        // 同样的产物前缀，但任务不是只读 → 仍然拦（保住 6690ed3 的意图）。
+        for t in &mut tasks {
+            t.labels = vec![];
+            t.task_type = None;
+        }
+        let err = validate_plan_paths(cwd, &tasks).expect_err("非只读任务须仍判重叠");
+        assert!(err.contains("范围重叠"), "{err}");
+    }
+
+    /// `artifact_paths: []` 是「明确只读」的另一种写法：同样不参与写冲突。
+    #[test]
+    fn empty_artifact_paths_marks_task_readonly() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        let make = |title: &str| {
+            let mut t = plan_task(title, &[], &["src"]);
+            t.artifact_paths = Some(vec![]);
+            t
+        };
+        assert!(validate_plan_paths(cwd, &[make("A 读 src"), make("B 也读 src")]).is_ok());
     }
 
     /// 只读类任务的 paths 必须**整条存在**（严格档）。
